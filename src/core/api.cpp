@@ -31,6 +31,13 @@ void jkp_config_default(jkp_config* config) {
   config->max_keypoints = 5000;
 }
 
+int jkp_backend_available(jkp_backend backend) {
+#ifdef JKP_HAVE_CUDA
+  if (backend == JKP_BACKEND_CUDA) return 1;
+#endif
+  return backend == JKP_BACKEND_CPU;
+}
+
 jkp_ctx* jkp_create(const jkp_config* config) {
   try {
     if (!config) throw std::runtime_error("config is null");
@@ -50,8 +57,11 @@ jkp_ctx* jkp_create(const jkp_config* config) {
     if (ctx->weights.meta("model").rfind("aliked-", 0) != 0)
       throw std::runtime_error("unsupported model '" + ctx->weights.meta("model") + "'");
     ctx->model = std::make_unique<jkp::Aliked>(ctx->weights);
-    if (config->backend != JKP_BACKEND_CPU) throw std::runtime_error("backend not available in this build");
-    ctx->ops = jkp::make_cpu_ops(config->num_threads);
+    if (!jkp_backend_available(config->backend)) throw std::runtime_error("backend not available in this build");
+    if (config->backend == JKP_BACKEND_CPU) ctx->ops = jkp::make_cpu_ops(config->num_threads);
+#ifdef JKP_HAVE_CUDA
+    if (config->backend == JKP_BACKEND_CUDA) ctx->ops = jkp::make_cuda_ops(config->device);
+#endif
     ctx->detect.top_k = config->top_k;
     ctx->detect.scores_th = config->score_threshold;
     ctx->detect.n_limit = config->max_keypoints;

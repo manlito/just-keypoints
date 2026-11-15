@@ -34,11 +34,13 @@ int usage() {
                "       jkp bench   IMAGE [--runs N] [options]\n"
                "options:\n"
                "  --image PATH      input image (same as the positional argument)\n"
+               "  --backend NAME    cpu (default) or cuda\n"
+               "  --device N        GPU index for --backend cuda (default 0)\n"
                "  --weights PATH    .jkpw file (default: weights embedded in the build)\n"
                "  --top-k K         keep the K best keypoints (default: threshold mode)\n"
                "  --scores-th T     score threshold (default 0.2)\n"
                "  --n-limit N       maximum keypoints in threshold mode (default 5000)\n"
-               "  --threads N       worker threads (default: all)\n"
+               "  --threads N       CPU worker threads (default: all)\n"
                "  --gray            feed the image as 8-bit grayscale\n");
   return 2;
 }
@@ -64,6 +66,13 @@ int main(int argc, char** argv) {
     if (a == "--image") image_path = value();
     else if (a == "--out") out_path = value();
     else if (a == "--weights") weights_path = value();
+    else if (a == "--backend") {
+      std::string name = value();
+      if (name == "cpu") config.backend = JKP_BACKEND_CPU;
+      else if (name == "cuda") config.backend = JKP_BACKEND_CUDA;
+      else return usage();
+    }
+    else if (a == "--device") config.device = std::atoi(value());
     else if (a == "--top-k") config.top_k = std::atoi(value());
     else if (a == "--scores-th") config.score_threshold = static_cast<float>(std::atof(value()));
     else if (a == "--n-limit") config.max_keypoints = std::atoi(value());

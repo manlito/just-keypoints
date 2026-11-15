@@ -3,11 +3,13 @@
 Keypoint and descriptor extraction (ALIKED) with minimal dependencies, for feature matching and bundle adjustment.
 No PyTorch, no ONNX Runtime. Plan and status: [PLAN.md](PLAN.md).
 
-Status: the CPU reference backend works and matches the original ALIKED. CUDA, Metal and WebGPU backends are planned.
+Status: the CPU reference backend and the CUDA backend work and match the original ALIKED. The CUDA backend is
+not optimized yet. Metal and WebGPU backends are planned.
 
 ## Build
 
-Needs CMake >= 3.16 and a C++17 compiler. Nothing else.
+Needs CMake >= 3.16 and a C++17 compiler. Nothing else for the CPU backend.
+The CUDA backend is built when the CUDA toolkit (`nvcc`) is found; it uses no other library.
 
 ```sh
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
@@ -17,6 +19,7 @@ cmake --build build/release
 | Option | Default | Meaning |
 |---|---|---|
 | `JKP_EMBED_WEIGHTS` | `ON` | compile the weights into the library (adds ~2.7 MB); `OFF` = give a path or memory blob at run time |
+| `JKP_CUDA` | `AUTO` | CUDA backend: `AUTO` = build it when a CUDA compiler is found, `ON` = require it, `OFF` |
 | `JKP_BUILD_CLI` | `ON` | build the `jkp` tool |
 | `JKP_BUILD_TESTS` | `ON` | build tests |
 
@@ -25,9 +28,10 @@ cmake --build build/release
 ```sh
 build/release/jkp extract image.png --out features.jkpt    # keypoints, scores, descriptors
 build/release/jkp bench image.png --runs 10
+build/release/jkp bench image.png --backend cuda
 ```
 
-Options: `--top-k K`, `--scores-th T`, `--n-limit N`, `--weights file.jkpw`, `--threads N`, `--gray`.
+Options: `--backend cpu|cuda`, `--device N`, `--top-k K`, `--scores-th T`, `--n-limit N`, `--weights file.jkpw`, `--threads N`, `--gray`.
 
 ## C API
 
@@ -36,6 +40,7 @@ Options: `--top-k K`, `--scores-th T`, `--n-limit N`, `--weights file.jkpw`, `--
 
 jkp_config config;
 jkp_config_default(&config);              /* CPU, aliked-n16, embedded weights */
+if (jkp_backend_available(JKP_BACKEND_CUDA)) config.backend = JKP_BACKEND_CUDA;
 jkp_ctx* ctx = jkp_create(&config);
 
 jkp_image image = {pixels, width, height, 0, JKP_FORMAT_RGB8};
@@ -52,7 +57,15 @@ See [tools/README.md](tools/README.md). In short:
 
 ```sh
 python tools/compare.py third_party/ALIKED/assets/tum/*.png --b "cmd:build/release/jkp extract"
+python tools/compare.py third_party/ALIKED/assets/tum/*.png --b "cmd:build/release/jkp extract --backend cuda"
 python tools/dump_golden.py third_party/ALIKED/assets/tum/*.png   # then: ctest --test-dir build/release
+```
+
+`ctest` runs the golden files against every backend in the build, and compares the CUDA backend with the
+CPU backend on generated images (no golden files or Python needed for that one):
+
+```sh
+ctest --test-dir build/release -R cuda_vs_cpu
 ```
 
 ## Licenses

@@ -1,4 +1,4 @@
-# Dev tools (M1)
+# Dev tools
 
 Python + PyTorch are used here only to export weights and validate against the original ALIKED.
 They are never a runtime dependency of the library.
@@ -12,6 +12,7 @@ python tools/export_weights.py               # -> weights/aliked-n16.jkpw (Batch
 python tools/compare.py $A/tum/*.png         # original vs reference forward pass from the .jkpw file
 python tools/compare.py $A/tum/*.png --a upstream:cpu --b upstream:cuda
 python tools/dump_golden.py $A/tum/*.png     # per-layer test vectors -> build/golden/*.jkpt (not committed)
+python tools/compare.py $A/tum/*.png --b "cmd:build/release/jkp extract"   # original vs the C++ library
 ```
 
 | File | Purpose |

@@ -91,8 +91,11 @@ Each milestone is a state you can run and check. Phases below hold the technical
   Done: upstream pinned at `683d7c6`; `weights/aliked-n16.jkpw` is 44 tensors, 676,876 values, 2.71 MB.
   The reference forward pass from that file (`tools/folded.py`) matches the original on 27 images:
   identical keypoint sets, position error <= 1.3e-4 px, score error <= 3e-5, descriptor cosine >= 1 - 2e-10.
-- [ ] **M2 — First keypoints from our own code** (phase 1)
+- [x] **M2 — First keypoints from our own code** (phase 1)
   `jkp extract image.png` (CPU, C++, no dependencies) produces keypoints and descriptors that match the original in `compare.py`.
+  Done: 31/31 sample images match the original (identical keypoint sets, position error <= 1.3e-4 px,
+  score error <= 5e-5, descriptor cosine >= 1 - 5e-10); every intermediate tensor matches the golden dump
+  within 2e-5. Speed is not a goal here: ~0.8 s for 640x480 on 4 CPU threads.
 - [ ] **M3 — Runs on the Mac GPU** (phase 4, FP32)
   Metal backend passes the same comparison on the M5 laptop.
 - [ ] **M4 — Runs on NVIDIA** (phase 2)
@@ -211,6 +214,15 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - Golden files are ~50-100 MB per image at 320 px (dense feature maps), so they are generated locally
   with `tools/dump_golden.py`, not committed.
 - The original's `get_patches` custom op needs CUDA to build; `tools/upstream.py` has an equivalent CPU version.
+
+## Notes from M2
+
+- The ALIKED graph (`src/models/aliked/`) is written once against `src/core/ops.h`; a GPU backend implements
+  that interface (about a dozen operations, including `detect` and `describe`). Expect to revise the interface
+  when the first GPU backend shows what it needs (preallocation, fused operations).
+- The library is built with `-ffp-contract=off` so results do not depend on FMA availability.
+- The CLI decodes images with a vendored `stb_image.h`; the library itself has no image-decoding code.
+- `tests/golden_test.cpp` checks every stage against a golden dump and is the main debugging tool for new backends.
 
 ## Open questions (decide during implementation)
 

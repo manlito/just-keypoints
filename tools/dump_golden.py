@@ -31,6 +31,7 @@ def main():
     for path in args.images:
         rgb = upstream.load_image(path, args.max_size)
         out = upstream.run(model, rgb, stages=True)
+        out["image_f32"] = rgb.astype("float32")  # the C++ reader only loads float32 tensors
         meta = {"kind": "golden", "model": args.model, "source_commit": upstream.PINNED_COMMIT,
                 "image": os.path.basename(path), "width": rgb.shape[1], "height": rgb.shape[0],
                 "top_k": args.top_k, "scores_th": args.scores_th, "n_limit": args.n_limit, "device": args.device}

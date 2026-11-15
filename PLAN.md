@@ -10,7 +10,8 @@ Minimal-dependency ALIKED keypoint + descriptor extraction for bundle-adjustment
 | Scope | Keypoints + descriptors only. No matcher. |
 | Precision | FP32 "reference" mode on every backend, matching the original ALIKED repo; it is the default. FP16 is an opt-in fast mode (`config.precision`). |
 | Weights embedding | User's choice at build time (`JKP_EMBED_WEIGHTS=ON/OFF`, per model). Loading from a path, memory blob or URL always works. |
-| Extensibility | Other detectors can be added later: model id in config and weights file, per-model graph under `src/models/`, shared op kernels. Only ALIKED is implemented now. |
+| Second detector | RaCo (cvg/RaCo, Apache-2.0), after ALIKED is complete. See "RaCo" below. No further detectors planned. |
+| Extensibility | Model id in config and weights file, per-model graph under `src/models/`, shared op kernels. Detector and descriptor are separate stages so they can be combined. |
 | Native backend | Hand-written CUDA kernels. No PyTorch, ONNX Runtime, cuDNN or TensorRT. |
 | Apple backend | Hand-written Metal compute shaders (MSL). No Core ML or MPSGraph. |
 | Web backend | WGSL compute shaders, C++ core compiled to WASM (Emscripten) |
@@ -67,6 +68,10 @@ void      jkp_destroy(jkp_ctx*);
   - `score`  float32 `[N]`
   - `desc`   float32 `[N,D]`, L2-normalized; `D` reported in the result (128 for `aliked-n16`) (optional fp16 / uint8-quantized output later)
   - `n`      number of keypoints (<= `max_keypoints`)
+  - `rank`   float32 `[N]` — optional, RaCo ranker score
+  - `cov`    float32 `[N,2,2]` — optional, RaCo keypoint covariance in pixels (usable as a BA weight)
+- `desc` is optional too (`D = 0` for a detector without descriptors).
+- Config selects `detector` and `descriptor` independently, e.g. `detector = raco`, `descriptor = aliked-n16`.
 - Results can stay on the device (CUDA pointer / `MTLBuffer` / `GPUBuffer`) for a downstream GPU matcher.
 
 ## Weights format (`.jkpw`)
@@ -100,6 +105,8 @@ Each milestone is a state you can run and check. Phases below hold the technical
   GitHub Pages site: load two images, see keypoints, matches and timings.
 - [ ] **M8 — v1.0** (phase 7)
   CMake package, npm package, tagged release with weights and benchmark numbers.
+- [ ] **M9 — RaCo** (phase 8)
+  RaCo keypoints, ranker scores and covariances match the original on every backend; RaCo + ALIKED descriptors selectable in the demo.
 
 ## Phases
 
@@ -159,6 +166,33 @@ Each milestone is a state you can run and check. Phases below hold the technical
 - CMake install target + `find_package` config; single header.
 - npm package (wasm + js + weights).
 - Optional thin Python binding (ctypes over the C API) for use in SfM scripts.
+
+### 8 — RaCo detector
+- Export `raco.pth` to `.jkpw`, add `tools/` reference pass and `compare.py` support (same method as M1).
+- `src/models/raco/` graph on CPU, then CUDA, Metal, WebGPU.
+- "Describe at given keypoints" entry in the ALIKED descriptor head, so RaCo keypoints get ALIKED descriptors.
+- Demo: detector switch, covariance ellipses, top-K by ranker score.
+- **Exit:** M9.
+
+## RaCo
+
+Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `ee06fa6`.
+
+- **Detector only.** Outputs keypoints, detection scores, ranker scores and 2x2 covariances. No descriptors:
+  the authors match with ALIKED descriptors + LightGlue. For this repo that means running the ALIKED
+  network as well to describe RaCo keypoints — roughly two networks per image.
+- **Backbone** is ALIKED-n16 widths (16/32/64/128) with plain 3x3 convolutions, no deformable convolution.
+  Same pooling, upsampling, SELU and score head as ALIKED, so most kernels are reused.
+- **New ops:** reflect padding, 5x5 convolution, LeakyReLU, Softplus, global softmax over the score map,
+  ImageNet mean/std input normalization.
+- **Ranker head** runs on the full-resolution image: 9 residual blocks of 12 channels. Likely the most
+  expensive part; it can be skipped when ranking is not needed.
+- **Covariance head:** three 3x3 convolutions on the aggregated features, 3 Cholesky elements per pixel,
+  sampled at keypoints.
+- **Detection:** max-pool NMS (radius 3), top-K (default 2048), subpixel refinement; keypoints use a
+  pixel-centre convention (+0.5) that differs from ALIKED and must be unified in our API.
+- Weights are a release asset (`v1.0.0/raco.pth`); confirm the weights fall under the repo's Apache-2.0
+  license before redistributing an exported file.
 
 ## Development machines
 

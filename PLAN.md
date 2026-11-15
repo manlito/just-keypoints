@@ -71,7 +71,8 @@ void      jkp_destroy(jkp_ctx*);
 
 ## Weights format (`.jkpw`)
 
-Single flat binary: magic + version + model id + tensor table (name, shape, dtype, offset) + raw little-endian data.
+Single flat binary: magic + version + metadata (model id, widths, K, M) + tensor table (name, shape, dtype, offset) + raw little-endian data.
+Exact layout: see the top of `tools/jkpfile.py`.
 The model id selects the graph, so one loader serves every future detector.
 No protobuf, no parsing dependencies. Loadable via `fread`, `mmap`, or `fetch()` → `ArrayBuffer`.
 One FP32 file is shipped; FP16 mode converts the weights at load time.
@@ -80,8 +81,11 @@ One FP32 file is shipped; FP16 mode converts the weights at load time.
 
 Each milestone is a state you can run and check. Phases below hold the technical detail.
 
-- [ ] **M1 — Reference locked** (phase 0)
+- [x] **M1 — Reference locked** (phase 0)
   Original ALIKED runs under PyTorch on CPU; weights exported to `.jkpw`; golden vectors and `compare.py` exist.
+  Done: upstream pinned at `683d7c6`; `weights/aliked-n16.jkpw` is 44 tensors, 676,876 values, 2.71 MB.
+  The reference forward pass from that file (`tools/folded.py`) matches the original on 27 images:
+  identical keypoint sets, position error <= 1.3e-4 px, score error <= 3e-5, descriptor cosine >= 1 - 2e-10.
 - [ ] **M2 — First keypoints from our own code** (phase 1)
   `jkp extract image.png` (CPU, C++, no dependencies) produces keypoints and descriptors that match the original in `compare.py`.
 - [ ] **M3 — Runs on the Mac GPU** (phase 4, FP32)
@@ -161,6 +165,18 @@ Each milestone is a state you can run and check. Phases below hold the technical
 - Phases 0, 1, 4, 5, 6, 7 run on the M5 laptop (WebGPU via Dawn uses Metal there).
 - Phases 2 and 3 need an NVIDIA GPU machine.
 - The CUDA and Metal phases only depend on phase 1, so either can go first depending on the machine in use.
+
+## Notes from M1 (for the C++ port)
+
+- `tools/folded.py` is the executable specification: it uses only the `.jkpw` file and plain tensor ops.
+- Keypoints are stored normalized to [-1, 1] and the descriptor head truncates the pixel position recovered
+  from that value. The C++ code must keep the same float32 operation order, or a keypoint near an integer
+  pixel can pick a different 3x3 patch.
+- In threshold mode keypoints come out in raster order; only when more than `n_limit` pass the threshold
+  are they sorted by score and cut.
+- Golden files are ~50-100 MB per image at 320 px (dense feature maps), so they are generated locally
+  with `tools/dump_golden.py`, not committed.
+- The original's `get_patches` custom op needs CUDA to build; `tools/upstream.py` has an equivalent CPU version.
 
 ## Open questions (decide during implementation)
 

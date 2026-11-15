@@ -9,6 +9,8 @@ Minimal-dependency ALIKED keypoint + descriptor extraction for bundle-adjustment
 | Model | ALIKED `aliked-n16` (128-dim descriptors, BSD-3 weights) |
 | Scope | Keypoints + descriptors only. No matcher. |
 | Precision | FP32 "reference" mode on every backend, matching the original ALIKED repo; it is the default. FP16 is an opt-in fast mode (`config.precision`). |
+| Weights embedding | User's choice at build time (`JKP_EMBED_WEIGHTS=ON/OFF`, per model). Loading from a path, memory blob or URL always works. |
+| Extensibility | Other detectors can be added later: model id in config and weights file, per-model graph under `src/models/`, shared op kernels. Only ALIKED is implemented now. |
 | Native backend | Hand-written CUDA kernels. No PyTorch, ONNX Runtime, cuDNN or TensorRT. |
 | Apple backend | Hand-written Metal compute shaders (MSL). No Core ML or MPSGraph. |
 | Web backend | WGSL compute shaders, C++ core compiled to WASM (Emscripten) |
@@ -33,7 +35,8 @@ SDDH runs only on the K detected keypoints, not on the dense map.
 
 ```
 include/jkp/jkp.h        C API (the only public header)
-src/core/                weights loader, graph definition, tensor/buffer abstractions
+src/core/                weights loader, tensor/buffer abstractions, model registry
+src/models/aliked/       ALIKED graph (built from shared ops); future detectors get a sibling folder
 src/backend/cpu/         plain C++ reference (correctness oracle, WASM fallback)
 src/backend/cuda/        .cu kernels
 src/backend/metal/        .metal shaders + Objective-C++ glue
@@ -62,13 +65,14 @@ void      jkp_destroy(jkp_ctx*);
 - **Output** `jkp_result` (struct of arrays, caller- or library-owned):
   - `xy`     float32 `[N,2]` — pixel coordinates in the original image, subpixel
   - `score`  float32 `[N]`
-  - `desc`   float32 `[N,128]`, L2-normalized (optional fp16 / uint8-quantized output later)
+  - `desc`   float32 `[N,D]`, L2-normalized; `D` reported in the result (128 for `aliked-n16`) (optional fp16 / uint8-quantized output later)
   - `n`      number of keypoints (<= `max_keypoints`)
 - Results can stay on the device (CUDA pointer / `MTLBuffer` / `GPUBuffer`) for a downstream GPU matcher.
 
 ## Weights format (`.jkpw`)
 
 Single flat binary: magic + version + model id + tensor table (name, shape, dtype, offset) + raw little-endian data.
+The model id selects the graph, so one loader serves every future detector.
 No protobuf, no parsing dependencies. Loadable via `fread`, `mmap`, or `fetch()` → `ArrayBuffer`.
 One FP32 file is shipped; FP16 mode converts the weights at load time.
 

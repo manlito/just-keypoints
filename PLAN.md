@@ -76,6 +76,27 @@ The model id selects the graph, so one loader serves every future detector.
 No protobuf, no parsing dependencies. Loadable via `fread`, `mmap`, or `fetch()` → `ArrayBuffer`.
 One FP32 file is shipped; FP16 mode converts the weights at load time.
 
+## Milestones
+
+Each milestone is a state you can run and check. Phases below hold the technical detail.
+
+- [ ] **M1 — Reference locked** (phase 0)
+  Original ALIKED runs under PyTorch on CPU; weights exported to `.jkpw`; golden vectors and `compare.py` exist.
+- [ ] **M2 — First keypoints from our own code** (phase 1)
+  `jkp extract image.png` (CPU, C++, no dependencies) produces keypoints and descriptors that match the original in `compare.py`.
+- [ ] **M3 — Runs on the Mac GPU** (phase 4, FP32)
+  Metal backend passes the same comparison on the M5 laptop.
+- [ ] **M4 — Runs on NVIDIA** (phase 2)
+  CUDA backend passes the same comparison. Order of M3/M4 depends on the machine in use.
+- [ ] **M5 — Fast** (phase 3, plus FP16 on Metal)
+  Benchmark table: jkp CUDA vs PyTorch CUDA, jkp Metal, FP32 vs FP16, at three resolutions. FP16 accuracy loss measured.
+- [ ] **M6 — Runs in the browser** (phase 5)
+  WebGPU backend passes the comparison natively (Dawn) and in a browser test page.
+- [ ] **M7 — Public demo and docs** (phase 6)
+  GitHub Pages site: load two images, see keypoints, matches and timings.
+- [ ] **M8 — v1.0** (phase 7)
+  CMake package, npm package, tagged release with weights and benchmark numbers.
+
 ## Phases
 
 ### 0 — Reference and golden data
@@ -90,6 +111,7 @@ One FP32 file is shipped; FP16 mode converts the weights at load time.
 ### 1 — CPU reference in C++
 - Core: weights loader, graph description, C API.
 - Naive, readable implementation of every op.
+- Small CLI (`jkp extract`, `jkp bench`) that works with every backend.
 - **Exit:** per-layer match with golden (max abs error ~1e-4); final keypoints within 0.01 px, descriptor cosine > 0.999.
 
 ### 2 — CUDA backend (correctness)

@@ -44,7 +44,7 @@ if(JKP_EMBED_WEIGHTS)
   endforeach()
 endif()
 set(embed_cpp "${CMAKE_CURRENT_BINARY_DIR}/embedded_weights.cpp")
-string(REPLACE ";" "\;" embed_models_arg "${embed_models}")
+string(REPLACE ";" "|" embed_models_arg "${embed_models}")  # a list does not survive the command line
 add_custom_command(
   OUTPUT "${embed_cpp}"
   COMMAND ${CMAKE_COMMAND} "-DOUT=${embed_cpp}" "-DMODELS=${embed_models_arg}" -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/embed.cmake"
@@ -53,8 +53,10 @@ add_custom_command(
 
 add_library(jkp
   src/core/api.cpp
+  src/core/ops.cpp
   src/core/weights.cpp
   src/models/aliked/aliked.cpp
+  src/models/raco/raco.cpp
   src/backend/cpu/cpu_ops.cpp
   "${embed_cpp}")
 target_include_directories(jkp PUBLIC include PRIVATE src)
@@ -107,5 +109,16 @@ if(JKP_BUILD_TESTS)
       add_test(NAME golden_${backend}_${name}
                COMMAND golden_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/aliked-n16.jkpw" "${golden}" ${backend})
     endforeach()
+  endforeach()
+
+  # RaCo: python tools/dump_golden.py --model raco <images>
+  add_executable(raco_golden_test tests/raco_golden_test.cpp)
+  target_include_directories(raco_golden_test PRIVATE src)
+  target_link_libraries(raco_golden_test PRIVATE jkp)
+  file(GLOB raco_golden_files "${CMAKE_CURRENT_SOURCE_DIR}/build/golden/raco/*.jkpt")
+  foreach(golden IN LISTS raco_golden_files)
+    get_filename_component(name "${golden}" NAME_WLE)
+    add_test(NAME golden_raco_cpu_${name}
+             COMMAND raco_golden_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/raco.jkpw" "${golden}")
   endforeach()
 endif()

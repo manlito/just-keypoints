@@ -68,7 +68,25 @@ CPU backend on generated images (no golden files or Python needed for that one):
 ctest --test-dir build/release -R cuda_vs_cpu
 ```
 
+## RaCo detector
+
+[RaCo](https://github.com/cvg/RaCo) is a second model: a detector that returns, per keypoint, a ranker score
+and a 2x2 covariance in pixels², and no descriptors. It runs on the CPU backend for now and matches the original.
+
+```sh
+build/release/jkp extract image.png --model raco --weights weights/raco.jkpw --out features.jkpt
+python tools/compare.py --model raco image.png --b "cmd:build/release/jkp extract --weights weights/raco.jkpw"
+```
+
+Add `--descriptor aliked-n16` (C API: `config.descriptor`) to get ALIKED descriptors for the RaCo keypoints;
+this runs both networks. `--no-covariance` and `--no-ranker` (`skip_covariance`, `skip_ranker`) leave out a head:
+the covariance head is about three quarters of the run time.
+
+`--weights` is not needed when the build embeds the model: `-DJKP_EMBED_MODELS="aliked-n16;raco"` (adds ~2 MB).
+In the C API set `config.model = "raco"`; the result then has `rank` and `cov`, and `desc` is `NULL` unless a descriptor model is set.
+`top_k` is the number of keypoints (default 2048); there is no score threshold.
+
 ## Licenses
 
 Code in this repository: to be decided. Weights in `weights/` come from ALIKED (BSD-3-Clause, see
-`weights/LICENSE-ALIKED`). `cli/stb_image.h` is public domain / MIT and is used only by the CLI.
+`weights/LICENSE-ALIKED`) and RaCo (Apache-2.0, see `weights/LICENSE-RACO`). `cli/stb_image.h` is public domain / MIT and is used only by the CLI.

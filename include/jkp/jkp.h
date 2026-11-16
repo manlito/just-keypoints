@@ -17,14 +17,16 @@ typedef enum { JKP_FORMAT_GRAY8 = 0, JKP_FORMAT_RGB8 = 1, JKP_FORMAT_RGBA8 = 2 }
 
 typedef struct {
   jkp_backend backend;
-  /* Model to run; selects the embedded weights when no weights are given. Default "aliked-n16". */
+  /* Model to run; selects the embedded weights when no weights are given. Default "aliked-n16".
+     "raco" is a detector without descriptors: it returns ranker scores and covariances instead. */
   const char* model;
   /* Weights source, first that is set wins: memory blob, file path, weights embedded at build time. */
   const void* weights_data;
   size_t weights_size;
   const char* weights_path;
   /* Selection. top_k > 0: keep the top_k best keypoints. Otherwise keep every keypoint with
-     score > score_threshold, capped at max_keypoints (best first when over the cap). */
+     score > score_threshold, capped at max_keypoints (best first when over the cap).
+     raco: always the top_k best (2048 when top_k <= 0); score_threshold and max_keypoints are not used. */
   int top_k;
   float score_threshold;
   int max_keypoints;
@@ -32,6 +34,17 @@ typedef struct {
   int num_threads;
   /* GPU backends: device index; 0 = first device. */
   int device;
+  /* Optional second model that describes the keypoints of a detector without descriptors:
+     model = "raco", descriptor = "aliked-n16". NULL = only what `model` itself returns.
+     Its weights: memory blob, file path, or weights embedded at build time, as above. */
+  const char* descriptor;
+  const void* descriptor_weights_data;
+  size_t descriptor_weights_size;
+  const char* descriptor_weights_path;
+  /* raco: non-zero skips a head and leaves its output NULL. The covariance head is about three
+     quarters of the work of the network, the ranker head about a fifth. */
+  int skip_ranker;
+  int skip_covariance;
 } jkp_config;
 
 typedef struct {
@@ -45,10 +58,12 @@ typedef struct {
 /* Arrays are owned by the context and stay valid until the next jkp_extract or jkp_destroy on it. */
 typedef struct {
   int n;              /* number of keypoints */
-  int dim;            /* descriptor size (128 for aliked-n16) */
+  int dim;            /* descriptor size (128 for aliked-n16, 0 for raco without a descriptor model) */
   const float* xy;    /* [n][2] pixel coordinates, x right / y down, (0,0) = centre of the top-left pixel */
-  const float* score; /* [n] */
-  const float* desc;  /* [n][dim], L2-normalized */
+  const float* score; /* [n]; aliked: in [0, 1]. raco: probability, sums to 1 over the image */
+  const float* desc;  /* [n][dim], L2-normalized; NULL when dim is 0 */
+  const float* rank;  /* [n] ranker score, higher is better (raco); NULL for other models */
+  const float* cov;   /* [n][2][2] keypoint covariance in pixels^2 (raco); NULL for other models */
 } jkp_result;
 
 /* Fills `config` with defaults (CPU, aliked-n16, threshold 0.2, at most 5000 keypoints). */

@@ -30,6 +30,8 @@ typedef struct {
   int max_keypoints;
   /* CPU backend worker threads; 0 = all hardware threads. */
   int num_threads;
+  /* GPU backends: device index; 0 = first device. */
+  int device;
 } jkp_config;
 
 typedef struct {
@@ -51,6 +53,9 @@ typedef struct {
 
 /* Fills `config` with defaults (CPU, aliked-n16, threshold 0.2, at most 5000 keypoints). */
 void jkp_config_default(jkp_config* config);
+
+/* Returns 1 when the backend is compiled into this build (the device itself is checked by jkp_create). */
+int jkp_backend_available(jkp_backend backend);
 
 /* Returns NULL on failure; see jkp_last_error(). */
 jkp_ctx* jkp_create(const jkp_config* config);

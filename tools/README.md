@@ -13,6 +13,7 @@ python tools/compare.py $A/tum/*.png         # original vs reference forward pas
 python tools/compare.py $A/tum/*.png --a upstream:cpu --b upstream:cuda
 python tools/dump_golden.py $A/tum/*.png     # per-layer test vectors -> build/golden/*.jkpt (not committed)
 python tools/compare.py $A/tum/*.png --b "cmd:build/release/jkp extract"   # original vs the C++ library
+python tools/compare.py $A/tum/*.png --b "cmd:build/release/jkp extract --backend cuda"
 ```
 
 | File | Purpose |
@@ -22,7 +23,7 @@ python tools/compare.py $A/tum/*.png --b "cmd:build/release/jkp extract"   # ori
 | `folded.py` | forward pass from a `.jkpw` file only; the executable specification for the C++ backends |
 | `export_weights.py` | checkpoint -> `.jkpw` |
 | `dump_golden.py` | golden test vectors from the original |
-| `compare.py` | compares two implementations: `upstream`, `folded`, or `cmd:<program>` (the future `jkp` CLI) |
+| `compare.py` | compares two implementations: `upstream`, `folded`, or `cmd:<program>` (the `jkp` CLI, any backend) |
 
 The original needs a compiled CUDA extension (`custom_ops/get_patches`). When it is not built,
 `upstream.py` substitutes an equivalent pure-torch version so the original runs on CPU-only machines.

@@ -98,8 +98,12 @@ Each milestone is a state you can run and check. Phases below hold the technical
   within 2e-5. Speed is not a goal here: ~0.8 s for 640x480 on 4 CPU threads.
 - [ ] **M3 — Runs on the Mac GPU** (phase 4, FP32)
   Metal backend passes the same comparison on the M5 laptop.
-- [ ] **M4 — Runs on NVIDIA** (phase 2)
+- [x] **M4 — Runs on NVIDIA** (phase 2)
   CUDA backend passes the same comparison. Order of M3/M4 depends on the machine in use.
+  Done (RTX 2070, CUDA 13.4): `jkp extract --backend cuda` matches the original on 57/57 sample images,
+  in threshold and top-k mode (identical keypoint sets, position error <= 2.6e-4 px, score error <= 7e-5,
+  descriptor cosine >= 1 - 2e-9); every intermediate tensor matches the golden dump within 3e-5 and the
+  CPU backend within 2e-5. Not tuned yet: 43 ms for 640x480, about 8x the CPU backend on 12 threads.
 - [ ] **M5 — Fast** (phase 3, plus FP16 on Metal)
   Benchmark table: jkp CUDA vs PyTorch CUDA, jkp Metal, FP32 vs FP16, at three resolutions. FP16 accuracy loss measured.
 - [ ] **M6 — Runs in the browser** (phase 5)
@@ -223,6 +227,23 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - The library is built with `-ffp-contract=off` so results do not depend on FMA availability.
 - The CLI decodes images with a vendored `stb_image.h`; the library itself has no image-decoding code.
 - `tests/golden_test.cpp` checks every stage against a golden dump and is the main debugging tool for new backends.
+
+## Notes from M4
+
+- `src/backend/cuda/cuda_ops.cu` holds every kernel and the host glue; the only dependency is the CUDA
+  runtime library. The `Ops` interface did not need to change.
+- Kernels keep the float32 operation order of the CPU backend and are compiled with `--fmad=false`, so the
+  two backends differ only through `exp()` (SELU, sigmoid, soft-argmax). That is what makes the keypoint
+  sets identical; keep it when optimizing (M5), or accept and measure the difference there.
+- Selection runs on the device: block-wise ordered compaction for threshold mode; radix select on the
+  float bits, then a rank sort of the kept keypoints, for top-k and for the cap. Ties resolve in raster
+  order as on the CPU. Read back per image: N keypoints, N descriptors and a few counters.
+- Known costs left for M5: one thread per output value with no fusing or tiling, weights read from global
+  memory, the rank sort is O(N^2) (fine for N <= ~20k), keypoints make a host round trip between
+  `detect` and `describe`, and the mean-score fallback sums the score map in a single GPU thread.
+- `tests/backend_test.cpp` compares CUDA with CPU on generated images (selection modes, pixel formats,
+  flat and tiny images) and needs no golden files; `golden_test` takes the backend as a third argument.
+  A Metal or WebGPU backend can reuse both.
 
 ## Open questions (decide during implementation)
 

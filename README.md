@@ -3,13 +3,15 @@
 Keypoint and descriptor extraction (ALIKED) with minimal dependencies, for feature matching and bundle adjustment.
 No PyTorch, no ONNX Runtime. Plan and status: [PLAN.md](PLAN.md).
 
-Status: the CPU reference backend and the CUDA backend work and match the original ALIKED. The CUDA backend is
-not optimized yet. Metal and WebGPU backends are planned.
+Status: the CPU reference backend, the CUDA backend and the Metal backend work and match the original ALIKED.
+The GPU backends are not optimized yet. A WebGPU backend is planned.
 
 ## Build
 
 Needs CMake >= 3.16 and a C++17 compiler. Nothing else for the CPU backend.
 The CUDA backend is built when the CUDA toolkit (`nvcc`) is found; it uses no other library.
+The Metal backend is built on macOS; it uses only Metal.framework and compiles its shaders at run time, so
+no Metal toolchain is needed.
 
 ```sh
 cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release
@@ -20,6 +22,7 @@ cmake --build build/release
 |---|---|---|
 | `JKP_EMBED_WEIGHTS` | `ON` | compile the weights into the library (adds ~2.7 MB); `OFF` = give a path or memory blob at run time |
 | `JKP_CUDA` | `AUTO` | CUDA backend: `AUTO` = build it when a CUDA compiler is found, `ON` = require it, `OFF` |
+| `JKP_METAL` | `AUTO` | Metal backend: `AUTO` = build it on Apple platforms, `ON` = require it, `OFF` |
 | `JKP_BUILD_CLI` | `ON` | build the `jkp` tool |
 | `JKP_BUILD_TESTS` | `ON` | build tests |
 
@@ -29,9 +32,10 @@ cmake --build build/release
 build/release/jkp extract image.png --out features.jkpt    # keypoints, scores, descriptors
 build/release/jkp bench image.png --runs 10
 build/release/jkp bench image.png --backend cuda
+build/release/jkp bench image.png --backend metal
 ```
 
-Options: `--backend cpu|cuda`, `--device N`, `--top-k K`, `--scores-th T`, `--n-limit N`, `--weights file.jkpw`, `--threads N`, `--gray`.
+Options: `--backend cpu|cuda|metal`, `--device N`, `--top-k K`, `--scores-th T`, `--n-limit N`, `--weights file.jkpw`, `--threads N`, `--gray`.
 
 ## C API
 
@@ -58,14 +62,15 @@ See [tools/README.md](tools/README.md). In short:
 ```sh
 python tools/compare.py third_party/ALIKED/assets/tum/*.png --b "cmd:build/release/jkp extract"
 python tools/compare.py third_party/ALIKED/assets/tum/*.png --b "cmd:build/release/jkp extract --backend cuda"
+python tools/compare.py third_party/ALIKED/assets/tum/*.png --b "cmd:build/release/jkp extract --backend metal"
 python tools/dump_golden.py third_party/ALIKED/assets/tum/*.png   # then: ctest --test-dir build/release
 ```
 
-`ctest` runs the golden files against every backend in the build, and compares the CUDA backend with the
+`ctest` runs the golden files against every backend in the build, and compares each GPU backend with the
 CPU backend on generated images (no golden files or Python needed for that one):
 
 ```sh
-ctest --test-dir build/release -R cuda_vs_cpu
+ctest --test-dir build/release -R _vs_cpu
 ```
 
 ## Licenses

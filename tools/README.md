@@ -14,6 +14,7 @@ python tools/compare.py $A/tum/*.png --a upstream:cpu --b upstream:cuda
 python tools/dump_golden.py $A/tum/*.png     # per-layer test vectors -> build/golden/*.jkpt (not committed)
 python tools/compare.py $A/tum/*.png --b "cmd:build/release/jkp extract"   # original vs the C++ library
 python tools/compare.py $A/tum/*.png --b "cmd:build/release/jkp extract --backend cuda"
+python tools/compare.py $A/tum/*.png --b "cmd:build/release/jkp extract --backend metal"
 ```
 
 | File | Purpose |

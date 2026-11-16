@@ -34,8 +34,8 @@ int usage() {
                "       jkp bench   IMAGE [--runs N] [options]\n"
                "options:\n"
                "  --image PATH      input image (same as the positional argument)\n"
-               "  --backend NAME    cpu (default) or cuda\n"
-               "  --device N        GPU index for --backend cuda (default 0)\n"
+               "  --backend NAME    cpu (default), cuda or metal\n"
+               "  --device N        GPU index for --backend cuda or metal (default 0)\n"
                "  --weights PATH    .jkpw file (default: weights embedded in the build)\n"
                "  --top-k K         keep the K best keypoints (default: threshold mode)\n"
                "  --scores-th T     score threshold (default 0.2)\n"
@@ -70,6 +70,7 @@ int main(int argc, char** argv) {
       std::string name = value();
       if (name == "cpu") config.backend = JKP_BACKEND_CPU;
       else if (name == "cuda") config.backend = JKP_BACKEND_CUDA;
+      else if (name == "metal") config.backend = JKP_BACKEND_METAL;
       else return usage();
     }
     else if (a == "--device") config.device = std::atoi(value());

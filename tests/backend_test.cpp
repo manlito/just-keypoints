@@ -1,6 +1,6 @@
 // Compares a GPU backend with the CPU backend on generated images: every intermediate tensor and the
 // final keypoints, scores and descriptors, across the selection modes and pixel formats.
-//   backend_test WEIGHTS.jkpw cuda
+//   backend_test WEIGHTS.jkpw cuda|metal
 // Needs no golden files. The CPU backend is itself checked against the original ALIKED by golden_test.
 #include <cmath>
 #include <cstdint>
@@ -13,6 +13,7 @@
 #include "core/ops.h"
 #include "core/weights.h"
 #include "models/aliked/aliked.h"
+#include "test_backends.h"
 
 namespace {
 
@@ -101,8 +102,9 @@ Run run(const jkp::Aliked& model, jkp::Ops& ops, const Case& c, const std::vecto
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 3 || std::string(argv[2]) != "cuda") {
-    std::fprintf(stderr, "usage: backend_test WEIGHTS.jkpw cuda\n");
+  const std::string backend = argc == 3 ? argv[2] : "";
+  if (backend != "cuda" && backend != "metal") {
+    std::fprintf(stderr, "usage: backend_test WEIGHTS.jkpw cuda|metal\n");
     return 2;
   }
   const Case cases[] = {
@@ -127,7 +129,7 @@ int main(int argc, char** argv) {
     jkp::Weights weights = jkp::Weights::from_file(argv[1]);
     jkp::Aliked model(weights);
     auto cpu = jkp::make_cpu_ops(0);
-    auto gpu = jkp::make_cuda_ops(0);
+    auto gpu = make_backend(backend);
     for (const Case& c : cases) {
       int stride = c.w * c.channels + c.extra_stride;
       std::vector<uint8_t> image = picture(c.w, c.h, c.channels, stride, 12345u + static_cast<uint32_t>(c.w));

@@ -96,8 +96,13 @@ Each milestone is a state you can run and check. Phases below hold the technical
   Done: 31/31 sample images match the original (identical keypoint sets, position error <= 1.3e-4 px,
   score error <= 5e-5, descriptor cosine >= 1 - 5e-10); every intermediate tensor matches the golden dump
   within 2e-5. Speed is not a goal here: ~0.8 s for 640x480 on 4 CPU threads.
-- [ ] **M3 — Runs on the Mac GPU** (phase 4, FP32)
+- [x] **M3 — Runs on the Mac GPU** (phase 4, FP32)
   Metal backend passes the same comparison on the M5 laptop.
+  Done (M5 Pro, macOS 26): `jkp extract --backend metal` matches the original on 57/57 sample images,
+  in threshold and top-k mode (identical keypoint sets, position error <= 2.6e-4 px, score error <= 8e-5,
+  descriptor cosine >= 1 - 4e-9); every intermediate tensor matches the golden dump within 3.1e-5 and the
+  CPU backend within 2.3e-5. Not tuned yet: 25 ms for 640x400, 60-75 ms for 1024x640, 230 ms for
+  1920x1200, about 2x the CPU backend on the same machine.
 - [x] **M4 — Runs on NVIDIA** (phase 2)
   CUDA backend passes the same comparison. Order of M3/M4 depends on the machine in use.
   Done (RTX 2070, CUDA 13.4): `jkp extract --backend cuda` matches the original on 57/57 sample images,
@@ -244,6 +249,30 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - `tests/backend_test.cpp` compares CUDA with CPU on generated images (selection modes, pixel formats,
   flat and tiny images) and needs no golden files; `golden_test` takes the backend as a third argument.
   A Metal or WebGPU backend can reuse both.
+
+## Notes from M3
+
+- `src/backend/metal/kernels.metal` is a kernel-by-kernel port of the CUDA file (same names, same argument
+  order, one scalar per buffer index via `setBytes`); `metal_ops.mm` is the host glue. Dependencies:
+  Metal.framework and Foundation only. The `Ops` interface did not change.
+- The shader source is embedded in the library (`cmake/embed_text.cmake`) and compiled at `jkp_create`
+  with `newLibraryWithSource`, so building needs no Metal toolchain (`xcodebuild -downloadComponent
+  MetalToolchain` is not installed on the M5). Compile options: safe math mode, precise math functions,
+  and `#pragma METAL fp contract(off)` in the source. As on CUDA, results differ from the CPU backend only
+  through `exp()`. Precompiling a `.metallib` (when the toolchain is present) would save the compile at startup.
+- All buffers use shared storage: the image is written and results are read in place, with no copies.
+  Work is encoded into one command buffer with serial dispatch and committed only when the host needs a
+  value (stage readback, selection counts, results). The buffer pool hands a buffer released during the
+  open command buffer back to GPU work at once (dispatch order makes that safe) but never to a buffer the
+  host writes; those wait for the next sync.
+- Selection matches CUDA: block-wise ordered compaction, radix select on the float bits, rank sort. The
+  prefix sum over block counts and the mean-score fallback sum run on the host (shared memory makes that
+  free and the fallback sum identical to the CPU backend).
+- `tests/backend_test.cpp` now takes `cuda|metal`; ctest registers `<backend>_vs_cpu` for each GPU backend
+  in the build and the golden tests per backend.
+- Known costs left for M5: same as CUDA (no tiling or fusing, O(N^2) rank sort, keypoint round trip between
+  `detect` and `describe`), plus a full sync for each radix-select pass. Peak memory is ~1.7 GB at
+  1024x640, mostly the deformable-convolution column buffer and the pool keeping every size it has seen.
 
 ## Open questions (decide during implementation)
 

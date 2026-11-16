@@ -74,5 +74,7 @@ class Ops {
 std::unique_ptr<Ops> make_cpu_ops(int num_threads);
 // Only in builds with the CUDA backend (JKP_HAVE_CUDA). device: GPU index.
 std::unique_ptr<Ops> make_cuda_ops(int device);
+// Only in builds with the Metal backend (JKP_HAVE_METAL). device: index in MTLCopyAllDevices().
+std::unique_ptr<Ops> make_metal_ops(int device);
 
 }  // namespace jkp

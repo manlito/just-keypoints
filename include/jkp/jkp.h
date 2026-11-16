@@ -15,6 +15,10 @@ typedef enum { JKP_BACKEND_CPU = 0, JKP_BACKEND_CUDA = 1, JKP_BACKEND_METAL = 2,
 
 typedef enum { JKP_FORMAT_GRAY8 = 0, JKP_FORMAT_RGB8 = 1, JKP_FORMAT_RGBA8 = 2 } jkp_format;
 
+/* FP32 is the reference mode: it matches the original network. FP16 (GPU backends only) stores feature
+   maps and weights as 16-bit floats: faster, with slightly different keypoints and descriptors. */
+typedef enum { JKP_PRECISION_FP32 = 0, JKP_PRECISION_FP16 = 1 } jkp_precision;
+
 typedef struct {
   jkp_backend backend;
   /* Model to run; selects the embedded weights when no weights are given. Default "aliked-n16".
@@ -45,6 +49,8 @@ typedef struct {
      quarters of the work of the network, the ranker head about a fifth. */
   int skip_ranker;
   int skip_covariance;
+  /* Default JKP_PRECISION_FP32. jkp_create fails when the backend does not support the precision. */
+  jkp_precision precision;
 } jkp_config;
 
 typedef struct {

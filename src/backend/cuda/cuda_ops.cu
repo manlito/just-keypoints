@@ -1,20 +1,47 @@
-// CUDA backend: one hand-written kernel per operation, FP32, CHW layout, same graph as the CPU backend.
+// CUDA backend: hand-written kernels, CHW layout, same graph as the CPU backend.
 //
-// Correctness first (PLAN.md phase 2). Every kernel keeps the float32 operation order of
-// src/backend/cpu/cpu_ops.cpp and the file is compiled with --fmad=false, so the only source of
-// difference from the CPU backend is the exp() implementation (SELU, sigmoid, soft-argmax).
+// FP32 (the default) keeps the float32 operation order of src/backend/cpu/cpu_ops.cpp, and the file is
+// compiled with --fmad=false, so the only source of difference from the CPU backend is the exp()
+// implementation (SELU, sigmoid, soft-argmax).
+//
+// Precision: every kernel that touches a feature map is a template on its storage type R, float or
+// __half. In FP16 mode feature maps and the weights of the dense network are stored as __half and
+// converted to float when read; arithmetic is float32 in both modes (FP16 mode uses a fused multiply-add
+// in the convolutions). The score map (the output of the sigmoid convolution) stays float so that scores
+// do not tie, and so do keypoint selection and the descriptor head's own weights and buffers.
+//
+// Speed (PLAN.md phase 3):
+// - Convolutions compute T output channels per thread, with weights stored tap-major so that the T
+//   weights of a tap are adjacent. Each output accumulates in the same order as before.
+// - The 128-channel full-resolution tensor of ALIKED (upsample_concat, then l2_normalize_crop) is a lazy
+//   "pyramid": the 1x1 convolution of the score head and the descriptor head compute its values from
+//   the four small maps where they need them. It is stored only if something else asks for its values
+//   (Tensor::read in the tests, any other operation). Stored or not, FP32 results are the same.
 //
 // Keypoint selection (threshold, top-k, compaction, ordering) runs on the device; only the selected
 // keypoints and their descriptors are copied back to the host.
+//
+// Profiling: with JKP_CUDA_PROFILE=1 in the environment every kernel launch is followed by a device
+// synchronization and its time is recorded under the operation that issued it; the table goes to stderr
+// when the backend is destroyed. Total times are meaningless in that mode, times per launch are not.
+#include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <chrono>
 #include <climits>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <stdexcept>
 #include <string>
+#include <utility>
+#include <vector>
 
+#include "core/half.h"
 #include "core/ops.h"
 
 namespace jkp {
@@ -24,10 +51,24 @@ namespace {
 // Device helpers shared by the kernels
 // ---------------------------------------------------------------------------------------------
 
-enum : int { kActNone = 0, kActSelu = 1, kActSigmoid = 2 };
+enum : int { kActNone = 0, kActSelu = 1, kActSigmoid = 2, kActLeakyRelu = 3 };
 enum : int { kGreater = 0, kEqual = 1 };
-constexpr int kRadius = 2;       // NMS and soft-argmax window radius
-constexpr int kScanBlock = 256;  // elements handled by one thread in the compaction kernels
+constexpr int kRadius = 2;        // NMS and soft-argmax window radius
+constexpr int kScanBlock = 256;   // elements handled by one thread in the compaction kernels
+constexpr int kMaxPyramidC = 128; // channels the descriptor kernels on a pyramid can hold per thread
+
+// Storage type <-> float.
+__device__ __forceinline__ float ld(float v) { return v; }
+__device__ __forceinline__ float ld(__half v) { return __half2float(v); }
+__device__ __forceinline__ void st(float* p, float v) { *p = v; }
+__device__ __forceinline__ void st(__half* p, float v) { *p = __float2half(v); }
+
+// acc + w * v. FP32 keeps the two roundings of the CPU backend (the file is compiled with --fmad=false);
+// FP16 mode is not tied to the CPU backend's rounding and uses a fused multiply-add.
+template <typename R>
+__device__ __forceinline__ float mac(float acc, float w, float v) {
+  return sizeof(R) == sizeof(float) ? acc + w * v : fmaf(w, v, acc);
+}
 
 __device__ __forceinline__ float selu(float x) {
   const float alpha = 1.6732632423543772848170429916717f, scale = 1.0507009873554804934193349852946f;
@@ -37,6 +78,7 @@ __device__ __forceinline__ float selu(float x) {
 __device__ __forceinline__ float activate(float v, int act) {
   if (act == kActSelu) return selu(v);
   if (act == kActSigmoid) return 1.0f / (1.0f + expf(-v));
+  if (act == kActLeakyRelu) return v > 0 ? v : 0.01f * v;
   return v;
 }
 
@@ -55,8 +97,9 @@ __device__ __forceinline__ void bilinear_setup(float x, float y, int w, int h, i
     wt[i] = inside ? ws[i] : 0.0f;
   }
 }
-__device__ __forceinline__ float bilinear_apply(const float* plane, const int idx[4], const float wt[4]) {
-  return wt[0] * plane[idx[0]] + wt[1] * plane[idx[1]] + wt[2] * plane[idx[2]] + wt[3] * plane[idx[3]];
+template <typename P>
+__device__ __forceinline__ float bilinear_apply(const P* plane, const int idx[4], const float wt[4]) {
+  return wt[0] * ld(plane[idx[0]]) + wt[1] * ld(plane[idx[1]]) + wt[2] * ld(plane[idx[2]]) + wt[3] * ld(plane[idx[3]]);
 }
 
 __device__ __forceinline__ int thread_index() { return static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x); }
@@ -65,15 +108,17 @@ __device__ __forceinline__ int thread_index() { return static_cast<int>(blockIdx
 // Dense kernels. One thread per output element unless noted.
 // ---------------------------------------------------------------------------------------------
 
-__global__ void k_image(const uint8_t* src, int stride, int channels, int w, int h, float* dst) {
+template <typename R>
+__global__ void k_image(const uint8_t* src, int stride, int channels, int w, int h, R* dst) {
   int i = thread_index(), hw = h * w;
   if (i >= 3 * hw) return;
   int c = i / hw, y = (i % hw) / w, x = i % w;
   int src_c = channels == 1 ? 0 : c;
-  dst[i] = static_cast<float>(src[static_cast<size_t>(y) * stride + x * channels + src_c]) / 255.0f;
+  st(dst + i, static_cast<float>(src[static_cast<size_t>(y) * stride + x * channels + src_c]) / 255.0f);
 }
 
-__global__ void k_pad_replicate(const float* src, int c, int h, int w, int left, int top, int oh, int ow, float* dst) {
+template <typename R>
+__global__ void k_pad_replicate(const R* src, int c, int h, int w, int left, int top, int oh, int ow, R* dst) {
   int i = thread_index(), ohw = oh * ow;
   if (i >= c * ohw) return;
   int ch = i / ohw, y = (i % ohw) / ow, x = i % ow;
@@ -81,83 +126,141 @@ __global__ void k_pad_replicate(const float* src, int c, int h, int w, int left,
   dst[i] = src[(ch * h + sy) * w + sx];
 }
 
-__global__ void k_crop(const float* src, int c, int h, int w, int left, int top, int oh, int ow, float* dst) {
+// P: any element type (feature maps, and the float score map in FP16 mode).
+template <typename P>
+__global__ void k_crop(const P* src, int c, int h, int w, int left, int top, int oh, int ow, P* dst) {
   int i = thread_index(), ohw = oh * ow;
   if (i >= c * ohw) return;
   int ch = i / ohw, y = (i % ohw) / ow, x = i % ow;
   dst[i] = src[(ch * h + y + top) * w + x + left];
 }
 
-__global__ void k_conv2d(const float* x, const float* weight, const float* bias, int cin, int cout, int h, int w,
-                         int k, int act, float* out) {
+// General convolution, one thread per output value; weights [cout][cin][k][k]. Used for kernel sizes
+// without a tiled kernel.
+template <typename R>
+__global__ void k_conv2d(const R* x, const R* weight, const R* bias, int cin, int cout, int h, int w, int k, int act,
+                         R* out) {
   int i = thread_index(), hw = h * w;
   if (i >= cout * hw) return;
   int oc = i / hw, y = (i % hw) / w, xo = i % w, pad = k / 2;
-  float acc = bias ? bias[oc] : 0.0f;
-  const float* wk = weight + static_cast<size_t>(oc) * cin * k * k;
+  float acc = bias ? ld(bias[oc]) : 0.0f;
+  const R* wk = weight + static_cast<size_t>(oc) * cin * k * k;
   for (int ic = 0; ic < cin; ++ic, wk += k * k) {
-    const float* in = x + static_cast<size_t>(ic) * hw;
+    const R* in = x + static_cast<size_t>(ic) * hw;
     for (int ky = 0; ky < k; ++ky) {
       int sy = y + ky - pad;
       if (sy < 0 || sy >= h) continue;
       for (int kx = 0; kx < k; ++kx) {
         int sx = xo + kx - pad;
         if (sx < 0 || sx >= w) continue;
-        acc += wk[ky * k + kx] * in[sy * w + sx];
+        acc = mac<R>(acc, ld(wk[ky * k + kx]), ld(in[sy * w + sx]));
       }
     }
   }
-  out[i] = activate(acc, act);
+  st(out + i, activate(acc, act));
+}
+
+// Weights of the tiled kernels are stored tap-major: w[tap * cpad + oc], tap = (ic * K + ky) * K + kx,
+// cpad = cout rounded up to the tile size T (zeros in the padding), so the T weights one thread needs
+// for a tap are adjacent.
+//
+// Convolution, T output channels per thread for one pixel, KxK kernel known at compile time. Each input
+// value is read once for all T outputs, and each output accumulates in the order of k_conv2d, so the
+// results are identical. Grid: ceil(cout / T) * h * w, pixel fastest.
+// O is the output storage type: R, or float for the score map in FP16 mode.
+template <typename R, typename O, int T, int K>
+__global__ void k_conv2d_tile(const R* x, const R* weight, const R* bias, int cin, int cout, int h, int w, int act,
+                              O* out) {
+  const int hw = h * w, blocks = (cout + T - 1) / T;
+  const int i = thread_index();
+  if (i >= blocks * hw) return;
+  const int ob = i / hw, pix = i % hw, y = pix / w, xo = pix % w, pad = K / 2, oc0 = ob * T;
+  float acc[T];
+  #pragma unroll
+  for (int t = 0; t < T; ++t) acc[t] = bias && oc0 + t < cout ? ld(bias[oc0 + t]) : 0.0f;
+  for (int ic = 0; ic < cin; ++ic) {
+    const R* in = x + static_cast<size_t>(ic) * hw;
+    const int wic = ic * K * K;
+    for (int ky = 0; ky < K; ++ky) {
+      const int sy = y + ky - pad;
+      if (sy < 0 || sy >= h) continue;
+      for (int kx = 0; kx < K; ++kx) {
+        const int sx = xo + kx - pad;
+        if (sx < 0 || sx >= w) continue;
+        const float v = ld(in[sy * w + sx]);
+        const R* wp = weight + (static_cast<size_t>(wic + ky * K + kx) * blocks + ob) * T;
+        #pragma unroll
+        for (int t = 0; t < T; ++t) acc[t] = mac<R>(acc[t], ld(wp[t]), v);
+      }
+    }
+  }
+  #pragma unroll
+  for (int t = 0; t < T; ++t)
+    if (oc0 + t < cout) st(out + static_cast<size_t>(oc0 + t) * hw + pix, activate(acc[t], act));
 }
 
 // Deformable convolution, step 1. One thread per (kernel tap, pixel): samples every input channel at
 // the offset position. col[(ic * 9 + tap) * hw + pixel].
-__global__ void k_deform_sample(const float* x, const float* off, int cin, int h, int w, float max_offset,
-                                float* col) {
+template <typename R>
+__global__ void k_deform_sample(const R* x, const R* off, int cin, int h, int w, float max_offset, R* col) {
   int i = thread_index(), hw = h * w;
   if (i >= 9 * hw) return;
   int k = i / hw, pix = i % hw, y = pix / w, xo = pix % w;
-  float off_y = off[static_cast<size_t>(2 * k) * hw + pix], off_x = off[static_cast<size_t>(2 * k + 1) * hw + pix];
+  float off_y = ld(off[static_cast<size_t>(2 * k) * hw + pix]), off_x = ld(off[static_cast<size_t>(2 * k + 1) * hw + pix]);
   float py = static_cast<float>(y - 1 + k / 3) + clampf(off_y, -max_offset, max_offset);
   float px = static_cast<float>(xo - 1 + k % 3) + clampf(off_x, -max_offset, max_offset);
   int idx[4] = {0, 0, 0, 0};
   float wt[4] = {0, 0, 0, 0};
   if (py > -1 && py < h && px > -1 && px < w) bilinear_setup(px, py, w, h, idx, wt);
   for (int ic = 0; ic < cin; ++ic)
-    col[(static_cast<size_t>(ic) * 9 + k) * hw + pix] = bilinear_apply(x + static_cast<size_t>(ic) * hw, idx, wt);
+    st(col + (static_cast<size_t>(ic) * 9 + k) * hw + pix, bilinear_apply(x + static_cast<size_t>(ic) * hw, idx, wt));
 }
 
-// Deformable convolution, step 2: weighted sum over the sampled columns.
-__global__ void k_deform_sum(const float* col, const float* weight, const float* bias, int taps, int cout, int hw,
-                             int act, float* out) {
-  int i = thread_index();
-  if (i >= cout * hw) return;
-  int oc = i / hw, pix = i % hw;
-  const float* wk = weight + static_cast<size_t>(oc) * taps;
-  float acc = bias[oc];
-  for (int j = 0; j < taps; ++j) acc += wk[j] * col[static_cast<size_t>(j) * hw + pix];
-  out[i] = activate(acc, act);
+// Deformable convolution, step 2: weighted sum over the sampled columns, T output channels per thread.
+// Weights are tap-major, tap = ic * 9 + kernel tap. Grid: ceil(cout / T) * hw.
+template <typename R, int T>
+__global__ void k_deform_sum_tile(const R* col, const R* weight, const R* bias, int taps, int cout, int hw, int act,
+                                  R* out) {
+  const int blocks = (cout + T - 1) / T;
+  const int i = thread_index();
+  if (i >= blocks * hw) return;
+  const int ob = i / hw, pix = i % hw, oc0 = ob * T;
+  float acc[T];
+  #pragma unroll
+  for (int t = 0; t < T; ++t) acc[t] = oc0 + t < cout ? ld(bias[oc0 + t]) : 0.0f;
+  for (int j = 0; j < taps; ++j) {
+    const float v = ld(col[static_cast<size_t>(j) * hw + pix]);
+    const R* wp = weight + (static_cast<size_t>(j) * blocks + ob) * T;
+    #pragma unroll
+    for (int t = 0; t < T; ++t) acc[t] = mac<R>(acc[t], ld(wp[t]), v);
+  }
+  #pragma unroll
+  for (int t = 0; t < T; ++t)
+    if (oc0 + t < cout) st(out + static_cast<size_t>(oc0 + t) * hw + pix, activate(acc[t], act));
 }
 
-__global__ void k_add(const float* a, const float* b, int n, int act, float* out) {
+template <typename R>
+__global__ void k_add(const R* a, const R* b, int n, int act, R* out) {
   int i = thread_index();
   if (i >= n) return;
-  out[i] = activate(a[i] + b[i], act);
+  st(out + i, activate(ld(a[i]) + ld(b[i]), act));
 }
 
-__global__ void k_avg_pool(const float* x, int c, int w, int oh, int ow, int k, float* out) {
+template <typename R>
+__global__ void k_avg_pool(const R* x, int c, int w, int oh, int ow, int k, R* out) {
   int i = thread_index(), ohw = oh * ow;
   if (i >= c * ohw) return;
   int ch = i / ohw, y = (i % ohw) / ow, xo = i % ow;
-  const float* in = x + static_cast<size_t>(ch) * (oh * k) * w;
+  const R* in = x + static_cast<size_t>(ch) * (oh * k) * w;
   float sum = 0;
   for (int j = 0; j < k; ++j)
-    for (int q = 0; q < k; ++q) sum += in[(y * k + j) * w + xo * k + q];
-  out[i] = sum / static_cast<float>(k * k);
+    for (int q = 0; q < k; ++q) sum += ld(in[(y * k + j) * w + xo * k + q]);
+  st(out + i, sum / static_cast<float>(k * k));
 }
 
 // Bilinear, align_corners = true: source position = dst * (in - 1) / (out - 1); sx, sy are those ratios.
-__global__ void k_upsample(const float* x, int c, int h, int w, int oh, int ow, float sx, float sy, float* out) {
+template <typename R>
+__global__ void k_upsample(const R* x, int c, int h, int w, int oh, int ow, float sx, float sy, R* out) {
   int i = thread_index(), ohw = oh * ow;
   if (i >= c * ohw) return;
   int ch = i / ohw, y = (i % ohw) / ow, xo = i % ow;
@@ -166,26 +269,126 @@ __global__ void k_upsample(const float* x, int c, int h, int w, int oh, int ow, 
   int x1 = x0 + (x0 < w - 1 ? 1 : 0), y1 = y0 + (y0 < h - 1 ? 1 : 0);
   float w1 = src_x - static_cast<float>(x0), w0 = 1.0f - w1;
   float h1 = src_y - static_cast<float>(y0), h0 = 1.0f - h1;
-  const float* r0 = x + (static_cast<size_t>(ch) * h + y0) * w;
-  const float* r1 = x + (static_cast<size_t>(ch) * h + y1) * w;
-  out[i] = h0 * (w0 * r0[x0] + w1 * r0[x1]) + h1 * (w0 * r1[x0] + w1 * r1[x1]);
+  const R* r0 = x + (static_cast<size_t>(ch) * h + y0) * w;
+  const R* r1 = x + (static_cast<size_t>(ch) * h + y1) * w;
+  st(out + i, h0 * (w0 * ld(r0[x0]) + w1 * ld(r0[x1])) + h1 * (w0 * ld(r1[x0]) + w1 * ld(r1[x1])));
 }
 
-// One thread per pixel.
-__global__ void k_l2_normalize(const float* x, int c, int hw, float* out) {
-  int i = thread_index();
-  if (i >= hw) return;
+// L2 normalization across channels of the cropped region of x (c x h x w) at (left, top); out is
+// c x oh x ow. One thread per output pixel.
+template <typename R>
+__global__ void k_l2_normalize_crop(const R* x, int c, int h, int w, int left, int top, int oh, int ow, R* out) {
+  const int i = thread_index(), ohw = oh * ow;
+  if (i >= ohw) return;
+  const int hw = h * w, src = (i / ow + top) * w + i % ow + left;
   float norm = 0;
   for (int ch = 0; ch < c; ++ch) {
-    float v = x[static_cast<size_t>(ch) * hw + i];
+    float v = ld(x[static_cast<size_t>(ch) * hw + src]);
     norm += v * v;
   }
   norm = fmaxf(sqrtf(norm), 1e-12f);
-  for (int ch = 0; ch < c; ++ch) out[static_cast<size_t>(ch) * hw + i] = x[static_cast<size_t>(ch) * hw + i] / norm;
+  for (int ch = 0; ch < c; ++ch)
+    st(out + static_cast<size_t>(ch) * ohw + i, ld(x[static_cast<size_t>(ch) * hw + src]) / norm);
 }
 
 // ---------------------------------------------------------------------------------------------
-// Detection kernels
+// Pyramid: the concatenation of up to four maps, each upsampled to the full resolution (k_upsample's
+// arithmetic, or as is for scale 1). The kernels below compute its values where they are needed
+// instead of storing it. In FP32 they give exactly what the stored tensor would hold.
+// ---------------------------------------------------------------------------------------------
+
+struct PyramidArgs {
+  int c[4] = {0, 0, 0, 0}, h[4] = {1, 1, 1, 1}, w[4] = {1, 1, 1, 1}, scale[4] = {1, 1, 1, 1};  // c = 0: unused part
+  float sx[4] = {0, 0, 0, 0}, sy[4] = {0, 0, 0, 0};                                            // k_upsample's ratios
+  int H = 0, W = 0;       // full resolution
+  int left = 0, top = 0;  // origin of the cropped map inside the pyramid (descriptor kernels)
+};
+
+// Where one part is read for a full-resolution pixel.
+struct Taps {
+  int i00, i01, i10, i11;
+  float w0, w1, h0, h1;
+  bool direct;
+};
+
+__device__ __forceinline__ Taps part_taps(const PyramidArgs& a, int p, int X, int Y) {
+  Taps t;
+  const int w = a.w[p], h = a.h[p];
+  t.direct = a.scale[p] == 1;
+  if (t.direct) {
+    t.i00 = t.i01 = t.i10 = t.i11 = Y * w + X;
+    t.w0 = t.h0 = 1.0f, t.w1 = t.h1 = 0.0f;
+    return t;
+  }
+  float src_x = a.sx[p] * static_cast<float>(X), src_y = a.sy[p] * static_cast<float>(Y);
+  int x0 = min(static_cast<int>(src_x), w - 1), y0 = min(static_cast<int>(src_y), h - 1);
+  int x1 = x0 + (x0 < w - 1 ? 1 : 0), y1 = y0 + (y0 < h - 1 ? 1 : 0);
+  t.w1 = src_x - static_cast<float>(x0), t.w0 = 1.0f - t.w1;
+  t.h1 = src_y - static_cast<float>(y0), t.h0 = 1.0f - t.h1;
+  t.i00 = y0 * w + x0, t.i01 = y0 * w + x1, t.i10 = y1 * w + x0, t.i11 = y1 * w + x1;
+  return t;
+}
+
+// Channel `ch` of part p (stored at m) at those taps.
+template <typename R>
+__device__ __forceinline__ float part_value(const R* m, const PyramidArgs& a, int p, int ch, const Taps& t) {
+  const R* plane = m + static_cast<size_t>(ch) * (a.h[p] * a.w[p]);
+  if (t.direct) return ld(plane[t.i00]);
+  return t.h0 * (t.w0 * ld(plane[t.i00]) + t.w1 * ld(plane[t.i01])) +
+         t.h1 * (t.w0 * ld(plane[t.i10]) + t.w1 * ld(plane[t.i11]));
+}
+
+// 1x1 convolution on a pyramid, T output channels per thread; same accumulation order as
+// k_conv2d_tile<T, 1> on the stored pyramid, tap-major weights. Grid: ceil(cout / T) * H * W.
+template <typename R, typename O, int T>
+__global__ void k_conv1x1_pyramid(const R* p0, const R* p1, const R* p2, const R* p3, PyramidArgs a, const R* weight,
+                                  const R* bias, int cout, int act, O* out) {
+  const int hw = a.H * a.W, blocks = (cout + T - 1) / T;
+  const int i = thread_index();
+  if (i >= blocks * hw) return;
+  const int ob = i / hw, pix = i % hw, Y = pix / a.W, X = pix % a.W, oc0 = ob * T;
+  float acc[T];
+  #pragma unroll
+  for (int t = 0; t < T; ++t) acc[t] = bias && oc0 + t < cout ? ld(bias[oc0 + t]) : 0.0f;
+  const R* parts[4] = {p0, p1, p2, p3};
+  int base = 0;
+  for (int p = 0; p < 4; ++p) {
+    if (a.c[p] == 0) continue;
+    const Taps taps = part_taps(a, p, X, Y);
+    for (int ch = 0; ch < a.c[p]; ++ch) {
+      const float v = part_value(parts[p], a, p, ch, taps);
+      const R* wp = weight + (static_cast<size_t>(base + ch) * blocks + ob) * T;
+      #pragma unroll
+      for (int t = 0; t < T; ++t) acc[t] = mac<R>(acc[t], ld(wp[t]), v);
+    }
+    base += a.c[p];
+  }
+  #pragma unroll
+  for (int t = 0; t < T; ++t)
+    if (oc0 + t < cout) st(out + static_cast<size_t>(oc0 + t) * hw + pix, activate(acc[t], act));
+}
+
+// All channels of the pyramid at pixel (X, Y) into vals (at most kMaxPyramidC), and their L2 norm as
+// k_l2_normalize_crop computes it.
+template <typename R>
+__device__ __forceinline__ float pyramid_pixel(const R* const parts[4], const PyramidArgs& a, int X, int Y,
+                                               float* vals) {
+  float norm = 0;
+  int pos = 0;
+  for (int p = 0; p < 4; ++p) {
+    if (a.c[p] == 0) continue;
+    const Taps taps = part_taps(a, p, X, Y);
+    for (int ch = 0; ch < a.c[p]; ++ch) {
+      const float v = part_value(parts[p], a, p, ch, taps);
+      vals[pos++] = v;
+      norm += v * v;
+    }
+  }
+  return fmaxf(sqrtf(norm), 1e-12f);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Detection kernels (float in both modes)
 // ---------------------------------------------------------------------------------------------
 
 // Separable (2r+1) max filter, window clipped at the borders. dir 0 = along x, 1 = along y.
@@ -278,13 +481,13 @@ __global__ void k_select_write(const float* v, int n, int mode, float th, const 
     if (selected(v[i], mode, th)) out[pos++] = i;
 }
 
-// Radix select: histogram of one byte of the float bits, over the values whose higher bytes equal `prefix`.
+// Radix select: histogram of 16 bits of the float bits, over the values whose higher bits equal `prefix`.
 // Values are non-negative, so the bit patterns order like the floats.
 __global__ void k_histogram(const float* v, int n, unsigned mask, unsigned prefix, int shift, unsigned* hist) {
   int i = thread_index();
   if (i >= n) return;
   unsigned bits = __float_as_uint(v[i]);
-  if ((bits & mask) == prefix) atomicAdd(&hist[(bits >> shift) & 255u], 1u);
+  if ((bits & mask) == prefix) atomicAdd(&hist[(bits >> shift) & 65535u], 1u);
 }
 
 // Rank sort of k indices by (value descending, index ascending). One thread per element counts the
@@ -344,11 +547,13 @@ __global__ void k_refine(const float* s, int w, int h, const int* idx, int n, fl
 
 // ---------------------------------------------------------------------------------------------
 // Descriptor head (SDDH) kernels. n keypoints, C channels, KxK patch, M sample positions.
+// Only the feature map is in the storage type R; the head's weights and buffers are float.
 // ---------------------------------------------------------------------------------------------
 
 // Offsets, first layer: KxK convolution on the patch centred on the truncated keypoint (zeros outside
 // the map), then SELU. One thread per (keypoint, output channel); o0[n][2M].
-__global__ void k_sddh_offset0(const float* f, int c, int h, int w, const float* xy_norm, int n, int K,
+template <typename R>
+__global__ void k_sddh_offset0(const R* f, int c, int h, int w, const float* xy_norm, int n, int K,
                                const float* weight, const float* bias, int m2, float* o0) {
   int t = thread_index();
   if (t >= n * m2) return;
@@ -359,11 +564,11 @@ __global__ void k_sddh_offset0(const float* f, int c, int h, int w, const float*
   const float* wk = weight + static_cast<size_t>(j) * c * K * K;
   float acc = 0;
   for (int ch = 0; ch < c; ++ch) {
-    const float* plane = f + static_cast<size_t>(ch) * hw;
+    const R* plane = f + static_cast<size_t>(ch) * hw;
     for (int a = 0; a < K; ++a)
       for (int b = 0; b < K; ++b) {
         int py = iy - lo + a, px = ix - lo + b;
-        if (px >= 0 && px < w && py >= 0 && py < h) acc += wk[(ch * K + a) * K + b] * plane[py * w + px];
+        if (px >= 0 && px < w && py >= 0 && py < h) acc += wk[(ch * K + a) * K + b] * ld(plane[py * w + px]);
       }
   }
   o0[t] = selu(acc + bias[j]);
@@ -384,8 +589,9 @@ __global__ void k_sddh_offset1(const float* o0, int n, int m2, const float* weig
 
 // Bilinear samples of the feature map at keypoint + offset. One thread per (keypoint, position);
 // sampled[n][M][C].
-__global__ void k_sddh_sample(const float* f, int c, int h, int w, const float* xy_norm, const float* o1, int n,
-                              int M, float* sampled) {
+template <typename R>
+__global__ void k_sddh_sample(const R* f, int c, int h, int w, const float* xy_norm, const float* o1, int n, int M,
+                              float* sampled) {
   int t = thread_index();
   if (t >= n * M) return;
   int i = t / M, m = t % M, hw = h * w;
@@ -402,27 +608,49 @@ __global__ void k_sddh_sample(const float* f, int c, int h, int w, const float* 
   for (int ch = 0; ch < c; ++ch) out[ch] = bilinear_apply(f + static_cast<size_t>(ch) * hw, bi, bw);
 }
 
-// 1x1 convolution + SELU on the samples. One thread per (keypoint, position, output channel).
-__global__ void k_sddh_sf(const float* sampled, int total, int c, const float* weight, float* feat) {
-  int t = thread_index();
-  if (t >= total) return;
-  int oc = t % c;
-  const float* wk = weight + static_cast<size_t>(oc) * c;
-  const float* in = sampled + static_cast<size_t>(t - oc);
-  float acc = 0;
-  for (int q = 0; q < c; ++q) acc += wk[q] * in[q];
-  feat[t] = selu(acc);
+// 1x1 convolution + SELU on the samples, T output channels per thread; weights tap-major (input channel
+// major). One thread per (keypoint, position, block of T output channels). R only selects mac().
+template <typename R, int T>
+__global__ void k_sddh_sf_tile(const float* sampled, int total, int c, const float* weight, float* feat) {
+  const int blocks = (c + T - 1) / T, i = thread_index();
+  if (i >= total / c * blocks) return;
+  const int s = i / blocks, ob = i % blocks, oc0 = ob * T;
+  const float* in = sampled + static_cast<size_t>(s) * c;
+  float acc[T];
+  #pragma unroll
+  for (int t = 0; t < T; ++t) acc[t] = 0.0f;
+  for (int ch = 0; ch < c; ++ch) {
+    const float v = in[ch];
+    const float* wp = weight + (static_cast<size_t>(ch) * blocks + ob) * T;
+    #pragma unroll
+    for (int t = 0; t < T; ++t) acc[t] = mac<R>(acc[t], wp[t], v);
+  }
+  #pragma unroll
+  for (int t = 0; t < T; ++t)
+    if (oc0 + t < c) feat[static_cast<size_t>(s) * c + oc0 + t] = selu(acc[t]);
 }
 
-// Aggregation with one CxD matrix per position. One thread per (keypoint, descriptor element).
-__global__ void k_sddh_aggregate(const float* feat, int n, int mc, int dim, const float* weight, float* desc) {
-  int t = thread_index();
-  if (t >= n * dim) return;
-  int i = t / dim, j = t % dim;
+// Aggregation with one CxD matrix per position, T descriptor elements per thread (the last block may be
+// shorter). One thread per (keypoint, block of T elements); weight[M*C][dim].
+template <typename R, int T>
+__global__ void k_sddh_aggregate_tile(const float* feat, int n, int mc, int dim, const float* weight, float* desc) {
+  const int blocks = (dim + T - 1) / T, t = thread_index();
+  if (t >= n * blocks) return;
+  const int i = t / blocks, j0 = (t % blocks) * T;
   const float* in = feat + static_cast<size_t>(i) * mc;
-  float d = 0;
-  for (int q = 0; q < mc; ++q) d += in[q] * weight[static_cast<size_t>(q) * dim + j];
-  desc[t] = d;
+  float acc[T];
+  #pragma unroll
+  for (int q = 0; q < T; ++q) acc[q] = 0.0f;
+  for (int k = 0; k < mc; ++k) {
+    const float v = in[k];
+    const float* wp = weight + static_cast<size_t>(k) * dim + j0;
+    #pragma unroll
+    for (int q = 0; q < T; ++q)
+      if (j0 + q < dim) acc[q] = mac<R>(acc[q], v, wp[q]);
+  }
+  #pragma unroll
+  for (int q = 0; q < T; ++q)
+    if (j0 + q < dim) desc[static_cast<size_t>(i) * dim + j0 + q] = acc[q];
 }
 
 // L2 normalization of each descriptor. One thread per keypoint.
@@ -436,6 +664,83 @@ __global__ void k_normalize_rows(float* desc, int n, int dim) {
   for (int j = 0; j < dim; ++j) d[j] /= norm;
 }
 
+// Descriptor head on a pyramid: the feature map is the L2-normalized pyramid, cropped to w x h at
+// (a.left, a.top). These kernels normalize only the pixels the keypoints touch; they replace
+// k_sddh_offset0 and k_sddh_sample and give the same values as those do on the stored feature map.
+
+// Normalized KxK patch around the truncated keypoint. One thread per (keypoint, patch pixel);
+// patch[n][K*K][C], left untouched (and unused) for pixels outside the map.
+template <typename R>
+__global__ void k_sddh_patch_pyramid(const R* p0, const R* p1, const R* p2, const R* p3, PyramidArgs a, int h, int w,
+                                     const float* xy_norm, int n, int K, float* patch) {
+  const int t = thread_index(), kk = K * K;
+  if (t >= n * kk) return;
+  const int i = t / kk, q = t % kk, lo = (K - 1) / 2;
+  const float kx = (xy_norm[2 * i] / 2.0f + 0.5f) * static_cast<float>(w - 1);
+  const float ky = (xy_norm[2 * i + 1] / 2.0f + 0.5f) * static_cast<float>(h - 1);
+  const int px = static_cast<int>(kx) - lo + q % K, py = static_cast<int>(ky) - lo + q / K;  // truncation
+  if (px < 0 || px >= w || py < 0 || py >= h) return;
+  const R* parts[4] = {p0, p1, p2, p3};
+  const int c = a.c[0] + a.c[1] + a.c[2] + a.c[3];
+  float vals[kMaxPyramidC];
+  const float norm = pyramid_pixel(parts, a, px + a.left, py + a.top, vals);
+  float* out = patch + static_cast<size_t>(t) * c;
+  for (int ch = 0; ch < c; ++ch) out[ch] = vals[ch] / norm;
+}
+
+// k_sddh_offset0 on the patches of k_sddh_patch_pyramid.
+__global__ void k_sddh_offset0_patch(const float* patch, int c, int h, int w, const float* xy_norm, int n, int K,
+                                     const float* weight, const float* bias, int m2, float* o0) {
+  int t = thread_index();
+  if (t >= n * m2) return;
+  int i = t / m2, j = t % m2, lo = (K - 1) / 2;
+  const float kx = (xy_norm[2 * i] / 2.0f + 0.5f) * static_cast<float>(w - 1);
+  const float ky = (xy_norm[2 * i + 1] / 2.0f + 0.5f) * static_cast<float>(h - 1);
+  const int ix = static_cast<int>(kx), iy = static_cast<int>(ky);  // truncation
+  const float* wk = weight + static_cast<size_t>(j) * c * K * K;
+  const float* in = patch + static_cast<size_t>(i) * K * K * c;
+  float acc = 0;
+  for (int ch = 0; ch < c; ++ch)
+    for (int a = 0; a < K; ++a)
+      for (int b = 0; b < K; ++b) {
+        int py = iy - lo + a, px = ix - lo + b;
+        if (px >= 0 && px < w && py >= 0 && py < h) acc += wk[(ch * K + a) * K + b] * in[(a * K + b) * c + ch];
+      }
+  o0[t] = selu(acc + bias[j]);
+}
+
+// k_sddh_sample on the pyramid: the four pixels around each sample position are normalized here.
+// One thread per (keypoint, position); sampled[n][M][C], C <= kMaxPyramidC.
+template <typename R>
+__global__ void k_sddh_sample_pyramid(const R* p0, const R* p1, const R* p2, const R* p3, PyramidArgs a, int h, int w,
+                                      const float* xy_norm, const float* o1, int n, int M, float* sampled) {
+  int t = thread_index();
+  if (t >= n * M) return;
+  int i = t / M, m = t % M;
+  const float wh[2] = {static_cast<float>(w - 1), static_cast<float>(h - 1)};
+  const float kx = (xy_norm[2 * i] / 2.0f + 0.5f) * wh[0];
+  const float ky = (xy_norm[2 * i + 1] / 2.0f + 0.5f) * wh[1];
+  const float* off = o1 + static_cast<size_t>(i) * 2 * M;
+  float gx = 2.0f * (kx + off[m]) / wh[0] - 1.0f, gy = 2.0f * (ky + off[M + m]) / wh[1] - 1.0f;
+  gx = ((gx + 1.0f) / 2.0f) * wh[0], gy = ((gy + 1.0f) / 2.0f) * wh[1];
+  int bi[4];
+  float bw[4];
+  bilinear_setup(gx, gy, w, h, bi, bw);
+  const R* parts[4] = {p0, p1, p2, p3};
+  const int c = a.c[0] + a.c[1] + a.c[2] + a.c[3];
+  float vals[kMaxPyramidC], acc[kMaxPyramidC];
+  // A corner outside the map has weight 0 and index 0, as in bilinear_apply: it adds 0 * (pixel 0).
+  for (int k = 0; k < 4; ++k) {
+    const float norm = pyramid_pixel(parts, a, bi[k] % w + a.left, bi[k] / w + a.top, vals);
+    for (int ch = 0; ch < c; ++ch) {
+      const float v = bw[k] * (vals[ch] / norm);
+      acc[ch] = k == 0 ? v : acc[ch] + v;
+    }
+  }
+  float* out = sampled + static_cast<size_t>(t) * c;
+  for (int ch = 0; ch < c; ++ch) out[ch] = acc[ch];
+}
+
 // ---------------------------------------------------------------------------------------------
 // Host side
 // ---------------------------------------------------------------------------------------------
@@ -447,20 +752,75 @@ void check(cudaError_t status, const char* what) {
 
 constexpr int kBlock = 256;
 
-// Launches `kernel` with at least n threads.
-#define JKP_LAUNCH(kernel, n, ...)                                                   \
-  do {                                                                               \
-    if ((n) > 0) {                                                                   \
-      kernel<<<(static_cast<unsigned>(n) + kBlock - 1) / kBlock, kBlock>>>(__VA_ARGS__); \
-      check(cudaGetLastError(), #kernel);                                            \
-    }                                                                                \
-  } while (0)
+// JKP_CUDA_PROFILE: time per operation label (see the top of the file).
+struct Profiler {
+  bool on = false;
+  long frames = 0;
+  std::string label;
+  std::map<std::string, std::pair<double, long>> stats;  // label -> (ms, launches)
+
+  Profiler() {
+    const char* env = std::getenv("JKP_CUDA_PROFILE");
+    on = env && *env && std::string(env) != "0";
+  }
+  void tag(const char* fmt, ...) {
+    if (!on) return;
+    char buf[160];
+    va_list args;
+    va_start(args, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, args);
+    va_end(args);
+    label = buf;
+  }
+  void report() {
+    if (!on || stats.empty()) return;
+    const double per = static_cast<double>(std::max(1L, frames));
+    double total = 0;
+    std::vector<std::pair<std::string, std::pair<double, long>>> rows(stats.begin(), stats.end());
+    for (const auto& r : rows) total += r.second.first;
+    std::sort(rows.begin(), rows.end(), [](const auto& a, const auto& b) { return a.second.first > b.second.first; });
+    std::fprintf(stderr, "\njkp cuda profile: %ld frames, kernel time %.2f ms/frame\n\n%-44s %10s %7s %6s\n", frames,
+                 total / per, "operation", "ms/frame", "share", "calls");
+    for (const auto& r : rows)
+      std::fprintf(stderr, "%-44s %10.3f %6.1f%% %6.1f\n", r.first.c_str(), r.second.first / per,
+                   100.0 * r.second.first / total, r.second.second / per);
+    stats.clear();
+  }
+};
+Profiler g_profile;
+
+template <typename T>
+struct Identity {
+  using type = T;
+};
+
+// Launches `kernel` with at least n threads. The kernel's parameter types fix the argument types.
+template <typename... Args>
+void launch(void (*kernel)(Args...), long long n, typename Identity<Args>::type... args) {
+  if (n <= 0) return;
+  if (n > static_cast<long long>(INT_MAX)) throw std::runtime_error("cuda: grid too large");
+  std::chrono::steady_clock::time_point t0;
+  if (g_profile.on) {
+    cudaDeviceSynchronize();
+    t0 = std::chrono::steady_clock::now();
+  }
+  kernel<<<(static_cast<unsigned>(n) + kBlock - 1) / kBlock, kBlock>>>(args...);
+  check(cudaGetLastError(), "kernel launch");
+  if (g_profile.on) {
+    cudaDeviceSynchronize();
+    auto& st = g_profile.stats[g_profile.label];
+    st.first += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    ++st.second;
+  }
+}
 
 // Element count as int; the kernels index with 32-bit integers.
 int count(long long n) {
   if (n < 0 || n > INT_MAX) throw std::runtime_error("cuda: tensor too large");
   return static_cast<int>(n);
 }
+
+float upsample_ratio(int in, int out) { return out > 1 ? static_cast<float>(in - 1) / static_cast<float>(out - 1) : 0.0f; }
 
 // Device memory with reuse: released blocks are kept and handed out again for the same size, so a
 // stream of equally sized images allocates only on the first frame.
@@ -525,27 +885,103 @@ class Buffer {
   T* p_;
 };
 
-struct CudaTensor : Tensor {
-  Buffer<float> buf;
-  CudaTensor(const PoolPtr& pool, int c_, int h_, int w_)
-      : buf(pool, static_cast<size_t>(count(static_cast<long long>(c_) * h_ * w_))), device(pool->device()) {
-    c = c_, h = h_, w = w_;
-  }
-  void read(float* dst) const override {
-    JKP_CUDA_CHECK(cudaSetDevice(device));
-    buf.download(dst, buf.size());
-  }
-  float* d() const { return buf.get(); }
-  int size() const { return static_cast<int>(buf.size()); }
-  int device;
-};
+struct CudaTensor;
 using CudaPtr = std::shared_ptr<CudaTensor>;
+
+// concat of parts[i] upsampled by scales[i]; with `normalized`, L2-normalized across channels and
+// cropped to the tensor's size at (left, top).
+struct Pyramid {
+  std::vector<CudaPtr> parts;
+  std::vector<int> scales;
+  int height = 0, width = 0;  // full resolution
+  bool normalized = false;
+  int left = 0, top = 0;
+  void (*store)(const CudaTensor&, void* dst) = nullptr;  // computes the tensor's values into dst
+};
+
+// Elements are float, or __half when the backend runs in FP16 and the tensor is not the score map.
+// A tensor with a pyramid has no storage until data() or read() asks for it.
+struct CudaTensor : Tensor {
+  PoolPtr pool;
+  bool half;
+  int n;
+  std::shared_ptr<const Pyramid> pyramid;
+  CudaTensor(const PoolPtr& pool_, int c_, int h_, int w_, bool half_, std::shared_ptr<const Pyramid> pyramid_ = {})
+      : pool(pool_), half(half_), n(count(static_cast<long long>(c_) * h_ * w_)), pyramid(std::move(pyramid_)) {
+    c = c_, h = h_, w = w_;
+    if (!pyramid) buf_ = std::make_unique<Buffer<uint8_t>>(pool, bytes());
+  }
+  size_t bytes() const { return static_cast<size_t>(n) * (half ? sizeof(__half) : sizeof(float)); }
+  void read(float* dst) const override {
+    JKP_CUDA_CHECK(cudaSetDevice(pool->device()));
+    const void* src = data();
+    if (!n) return;
+    if (!half) {
+      JKP_CUDA_CHECK(cudaMemcpy(dst, src, bytes(), cudaMemcpyDeviceToHost));
+      return;
+    }
+    std::vector<uint16_t> bits(n);
+    JKP_CUDA_CHECK(cudaMemcpy(bits.data(), src, bytes(), cudaMemcpyDeviceToHost));
+    for (int i = 0; i < n; ++i) dst[i] = half_to_float(bits[i]);
+  }
+  void* data() const {
+    if (!buf_) {
+      auto out = std::make_unique<Buffer<uint8_t>>(pool, bytes());
+      pyramid->store(*this, out->get());
+      buf_ = std::move(out);
+    }
+    return buf_->get();
+  }
+  template <typename T>
+  const T* as() const {
+    if ((sizeof(T) == sizeof(__half)) != half) throw std::runtime_error("cuda: tensor has another element type");
+    return static_cast<const T*>(data());
+  }
+  template <typename T>
+  T* out() {
+    return const_cast<T*>(as<T>());
+  }
+  int size() const { return n; }
+  PyramidArgs pyramid_args() const {
+    PyramidArgs a;
+    const Pyramid& p = *pyramid;
+    for (size_t i = 0; i < p.parts.size(); ++i) {
+      const CudaTensor& x = *p.parts[i];
+      a.c[i] = x.c, a.h[i] = x.h, a.w[i] = x.w, a.scale[i] = p.scales[i];
+      a.sx[i] = upsample_ratio(x.w, p.width), a.sy[i] = upsample_ratio(x.h, p.height);
+    }
+    a.H = p.height, a.W = p.width, a.left = p.left, a.top = p.top;
+    return a;
+  }
+
+ private:
+  mutable std::unique_ptr<Buffer<uint8_t>> buf_;
+};
 
 const CudaTensor& dev(const TensorPtr& t) { return static_cast<const CudaTensor&>(*t); }
 
-int act_id(Act act) { return act == Act::Selu ? kActSelu : act == Act::Sigmoid ? kActSigmoid : kActNone; }
+int act_id(Act act) {
+  switch (act) {
+    case Act::None: return kActNone;
+    case Act::Selu: return kActSelu;
+    case Act::Sigmoid: return kActSigmoid;
+    case Act::LeakyRelu: return kActLeakyRelu;
+  }
+  throw std::runtime_error("cuda: unknown activation");
+}
 
+// Bit pattern of a host float in the storage type.
+inline void encode(float v, float* dst) { *dst = v; }
+inline void encode(float v, __half* dst) {
+  const uint16_t bits = float_to_half(v);
+  std::memcpy(dst, &bits, sizeof(bits));
+}
+
+// R: storage type of feature maps and of the dense network's weights (float or __half).
+template <typename R>
 class CudaOps : public Ops {
+  static constexpr bool kHalf = sizeof(R) == sizeof(__half);
+
  public:
   explicit CudaOps(int device) {
     int devices = 0;
@@ -558,7 +994,8 @@ class CudaOps : public Ops {
   }
   ~CudaOps() override {
     if (cudaSetDevice(pool_->device()) == cudaSuccess)
-      for (auto& kv : params_) cudaFree(kv.second);
+      for (void* p : params_owned_) cudaFree(p);
+    g_profile.report();
   }
 
   TensorPtr image(const uint8_t* data, int width, int height, int stride, int channels) override {
@@ -570,7 +1007,9 @@ class CudaOps : public Ops {
     size_t bytes = static_cast<size_t>(stride) * (height - 1) + static_cast<size_t>(width) * channels;
     Buffer<uint8_t> src(pool_, bytes);
     src.upload(data, bytes);
-    JKP_LAUNCH(k_image, out->size(), src.get(), stride, channels, width, height, out->d());
+    ++g_profile.frames;
+    g_profile.tag("image %dx%d", width, height);
+    launch(k_image<R>, out->size(), src.get(), stride, channels, width, height, out->template out<R>());
     return out;
   }
 
@@ -578,15 +1017,21 @@ class CudaOps : public Ops {
     use();
     const CudaTensor& x = dev(xp);
     CudaPtr out = make(x.c, x.h + top + bottom, x.w + left + right);
-    JKP_LAUNCH(k_pad_replicate, out->size(), x.d(), x.c, x.h, x.w, left, top, out->h, out->w, out->d());
+    g_profile.tag("pad %dx%d", out->w, out->h);
+    launch(k_pad_replicate<R>, out->size(), x.as<R>(), x.c, x.h, x.w, left, top, out->h, out->w, out->template out<R>());
     return out;
   }
 
   TensorPtr crop(const TensorPtr& xp, int left, int top, int width, int height) override {
     use();
     const CudaTensor& x = dev(xp);
-    CudaPtr out = make(x.c, height, width);
-    JKP_LAUNCH(k_crop, out->size(), x.d(), x.c, x.h, x.w, left, top, height, width, out->d());
+    if (left == 0 && top == 0 && width == x.w && height == x.h) return xp;  // tensors are never modified
+    CudaPtr out = std::make_shared<CudaTensor>(pool_, x.c, height, width, x.half);
+    g_profile.tag("crop c%d %dx%d", x.c, width, height);
+    if (x.half)
+      launch(k_crop<__half>, out->size(), x.as<__half>(), x.c, x.h, x.w, left, top, height, width, out->template out<__half>());
+    else
+      launch(k_crop<float>, out->size(), x.as<float>(), x.c, x.h, x.w, left, top, height, width, out->template out<float>());
     return out;
   }
 
@@ -595,9 +1040,40 @@ class CudaOps : public Ops {
     const CudaTensor& x = dev(xp);
     const int cout = weight.shape[0], cin = weight.shape[1], k = weight.shape[2];
     if (cin != x.c || weight.shape[3] != k || k % 2 == 0) throw std::runtime_error("conv2d: shape mismatch");
+    const R* b = bias ? param(*bias) : nullptr;
+    const int hw = x.h * x.w, a = act_id(act);
+    g_profile.tag("conv%dx%d %3d->%-3d %4dx%-4d%s", k, k, cin, cout, x.w, x.h, x.pyramid && k == 1 ? " pyramid" : "");
+    // FP16: the sigmoid layer produces the score map, which stays float (see the top of the file).
+    if (kHalf && act == Act::Sigmoid && cout <= 4 && (k == 1 || k == 3)) {
+      CudaPtr out = std::make_shared<CudaTensor>(pool_, cout, x.h, x.w, false);
+      const R* w = param_tiled(weight, 4);
+      if (k == 1) launch(k_conv2d_tile<R, float, 4, 1>, hw, x.as<R>(), w, b, cin, cout, x.h, x.w, a, out->template out<float>());
+      else launch(k_conv2d_tile<R, float, 4, 3>, hw, x.as<R>(), w, b, cin, cout, x.h, x.w, a, out->template out<float>());
+      return out;
+    }
     CudaPtr out = make(cout, x.h, x.w);
-    JKP_LAUNCH(k_conv2d, out->size(), x.d(), param(weight), bias ? param(*bias) : nullptr, cin, cout, x.h, x.w, k,
-               act_id(act), out->d());
+    R* o = out->template out<R>();
+    const int t = tile(cout);
+    const long long threads = static_cast<long long>((cout + t - 1) / t) * hw;
+    if (k == 1 && x.pyramid && !x.pyramid->normalized) {
+      const PyramidArgs args = x.pyramid_args();
+      const R* w = param_tiled(weight, t);
+      const R *p0 = part(x, 0), *p1 = part(x, 1), *p2 = part(x, 2), *p3 = part(x, 3);
+      if (t == 4) launch(k_conv1x1_pyramid<R, R, 4>, threads, p0, p1, p2, p3, args, w, b, cout, a, o);
+      else if (t == 8) launch(k_conv1x1_pyramid<R, R, 8>, threads, p0, p1, p2, p3, args, w, b, cout, a, o);
+      else launch(k_conv1x1_pyramid<R, R, 16>, threads, p0, p1, p2, p3, args, w, b, cout, a, o);
+    } else if (k == 1 || k == 3) {
+      const R* w = param_tiled(weight, t);
+      const R* in = x.as<R>();
+      if (k == 1 && t == 4) launch(k_conv2d_tile<R, R, 4, 1>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else if (k == 1 && t == 8) launch(k_conv2d_tile<R, R, 8, 1>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else if (k == 1) launch(k_conv2d_tile<R, R, 16, 1>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else if (t == 4) launch(k_conv2d_tile<R, R, 4, 3>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else if (t == 8) launch(k_conv2d_tile<R, R, 8, 3>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else launch(k_conv2d_tile<R, R, 16, 3>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+    } else {
+      launch(k_conv2d<R>, out->size(), x.as<R>(), param(weight), b, cin, cout, x.h, x.w, k, a, o);
+    }
     return out;
   }
 
@@ -610,11 +1086,18 @@ class CudaOps : public Ops {
       throw std::runtime_error("deform_conv2d: shape mismatch");
     TensorPtr offset = conv2d(xp, offset_weight, &offset_bias, Act::None);
     const float max_offset = static_cast<float>(std::max(h, w)) / 4.0f;
-    Buffer<float> col(pool_, static_cast<size_t>(count(static_cast<long long>(cin) * 9 * hw)));
-    JKP_LAUNCH(k_deform_sample, 9 * hw, x.d(), dev(offset).d(), cin, h, w, max_offset, col.get());
+    Buffer<R> col(pool_, static_cast<size_t>(count(static_cast<long long>(cin) * 9 * hw)));
+    g_profile.tag("deform sample %3d %4dx%-4d", cin, w, h);
+    launch(k_deform_sample<R>, 9LL * hw, x.as<R>(), dev(offset).as<R>(), cin, h, w, max_offset, col.get());
     CudaPtr out = make(cout, h, w);
-    JKP_LAUNCH(k_deform_sum, out->size(), col.get(), param(weight), param(bias), cin * 9, cout, hw, act_id(act),
-               out->d());
+    const int t = tile(cout);
+    const long long threads = static_cast<long long>((cout + t - 1) / t) * hw;
+    const R *wt = param_tiled(weight, t), *b = param(bias);
+    R* o = out->template out<R>();
+    g_profile.tag("deform sum %3d->%-3d %4dx%-4d", cin, cout, w, h);
+    if (t == 4) launch(k_deform_sum_tile<R, 4>, threads, col.get(), wt, b, cin * 9, cout, hw, act_id(act), o);
+    else if (t == 8) launch(k_deform_sum_tile<R, 8>, threads, col.get(), wt, b, cin * 9, cout, hw, act_id(act), o);
+    else launch(k_deform_sum_tile<R, 16>, threads, col.get(), wt, b, cin * 9, cout, hw, act_id(act), o);
     return out;
   }
 
@@ -623,7 +1106,8 @@ class CudaOps : public Ops {
     const CudaTensor &a = dev(ap), &b = dev(bp);
     if (a.size() != b.size()) throw std::runtime_error("add: shape mismatch");
     CudaPtr out = make(a.c, a.h, a.w);
-    JKP_LAUNCH(k_add, out->size(), a.d(), b.d(), out->size(), act_id(act), out->d());
+    g_profile.tag("add c%d %dx%d", a.c, a.w, a.h);
+    launch(k_add<R>, out->size(), a.as<R>(), b.as<R>(), out->size(), act_id(act), out->template out<R>());
     return out;
   }
 
@@ -632,7 +1116,8 @@ class CudaOps : public Ops {
     const CudaTensor& x = dev(xp);
     if (k < 1 || x.h % k || x.w % k) throw std::runtime_error("avg_pool: size is not a multiple of the window");
     CudaPtr out = make(x.c, x.h / k, x.w / k);
-    JKP_LAUNCH(k_avg_pool, out->size(), x.d(), x.c, x.w, out->h, out->w, k, out->d());
+    g_profile.tag("avg_pool%d c%d %dx%d", k, x.c, x.w, x.h);
+    launch(k_avg_pool<R>, out->size(), x.as<R>(), x.c, x.w, out->h, out->w, k, out->template out<R>());
     return out;
   }
 
@@ -640,11 +1125,9 @@ class CudaOps : public Ops {
     use();
     const CudaTensor& x = dev(xp);
     CudaPtr out = make(x.c, x.h * scale, x.w * scale);
-    auto ratio = [](int in, int outn) {
-      return outn > 1 ? static_cast<float>(in - 1) / static_cast<float>(outn - 1) : 0.0f;
-    };
-    JKP_LAUNCH(k_upsample, out->size(), x.d(), x.c, x.h, x.w, out->h, out->w, ratio(x.w, out->w), ratio(x.h, out->h),
-               out->d());
+    g_profile.tag("upsample%d c%d -> %dx%d", scale, x.c, out->w, out->h);
+    launch(k_upsample<R>, out->size(), x.as<R>(), x.c, x.h, x.w, out->h, out->w, upsample_ratio(x.w, out->w),
+           upsample_ratio(x.h, out->h), out->template out<R>());
     return out;
   }
 
@@ -660,17 +1143,45 @@ class CudaOps : public Ops {
     for (const auto& t : xs) {
       const CudaTensor& x = dev(t);
       if (x.size())
-        JKP_CUDA_CHECK(cudaMemcpy(out->d() + pos, x.d(), x.size() * sizeof(float), cudaMemcpyDeviceToDevice));
+        JKP_CUDA_CHECK(cudaMemcpy(out->template out<R>() + pos, x.as<R>(), x.bytes(), cudaMemcpyDeviceToDevice));
       pos += x.size();
     }
     return out;
   }
 
-  TensorPtr l2_normalize(const TensorPtr& xp) override {
+  TensorPtr l2_normalize(const TensorPtr& xp) override { return l2_normalize_crop(xp, 0, 0, xp->w, xp->h); }
+
+  // A pyramid: stored only when an operation needs its values (see the top of the file).
+  TensorPtr upsample_concat(const std::vector<TensorPtr>& xs, const std::vector<int>& scales) override {
+    if (xs.empty() || xs.size() != scales.size()) throw std::runtime_error("upsample_concat: bad arguments");
+    if (xs.size() > 4) return Ops::upsample_concat(xs, scales);
+    auto p = std::make_shared<Pyramid>();
+    p->height = xs[0]->h * scales[0], p->width = xs[0]->w * scales[0];
+    p->store = &CudaOps::store_pyramid;
+    int c = 0;
+    for (size_t i = 0; i < xs.size(); ++i) {
+      if (xs[i]->h * scales[i] != p->height || xs[i]->w * scales[i] != p->width)
+        throw std::runtime_error("concat: shape mismatch");
+      if (dev(xs[i]).half != kHalf) throw std::runtime_error("cuda: tensor has another element type");
+      c += xs[i]->c;
+      p->parts.push_back(std::static_pointer_cast<CudaTensor>(xs[i]));
+      p->scales.push_back(scales[i]);
+    }
+    return std::make_shared<CudaTensor>(pool_, c, p->height, p->width, kHalf, p);
+  }
+
+  TensorPtr l2_normalize_crop(const TensorPtr& xp, int left, int top, int width, int height) override {
     use();
     const CudaTensor& x = dev(xp);
-    CudaPtr out = make(x.c, x.h, x.w);
-    JKP_LAUNCH(k_l2_normalize, x.h * x.w, x.d(), x.c, x.h * x.w, out->d());
+    if (x.pyramid && !x.pyramid->normalized) {
+      auto p = std::make_shared<Pyramid>(*x.pyramid);
+      p->normalized = true, p->left = left, p->top = top;
+      return std::make_shared<CudaTensor>(pool_, x.c, height, width, kHalf, p);
+    }
+    CudaPtr out = make(x.c, height, width);
+    g_profile.tag("l2_normalize_crop c%d %dx%d", x.c, width, height);
+    launch(k_l2_normalize_crop<R>, width * height, x.as<R>(), x.c, x.h, x.w, left, top, height, width,
+           out->template out<R>());
     return out;
   }
 
@@ -678,44 +1189,46 @@ class CudaOps : public Ops {
     use();
     const CudaTensor& sm = dev(score_map);
     const int w = sm.w, h = sm.h, n = w * h;
-    const float* s = sm.d();
     out->xy_norm.clear();
     out->score.clear();
     if (n == 0) return;
+    const float* s = sm.as<float>();  // the score map is float in both modes
 
     // Non-maximum suppression (simple_nms from SuperGlue, two refinement rounds).
     Buffer<float> nms(pool_, n);
+    g_profile.tag("detect nms %dx%d", w, h);
     {
       Buffer<float> tmp(pool_, n), mask(pool_, n), pooled_mask(pool_, n), supp(pool_, n), pooled_supp(pool_, n);
       auto max_filter = [&](const float* src, float* dst) {
-        JKP_LAUNCH(k_max_filter, n, src, w, h, kRadius, 0, tmp.get());
-        JKP_LAUNCH(k_max_filter, n, tmp.get(), w, h, kRadius, 1, dst);
+        launch(k_max_filter, n, src, w, h, kRadius, 0, tmp.get());
+        launch(k_max_filter, n, tmp.get(), w, h, kRadius, 1, dst);
       };
       max_filter(s, pooled_supp.get());
-      JKP_LAUNCH(k_nms_init, n, s, pooled_supp.get(), n, mask.get());
+      launch(k_nms_init, n, s, pooled_supp.get(), n, mask.get());
       for (int round = 0; round < 2; ++round) {
         max_filter(mask.get(), pooled_mask.get());
-        JKP_LAUNCH(k_nms_suppress, n, s, pooled_mask.get(), n, supp.get());
+        launch(k_nms_suppress, n, s, pooled_mask.get(), n, supp.get());
         max_filter(supp.get(), pooled_supp.get());
-        JKP_LAUNCH(k_nms_update, n, supp.get(), pooled_supp.get(), pooled_mask.get(), n, mask.get());
+        launch(k_nms_update, n, supp.get(), pooled_supp.get(), pooled_mask.get(), n, mask.get());
       }
-      JKP_LAUNCH(k_nms_final, n, s, mask.get(), w, h, kRadius, nms.get());
+      launch(k_nms_final, n, s, mask.get(), w, h, kRadius, nms.get());
     }
 
     // Selection, on the device. `idx` receives the pixel indices of the keypoints in output order.
+    g_profile.tag("detect select");
     const int blocks = (n + kScanBlock - 1) / kScanBlock;
     Buffer<unsigned> offsets(pool_, static_cast<size_t>(blocks) + 1);
     // Counts {nms `mode` th} and leaves the per-block offsets in `offsets`.
     auto select_count = [&](int mode, float th) {
-      JKP_LAUNCH(k_select_count, blocks, nms.get(), n, mode, th, offsets.get());
-      JKP_LAUNCH(k_select_scan, 1, offsets.get(), blocks);
+      launch(k_select_count, blocks, nms.get(), n, mode, th, offsets.get());
+      launch(k_select_scan, 1, offsets.get(), blocks);
       unsigned total = 0;
       JKP_CUDA_CHECK(cudaMemcpy(&total, offsets.get() + blocks, sizeof(total), cudaMemcpyDeviceToHost));
       return static_cast<int>(total);
     };
     // Writes the first `limit` of that set in raster order; must follow the matching select_count.
     auto select_write = [&](int mode, float th, int limit, int* dst) {
-      JKP_LAUNCH(k_select_write, blocks, nms.get(), n, mode, th, offsets.get(), static_cast<unsigned>(limit), dst);
+      launch(k_select_write, blocks, nms.get(), n, mode, th, offsets.get(), static_cast<unsigned>(limit), dst);
     };
 
     int kept = 0;         // number of keypoints
@@ -727,7 +1240,7 @@ class CudaOps : public Ops {
       int passing = params.scores_th > 0 ? select_count(kGreater, threshold = params.scores_th) : 0;
       if (passing == 0) {  // fall back to the mean score
         Buffer<float> sum(pool_, 1);
-        JKP_LAUNCH(k_sum_sequential, 1, s, n, sum.get());
+        launch(k_sum_sequential, 1, s, n, sum.get());
         float total = 0;
         sum.download(&total, 1);
         passing = select_count(kGreater, threshold = total / static_cast<float>(n));
@@ -742,18 +1255,21 @@ class CudaOps : public Ops {
     if (best < 0) {
       select_write(kGreater, threshold, kept, idx.get());
     } else {
-      // Radix select for the value of the `best`-th highest score, one byte of the float bits per pass.
-      Buffer<unsigned> hist_dev(pool_, 256);
-      unsigned hist[256], prefix = 0, mask = 0;
+      // Radix select for the value of the `best`-th highest score, 16 bits of the float bits per pass
+      // (each pass is a round trip to the host).
+      const int bins = 65536;
+      Buffer<unsigned> hist_dev(pool_, bins);
+      std::vector<unsigned> hist(bins);
+      unsigned prefix = 0, mask = 0;
       int remaining = best;  // how many are still needed from the values matching the prefix
-      for (int shift = 24; shift >= 0; shift -= 8) {
-        JKP_CUDA_CHECK(cudaMemset(hist_dev.get(), 0, sizeof(hist)));
-        JKP_LAUNCH(k_histogram, n, nms.get(), n, mask, prefix, shift, hist_dev.get());
-        hist_dev.download(hist, 256);
-        int bin = 255;
+      for (int shift = 16; shift >= 0; shift -= 16) {
+        JKP_CUDA_CHECK(cudaMemset(hist_dev.get(), 0, bins * sizeof(unsigned)));
+        launch(k_histogram, n, nms.get(), n, mask, prefix, shift, hist_dev.get());
+        hist_dev.download(hist.data(), bins);
+        int bin = bins - 1;
         for (; bin > 0 && static_cast<long long>(hist[bin]) < remaining; --bin) remaining -= static_cast<int>(hist[bin]);
         prefix |= static_cast<unsigned>(bin) << shift;
-        mask |= 255u << shift;
+        mask |= 65535u << shift;
       }
       float kth;
       std::memcpy(&kth, &prefix, sizeof(kth));
@@ -764,12 +1280,14 @@ class CudaOps : public Ops {
       select_write(kGreater, kth, above, unsorted.get());
       select_count(kEqual, kth);
       select_write(kEqual, kth, remaining, unsorted.get() + above);
-      JKP_LAUNCH(k_rank_sort, kept, nms.get(), unsorted.get(), kept, idx.get());
+      g_profile.tag("detect rank sort");
+      launch(k_rank_sort, kept, nms.get(), unsorted.get(), kept, idx.get());
     }
 
     // Refinement and readback of the kept keypoints only.
     Buffer<float> xy(pool_, 2 * static_cast<size_t>(kept)), score(pool_, kept);
-    JKP_LAUNCH(k_refine, kept, s, w, h, idx.get(), kept, xy.get(), score.get());
+    g_profile.tag("detect refine");
+    launch(k_refine, kept, s, w, h, idx.get(), kept, xy.get(), score.get());
     out->xy_norm.resize(2 * static_cast<size_t>(kept));
     out->score.resize(kept);
     xy.download(out->xy_norm.data(), out->xy_norm.size());
@@ -786,6 +1304,14 @@ class CudaOps : public Ops {
       throw std::runtime_error("describe: shape mismatch");
     const float max_offset = static_cast<float>(std::max(h, w)) / 4.0f;
     desc->assign(static_cast<size_t>(total) * dim, 0.0f);
+    // On a normalized pyramid the head normalizes only the pixels it reads.
+    const bool lazy = f.pyramid && f.pyramid->normalized && c <= kMaxPyramidC;
+    const PyramidArgs args = lazy ? f.pyramid_args() : PyramidArgs();
+    const R *p0 = lazy ? part(f, 0) : nullptr, *p1 = lazy ? part(f, 1) : nullptr, *p2 = lazy ? part(f, 2) : nullptr,
+            *p3 = lazy ? part(f, 3) : nullptr;
+    const R* stored = lazy ? nullptr : f.as<R>();
+    const float *off0_w = param_f32(*p.offset0_w), *off0_b = param_f32(*p.offset0_b), *off1_w = param_f32(*p.offset1_w),
+                *off1_b = param_f32(*p.offset1_b), *sf_w = param_tiled_f32(*p.sf_w, 1), *agg_w = param_f32(*p.agg_w);
 
     // In chunks, so the per-keypoint work buffers (M*C floats each) stay small for any keypoint count.
     const int chunk = 8192;
@@ -796,14 +1322,29 @@ class CudaOps : public Ops {
           o1(pool_, static_cast<size_t>(n) * 2 * M), sampled(pool_, samples), feat(pool_, samples),
           d(pool_, static_cast<size_t>(n) * dim);
       xy.upload(kpts.xy_norm.data() + 2 * static_cast<size_t>(begin), xy.size());
-      JKP_LAUNCH(k_sddh_offset0, n * 2 * M, f.d(), c, h, w, xy.get(), n, K, param(*p.offset0_w), param(*p.offset0_b),
-                 2 * M, o0.get());
-      JKP_LAUNCH(k_sddh_offset1, n * 2 * M, o0.get(), n, 2 * M, param(*p.offset1_w), param(*p.offset1_b), max_offset,
-                 o1.get());
-      JKP_LAUNCH(k_sddh_sample, n * M, f.d(), c, h, w, xy.get(), o1.get(), n, M, sampled.get());
-      JKP_LAUNCH(k_sddh_sf, samples, sampled.get(), static_cast<int>(samples), c, param(*p.sf_w), feat.get());
-      JKP_LAUNCH(k_sddh_aggregate, n * dim, feat.get(), n, M * c, dim, param(*p.agg_w), d.get());
-      JKP_LAUNCH(k_normalize_rows, n, d.get(), n, dim);
+      g_profile.tag("describe offsets");
+      if (lazy) {
+        Buffer<float> patch(pool_, static_cast<size_t>(n) * K * K * c);
+        g_profile.tag("describe patch");
+        launch(k_sddh_patch_pyramid<R>, n * K * K, p0, p1, p2, p3, args, h, w, xy.get(), n, K, patch.get());
+        g_profile.tag("describe offsets");
+        launch(k_sddh_offset0_patch, n * 2 * M, patch.get(), c, h, w, xy.get(), n, K, off0_w, off0_b, 2 * M, o0.get());
+      } else {
+        launch(k_sddh_offset0<R>, n * 2 * M, stored, c, h, w, xy.get(), n, K, off0_w, off0_b, 2 * M, o0.get());
+      }
+      launch(k_sddh_offset1, n * 2 * M, o0.get(), n, 2 * M, off1_w, off1_b, max_offset, o1.get());
+      g_profile.tag("describe sample");
+      if (lazy)
+        launch(k_sddh_sample_pyramid<R>, n * M, p0, p1, p2, p3, args, h, w, xy.get(), o1.get(), n, M, sampled.get());
+      else
+        launch(k_sddh_sample<R>, n * M, stored, c, h, w, xy.get(), o1.get(), n, M, sampled.get());
+      g_profile.tag("describe sf");
+      // One output per thread for these two: on CUDA more, smaller threads beat tiling here (measured).
+      launch(k_sddh_sf_tile<R, 1>, static_cast<long long>(n) * M * c, sampled.get(), count(samples), c, sf_w, feat.get());
+      g_profile.tag("describe aggregate");
+      launch(k_sddh_aggregate_tile<R, 1>, static_cast<long long>(n) * dim, feat.get(), n, M * c, dim, agg_w, d.get());
+      g_profile.tag("describe normalize");
+      launch(k_normalize_rows, n, d.get(), n, dim);
       d.download(desc->data() + static_cast<size_t>(begin) * dim, d.size());
     }
   }
@@ -812,25 +1353,104 @@ class CudaOps : public Ops {
   // The current device is per host thread; select ours on entry to every operation.
   void use() const { JKP_CUDA_CHECK(cudaSetDevice(pool_->device())); }
 
-  CudaPtr make(int c, int h, int w) { return std::make_shared<CudaTensor>(pool_, c, h, w); }
+  // A tensor in the storage type.
+  CudaPtr make(int c, int h, int w) { return std::make_shared<CudaTensor>(pool_, c, h, w, kHalf); }
 
-  // Device copy of a weight tensor, uploaded on first use. Weights outlive the backend (see jkp_ctx).
-  const float* param(const Param& p) {
-    auto it = params_.find(p.data);
-    if (it != params_.end()) return it->second;
-    float* d = nullptr;
-    JKP_CUDA_CHECK(cudaMalloc(&d, std::max<size_t>(p.size(), 1) * sizeof(float)));
-    params_[p.data] = d;
-    JKP_CUDA_CHECK(cudaMemcpy(d, p.data, p.size() * sizeof(float), cudaMemcpyHostToDevice));
-    return d;
+  // Output channels per thread for the tiled kernels (instantiated for 4, 8 and 16).
+  static int tile(int cout) {
+    static const int forced = [] {
+      const char* env = std::getenv("JKP_CUDA_TILE");  // tuning aid
+      return env ? std::atoi(env) : 0;
+    }();
+    if (forced == 4 || forced == 8 || forced == 16) return forced;
+    return cout <= 4 ? 4 : cout <= 8 ? 8 : 16;
   }
 
+  // Part i of a pyramid tensor, or part 0 for an unused slot (its channel count is 0).
+  static const R* part(const CudaTensor& x, size_t i) {
+    const auto& parts = x.pyramid->parts;
+    return parts[i < parts.size() ? i : 0]->template as<R>();
+  }
+
+  // Computes and stores the values of a pyramid tensor (the eager form of upsample_concat and
+  // l2_normalize_crop).
+  static void store_pyramid(const CudaTensor& t, void* dst) {
+    const Pyramid& p = *t.pyramid;
+    int channels = 0;
+    for (const auto& x : p.parts) channels += x->c;
+    const size_t plane = static_cast<size_t>(p.height) * p.width;
+    std::unique_ptr<Buffer<R>> full;  // the concatenation, when it is not the result itself
+    R* cat = static_cast<R*>(dst);
+    if (p.normalized) {
+      full = std::make_unique<Buffer<R>>(t.pool, channels * plane);
+      cat = full->get();
+    }
+    size_t pos = 0;
+    for (size_t i = 0; i < p.parts.size(); ++i) {
+      const CudaTensor& x = *p.parts[i];
+      const size_t values = x.c * plane;
+      if (p.scales[i] == 1) {
+        if (values)
+          JKP_CUDA_CHECK(cudaMemcpy(cat + pos, x.template as<R>(), values * sizeof(R), cudaMemcpyDeviceToDevice));
+      } else {
+        g_profile.tag("upsample%d c%d -> %dx%d", p.scales[i], x.c, p.width, p.height);
+        launch(k_upsample<R>, count(static_cast<long long>(values)), x.template as<R>(), x.c, x.h, x.w, p.height, p.width,
+               upsample_ratio(x.w, p.width), upsample_ratio(x.h, p.height), cat + pos);
+      }
+      pos += values;
+    }
+    g_profile.tag("l2_normalize_crop c%d %dx%d", t.c, t.w, t.h);
+    if (p.normalized)
+      launch(k_l2_normalize_crop<R>, t.w * t.h, cat, t.c, p.height, p.width, p.left, p.top, t.h, t.w, static_cast<R*>(dst));
+    // `full` returns to the pool here; the kernel that reads it was launched before any later one can reuse it.
+  }
+
+  // Device copies of weight tensors, uploaded on first use. Weights outlive the backend (see jkp_ctx).
+  template <typename T>
+  const T* upload(const std::vector<T>& host) {
+    T* d = nullptr;
+    JKP_CUDA_CHECK(cudaMalloc(&d, std::max<size_t>(host.size(), 1) * sizeof(T)));
+    params_owned_.push_back(d);
+    if (!host.empty()) JKP_CUDA_CHECK(cudaMemcpy(d, host.data(), host.size() * sizeof(T), cudaMemcpyHostToDevice));
+    return d;
+  }
+  template <typename T>
+  const T* cached(std::map<std::pair<const float*, int>, const void*>& cache, const Param& p, int tile) {
+    const auto key = std::make_pair(p.data, tile);
+    auto it = cache.find(key);
+    if (it != cache.end()) return static_cast<const T*>(it->second);
+    std::vector<T> host;
+    if (tile == 0) {  // as stored: [cout][...]
+      host.resize(p.size());
+      for (size_t i = 0; i < p.size(); ++i) encode(p.data[i], &host[i]);
+    } else {  // tap-major, cout padded with zeros to a multiple of `tile` (see k_conv2d_tile)
+      const size_t cout = static_cast<size_t>(p.shape[0]), taps = cout ? p.size() / cout : 0;
+      const size_t cpad = (cout + tile - 1) / tile * tile;
+      host.resize(taps * cpad);
+      for (size_t i = 0; i < host.size(); ++i) encode(0.0f, &host[i]);
+      for (size_t oc = 0; oc < cout; ++oc)
+        for (size_t t = 0; t < taps; ++t) encode(p.data[oc * taps + t], &host[t * cpad + oc]);
+    }
+    const T* d = upload(host);
+    cache[key] = d;
+    return d;
+  }
+  // In the storage type / always float (descriptor head).
+  const R* param(const Param& p) { return cached<R>(params_, p, 0); }
+  const R* param_tiled(const Param& p, int tile) { return cached<R>(params_, p, tile); }
+  const float* param_f32(const Param& p) { return cached<float>(params_f32_, p, 0); }
+  const float* param_tiled_f32(const Param& p, int tile) { return cached<float>(params_f32_, p, tile); }
+
   PoolPtr pool_;
-  std::map<const float*, float*> params_;
+  std::map<std::pair<const float*, int>, const void*> params_, params_f32_;
+  std::vector<void*> params_owned_;
 };
 
 }  // namespace
 
-std::unique_ptr<Ops> make_cuda_ops(int device) { return std::make_unique<CudaOps>(device); }
+std::unique_ptr<Ops> make_cuda_ops(int device, Precision precision) {
+  if (precision == Precision::Fp16) return std::make_unique<CudaOps<__half>>(device);
+  return std::make_unique<CudaOps<float>>(device);
+}
 
 }  // namespace jkp

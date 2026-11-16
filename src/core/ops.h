@@ -110,10 +110,14 @@ class Ops {
                         std::vector<float>* desc) = 0;
 };
 
+// Fp32 is the reference mode. Fp16 (GPU backends): feature maps and convolution weights are stored as
+// 16-bit floats; arithmetic, the score map, keypoint selection and the descriptor head stay in float32.
+enum class Precision { Fp32, Fp16 };
+
 std::unique_ptr<Ops> make_cpu_ops(int num_threads);
 // Only in builds with the CUDA backend (JKP_HAVE_CUDA). device: GPU index.
-std::unique_ptr<Ops> make_cuda_ops(int device);
+std::unique_ptr<Ops> make_cuda_ops(int device, Precision precision = Precision::Fp32);
 // Only in builds with the Metal backend (JKP_HAVE_METAL). device: index in MTLCopyAllDevices().
-std::unique_ptr<Ops> make_metal_ops(int device);
+std::unique_ptr<Ops> make_metal_ops(int device, Precision precision = Precision::Fp32);
 
 }  // namespace jkp

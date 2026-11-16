@@ -17,6 +17,13 @@ python tools/compare.py $A/tum/*.png --b "cmd:build/release/jkp extract --backen
 python tools/compare.py $A/tum/*.png --b "cmd:build/release/jkp extract --backend metal"
 ```
 
+Timing, against the original on the same device (each column in turn, several rounds):
+
+```sh
+python tools/bench.py --jkp "--backend metal" --jkp "--backend metal --precision fp16" --torch mps
+python tools/bench.py --jkp "--backend cuda" --jkp "--backend cuda --precision fp16" --torch cuda
+```
+
 RaCo uses the same tools with `--model raco`:
 
 ```sh
@@ -37,6 +44,7 @@ python tools/compare.py --model raco --descriptor aliked-n16 $A/tum/*.png \
 | `raco_folded.py` | RaCo forward pass from a `.jkpw` file only; the executable specification for the C++ backends |
 | `export_weights.py` | checkpoint -> `.jkpw` |
 | `dump_golden.py` | golden test vectors from the original |
+| `bench.py` | times `jkp bench` and the original ALIKED at several image sizes; prints a Markdown table |
 | `compare.py` | compares two implementations: `upstream`, `folded`, or `cmd:<program>` (the `jkp` CLI, any backend) |
 
 The original needs a compiled CUDA extension (`custom_ops/get_patches`). When it is not built,

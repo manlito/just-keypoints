@@ -1,6 +1,6 @@
 // jkp command line tool.
 //   jkp extract IMAGE [--out OUT.jkpt] [options]   extract keypoints and descriptors (raco: ranker, covariances)
-//   jkp bench   IMAGE [--runs N] [options]         time the extraction
+//   jkp bench   IMAGE [--runs N] [--warmup N] [options]   time the extraction (warm-up runs are not counted)
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
@@ -31,11 +31,12 @@ namespace {
 int usage() {
   std::fprintf(stderr,
                "usage: jkp extract IMAGE [--out OUT.jkpt] [options]\n"
-               "       jkp bench   IMAGE [--runs N] [options]\n"
+               "       jkp bench   IMAGE [--runs N] [--warmup N] [options]   (default 10 runs after 2 warm-up runs)\n"
                "options:\n"
                "  --image PATH      input image (same as the positional argument)\n"
                "  --backend NAME    cpu (default), cuda or metal\n"
                "  --device N        GPU index for --backend cuda or metal (default 0)\n"
+               "  --precision P     fp32 (default, matches the original) or fp16 (cuda and metal: faster)\n"
                "  --weights PATH    .jkpw file (default: weights embedded in the build)\n"
                "  --model NAME      aliked-n16 (default) or raco; picks the embedded weights\n"
                "  --descriptor NAME aliked-n16: describe raco keypoints with it\n"
@@ -54,7 +55,7 @@ int usage() {
 int main(int argc, char** argv) {
   if (argc < 2) return usage();
   std::string cmd = argv[1], image_path, out_path, weights_path, model, descriptor, descriptor_weights;
-  int runs = 10;
+  int runs = 10, warmup = 2;
   bool gray = false;
   jkp_config config;
   jkp_config_default(&config);
@@ -83,11 +84,18 @@ int main(int argc, char** argv) {
       else return usage();
     }
     else if (a == "--device") config.device = std::atoi(value());
+    else if (a == "--precision") {
+      std::string name = value();
+      if (name == "fp32") config.precision = JKP_PRECISION_FP32;
+      else if (name == "fp16") config.precision = JKP_PRECISION_FP16;
+      else return usage();
+    }
     else if (a == "--top-k") config.top_k = std::atoi(value());
     else if (a == "--scores-th") config.score_threshold = static_cast<float>(std::atof(value()));
     else if (a == "--n-limit") config.max_keypoints = std::atoi(value());
     else if (a == "--threads") config.num_threads = std::atoi(value());
     else if (a == "--runs") runs = std::atoi(value());
+    else if (a == "--warmup") warmup = std::atoi(value());
     else if (a == "--gray") gray = true;
     else if (a.rfind("--", 0) == 0) return usage();
     else image_path = a;
@@ -113,14 +121,16 @@ int main(int argc, char** argv) {
   }
   jkp_result r{};
   std::vector<double> ms;
+  // bench: the first runs compile kernels and fill the buffer pool; they are not counted.
+  const int skipped = cmd == "bench" ? std::max(0, warmup) : 0;
   int iterations = cmd == "bench" ? std::max(1, runs) : 1;
-  for (int i = 0; i < iterations; ++i) {
+  for (int i = -skipped; i < iterations; ++i) {
     auto t0 = std::chrono::steady_clock::now();
     if (jkp_extract(ctx, &image, &r) != 0) {
       std::fprintf(stderr, "jkp_extract: %s\n", jkp_last_error());
       return 1;
     }
-    ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
+    if (i >= 0) ms.push_back(std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count());
   }
 
   if (cmd == "bench") {

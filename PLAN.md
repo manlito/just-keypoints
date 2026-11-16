@@ -116,21 +116,30 @@ Each milestone is a state you can run and check. Phases below hold the technical
   in threshold and top-k mode (identical keypoint sets, position error <= 2.6e-4 px, score error <= 7e-5,
   descriptor cosine >= 1 - 2e-9); every intermediate tensor matches the golden dump within 3e-5 and the
   CPU backend within 2e-5. Not tuned yet: 43 ms for 640x480, about 8x the CPU backend on 12 threads.
-- [ ] **M5 — Fast** (phase 3, plus FP16 on Metal)
+- [x] **M5 — Fast** (phase 3, plus FP16 on Metal)
   Benchmark table: jkp CUDA vs PyTorch CUDA, jkp Metal, FP32 vs FP16, at three resolutions. FP16 accuracy loss measured.
-  In progress (Metal, FP32): tiled convolutions and fewer full-resolution copies, results byte-identical
-  to M3. Top-k 1000, median of warm runs, runs interleaved with PyTorch, M5 Pro:
+  Done. Milliseconds per image, from an 8-bit image in host memory to keypoints and descriptors in host
+  memory; top-k 1000, median of warm runs, columns timed in turn (`tools/bench.py`):
 
-  | Size | jkp Metal | PyTorch MPS (original) | jkp CPU | PyTorch CPU (original) |
-  |---|---|---|---|---|
-  | 640x480 | 12.8 ms (M3: 32.8) | 12.1 ms | 69 ms | 241 ms |
-  | 1241x376 | 17.6 ms (M3: 48.4) | 18.5 ms | 102 ms | 337 ms |
-  | 1024x768 | 25.1 ms (M3: 77.2) | 28.6 ms | 161 ms | 568 ms |
-  | 1920x1080 | 56.6 ms (M3: 212) | 68.7 ms | 384 ms | 1252 ms |
+  | Size | Metal FP32 | Metal FP16 | PyTorch MPS | CUDA FP32 | CUDA FP16 | PyTorch CUDA |
+  |---|---|---|---|---|---|---|
+  | 640x480 | 8.3 | 7.2 | 13.1 | 15.2 | 13.4 | 15.6 |
+  | 1241x376 | 10.3 | 8.7 | 19.2 | 19.6 | 17.5 | 22.2 |
+  | 1024x768 | 13.8 | 11.3 | 28.9 | 26.8 | 24.5 | 31.8 |
+  | 1920x1080 | 30.2 | 23.3 | 74.8 | 59.1 | 53.9 | 77.3 |
 
-  PyTorch MPS times vary with machine load by about 10% between sessions (68.7-75.7 ms at 1080p). The
-  PyTorch baseline runs without the original's compiled `get_patches` op (CUDA only), so its descriptor head
-  copies the whole feature map; the fair 1080p baseline is probably a few ms faster.
+  Metal and MPS: M5 Pro, macOS 26. CUDA: RTX 2070 Max-Q laptop, CUDA 13.4, PyTorch 2.15 (cu132). PyTorch is
+  the original ALIKED, without its compiled `get_patches` op (see M1 notes). Before M5: Metal 32.8 / 212 ms and
+  CUDA 48.7 / 270 ms at 640x480 / 1080p. CPU backend for scale: 66 ms (M5 Pro) and 355 ms (laptop) at 640x480.
+  - FP32 results did not change: `jkp extract` output is byte-identical to the M3 (Metal) and M4 (CUDA) builds
+    on 58 images in threshold and top-k mode, so the comparison with the original stands as recorded there.
+  - FP16 (`--precision fp16`, `config.precision`) against FP32 on the same backend, 24 images on Metal and 44
+    on CUDA, threshold and top-k 1000 (`precision_test`): 98.7-100 % of the keypoints are found within 1 px in
+    the other run (mean 99.6-99.9 %); median shift of those <= 0.002 px; score difference <= 0.04; descriptor
+    cosine 1 - 2e-5 on average, >= 0.98 for the worst pair (neighbouring maxima almost 1 px apart).
+    Against the original on 57 images (Metal, `compare.py`): keypoint overlap >= 99.45 %, mean 99.8 %.
+  - Not reached: the CUDA backend is only level with PyTorch at 640x480 (25 % faster at 1080p). Its
+    descriptor head takes about 6 of the 15 ms there; see the notes from M5.
 
   For reference, the ALIKED paper reports 77.4 FPS (12.9 ms) for aliked-n16 at 640x480 with 1K keypoints
   (PyTorch, RTX 2060).
@@ -193,6 +202,7 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
 - Benchmark harness (per-op timing, 640x480 / 1024x768 / 1920x1080).
 - Opt-in FP16 storage and math (FP32 reference mode stays available and tested), fused conv+activation, preallocated arena (zero allocations per frame),
   specialized 3x3 kernels per channel count, pinned-memory upload, optional batch of images.
+  (M5 did FP16 storage with float32 math, tiled kernels and the lazy pyramid; pinned upload and batches were not needed for the exit.)
 - Compare against the PyTorch reference and existing ALIKED CUDA/TensorRT ports as baselines.
 - **Exit:** documented ms/frame numbers; accuracy regression test (FP16 vs FP32 golden).
 
@@ -359,25 +369,46 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
   `detect` and `describe`), plus a full sync for each radix-select pass. Peak memory is ~1.7 GB at
   1024x640, mostly the deformable-convolution column buffer and the pool keeping every size it has seen.
 
-## Notes from M5 (Metal, in progress)
+## Notes from M5
 
-- `JKP_METAL_PROFILE=1` gives each dispatch its own command buffer and prints GPU time per operation and
-  per kernel when the backend is destroyed. Summed GPU time matches normal wall time, so the kernels
-  themselves are the cost, not syncs or encoding.
-- Convolutions were memory bound: one thread per output value re-read the whole input once per output
-  channel (8.6 GB per frame for the 128->8 score-head layer at 1080p). `k_conv2d_tile<T, K>` and
-  `k_deform_sum_tile<T>` compute T output channels per thread with weights in the constant address space;
-  each output keeps the same accumulation order, so outputs are byte-identical to the M3 kernels.
-  T = 4, 8 or 16 by output channel count (`JKP_METAL_TILE` forces one, for tuning); 32 is slower.
-  Convolution GPU time went from 24 to ~8.5 ms at 640x480 and from 163 to ~33 ms at 1080p.
-- Fewer passes over the 128-channel full-resolution tensor (~1 GB at 1080p): `Ops` gained two fused
-  operations, `upsample_concat` and `l2_normalize_crop`, whose defaults run the separate operations
-  (CPU and CUDA unchanged). Metal writes the upsampled maps straight into their concat slices, normalizes
-  and crops in one kernel, and returns the input from an identity crop. Saved ~20 ms GPU time at 1080p.
-- Next, by GPU time at 1080p: `k_l2_normalize_crop` (11 ms, 20%; it reads the input twice), the 3x3
-  convolutions at 1/2 and 1/8 resolution (2-4x slower than MPS; threadgroup tiles of the input), the
-  aggregation conv at full resolution writing into its concat slice (saves the remaining 2 ms copy), and
-  the descriptor head (~4 ms for 1K keypoints at any size).
+- Profilers: `JKP_METAL_PROFILE=1` gives each dispatch its own command buffer and prints GPU time per
+  operation and per kernel; `JKP_CUDA_PROFILE=1` synchronizes after every launch and prints time per
+  operation. Both print when the backend is destroyed. Summed times match normal wall time on both, so the
+  kernels are the cost, not synchronization or encoding.
+- Tiled convolutions. One thread per output value re-read the whole input once per output channel.
+  `k_conv2d_tile` and `k_deform_sum_tile` compute T output channels per thread (4, 8 or 16 by output channel
+  count; 32 is slower; `JKP_METAL_TILE` / `JKP_CUDA_TILE` force one). Weights are stored tap-major,
+  `w[tap * cpad + oc]`, so the T weights of a tap are adjacent; Metal reads them four at a time through the
+  constant address space. Each output keeps its accumulation order, so results are unchanged.
+- The pyramid. `upsample_concat` and `l2_normalize_crop` are fused operations in `Ops` (defaults run the
+  separate operations; the CPU backend uses those). On the GPU backends their result is lazy: the 128-channel
+  full-resolution tensor (1 GB at 1080p) is never stored. The score head's 1x1 convolution computes the
+  upsampled values per pixel from the four small maps, and the descriptor head normalizes only the pixels the
+  keypoints touch. `Tensor::read` and any other operation store it on demand, which is what the golden tests
+  check; stored or not, FP32 values are the same. This removed about a third of the 1080p time.
+- FP16 design. `real` (Metal) / the template parameter `R` (CUDA) is the storage type of feature maps and of
+  the dense network's weights; every value is converted to float when read, so arithmetic is float32 in
+  both modes and one kernel source serves both. In FP16 mode the convolutions use a fused multiply-add.
+  Kept in float32: the score map (half would make neighbouring scores tie in NMS), keypoint selection, and
+  the descriptor head's weights and buffers (per keypoint, so it costs nothing). `src/core/half.h` converts
+  on the host (checked against the compiler's `_Float16` on 400 M values).
+- FP16 gains 13-23 % on Metal and 8-12 % on CUDA: after tiling the convolutions are no longer limited by
+  memory traffic. Half arithmetic was not tried; it would need its own accuracy measurement.
+- Top-k selection takes 16 bits of the float per radix pass instead of 8: two host round trips instead of four.
+- CUDA descriptor head (about 6 ms for 1000 keypoints at any image size, against about 2 ms on Metal):
+  one output per thread is faster there than tiling (`k_sddh_sf_tile<R, 1>`), the opposite of Metal. The
+  rest is reading 128 channel planes per sampled pixel. Tried and dropped: storing the four small maps
+  channel-last (descriptor sampling 3.0 -> 1.6 ms, but the dense kernels that read them got slower, 1080p
+  57 -> 68 ms; no change on Metal), and gathering all sampled pixels with one thread per value (slower:
+  the scattered reads dominate, not the thread count). Untried: channel-last copies of only the three
+  low-resolution maps for the descriptor kernels.
+- Still open, by GPU time: on Metal at 1080p the 3x3 convolutions at full and half resolution (about 9 of
+  30 ms); on CUDA the descriptor head, then the same convolutions. Keypoints still make a host round trip
+  between `detect` and `describe`.
+- `tests/precision_test.cpp` (ctest `<backend>_fp16_vs_fp32`) fails on a broken FP16 path; its bounds are
+  far looser than the measured values. `jkp bench` skips two warm-up runs (`--warmup`).
+- The CUDA laptop has a separate tree at `~/Repos/just-keypoints/.claude/worktrees/m5` with its own `.venv`
+  holding CUDA-enabled PyTorch; the M4 worktree's `.venv` is CPU-only.
 
 ## Open questions (decide during implementation)
 

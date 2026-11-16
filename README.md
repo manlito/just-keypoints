@@ -3,6 +3,9 @@
 Keypoint and descriptor extraction (ALIKED) with minimal dependencies, for feature matching and bundle adjustment.
 No PyTorch, no ONNX Runtime. Plan and status: [PLAN.md](PLAN.md).
 
+Documentation: <https://just-keypoints.pages.dev> ([live demo](https://just-keypoints.pages.dev/demo/),
+[benchmark](https://just-keypoints.pages.dev/bench/)).
+
 Status: the CPU reference backend and the CUDA, Metal and WebGPU backends work and match the original ALIKED.
 WebGPU runs natively (Dawn) and in the browser (WebAssembly).
 
@@ -139,7 +142,7 @@ API, with the same settings (JSPI, `-fwasm-exceptions`).
 ## Documentation site and live demo
 
 `docs/` holds the documentation site (Sphinx) with a live demo and a benchmark page that run the browser build
-on WebGPU. Build and deploy: [docs/README.md](docs/README.md).
+on WebGPU, published at <https://just-keypoints.pages.dev>. Build and deploy: [docs/README.md](docs/README.md).
 
 ## RaCo detector
 

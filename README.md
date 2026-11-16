@@ -114,7 +114,8 @@ third_party/webgpu/dawn/Dawn-7daf3b0bee2c73621001ab15b256b5a84fb0b45f-macos-late
 third_party/webgpu/emdawnwebgpu/emdawnwebgpu_pkg/                                             (emdawnwebgpu.port.py)
 ```
 
-Or point `JKP_DAWN_DIR` / `JKP_EMDAWNWEBGPU_DIR` elsewhere. The browser build needs Emscripten 7.0.0 (Homebrew)
+`tools/fetch_webgpu.sh` downloads both (`browser` or `native` for one). Or point `JKP_DAWN_DIR` /
+`JKP_EMDAWNWEBGPU_DIR` elsewhere. The browser build needs Emscripten 7.0.0 (Homebrew)
 and Python 3.10 or later for it (`EMSDK_PYTHON` when the default `python3` is older):
 
 ```sh
@@ -134,6 +135,11 @@ The module is single-threaded and waits for the GPU through JSPI (Chrome and Edg
 other GPU work passes its own device: `config.webgpu_instance` and `config.webgpu_device`. An app that links
 just-keypoints with other libraries into one WebAssembly module links the static library (`libjkp.a`) and the C
 API, with the same settings (JSPI, `-fwasm-exceptions`).
+
+## Documentation site and live demo
+
+`docs/` holds the documentation site (Sphinx) with a live demo and a benchmark page that run the browser build
+on WebGPU. Build and deploy: [docs/README.md](docs/README.md).
 
 ## RaCo detector
 

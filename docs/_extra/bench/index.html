@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Benchmark · just-keypoints</title>
+<meta name="description" content="Time ALIKED keypoint and descriptor extraction in your browser on a fixed set of image sizes.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
+<link rel="stylesheet" href="../_static/jkp.css">
+<link rel="stylesheet" href="../app.css">
+</head>
+<body>
+<a class="jk-skip" href="#content">Skip to content</a>
+<header class="jk-top">
+  <div class="jk-top-in">
+    <a class="jk-brand" href="../index.html">
+      <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="5" cy="6" r="2.2"></circle><circle cx="16.5" cy="4.5" r="2.2"></circle><circle cx="12" cy="16.5" r="2.2"></circle><path d="M2 19.5h4M4 17.5v4M15.5 11h4M17.5 9v4"></path></svg>
+      <span>just-keypoints</span>
+    </a>
+    <span class="jk-grow"></span>
+    <a class="jk-toplink" href="../index.html">Documentation</a>
+    <a class="jk-toplink" href="../demo/index.html">Live demo</a>
+    <a class="jk-toplink" href="../bench/index.html" aria-current="page"><strong>Benchmark</strong></a>
+  </div>
+</header>
+
+<main class="app" id="content">
+  <h1>Benchmark</h1>
+  <p class="lede">Times the library in this browser on the same image at four sizes, with the 1000 best keypoints, so
+  numbers compare across machines and with <a href="../accuracy-and-speed.html">the native backends</a>.
+  A run is one call into the library: copying the pixels in, the network, keypoint selection, descriptors and
+  reading the results back. The table shows the median of the timed runs, after warm-up runs. Keep this tab in
+  front while it runs: browsers slow down hidden tabs.</p>
+
+  <div class="banner warn" id="banner" hidden></div>
+
+  <div class="layout">
+    <div>
+      <section class="panel" aria-labelledby="h-set">
+        <h2 id="h-set">Settings</h2>
+        <div class="field">
+          <span class="label">Backend</span>
+          <div class="seg" role="radiogroup" aria-label="Backend">
+            <label><input type="radio" name="backend" value="webgpu" checked>WebGPU</label>
+            <label><input type="radio" name="backend" value="cpu">CPU</label>
+          </div>
+          <p class="hint">The CPU backend runs on one thread, about a second per 640x480 image; it times 640x480 only.</p>
+        </div>
+        <div class="field">
+          <span class="label">Precision</span>
+          <label class="check"><input type="checkbox" id="fp32" checked>FP32</label>
+          <label class="check"><input type="checkbox" id="fp16" checked>FP16 <span class="hint" id="fp16-hint"></span></label>
+        </div>
+        <div class="field">
+          <label for="runs">Timed runs per size</label>
+          <input type="number" id="runs" min="1" max="200" value="20">
+        </div>
+        <div class="field">
+          <label for="warmup">Warm-up runs per size</label>
+          <input type="number" id="warmup" min="0" max="50" value="3">
+        </div>
+        <div class="row"><button type="button" class="primary" id="start" disabled>Start</button><button type="button" id="stop" disabled>Stop</button></div>
+        <p class="hint" id="progress"></p>
+      </section>
+    </div>
+    <div>
+      <section class="panel" aria-labelledby="h-res">
+        <h2 id="h-res">Milliseconds per image</h2>
+        <table class="t" id="results"><thead></thead><tbody></tbody></table>
+        <p class="hint">Median of the timed runs; in brackets the fastest and the slowest. Keypoints: the number
+        returned (1000 unless the image has fewer).</p>
+      </section>
+      <section class="panel" aria-labelledby="h-env">
+        <h2 id="h-env">This machine</h2>
+        <dl class="kv" id="env"></dl>
+      </section>
+      <section class="panel" aria-labelledby="h-copy">
+        <h2 id="h-copy">Copy the results</h2>
+        <pre class="out" id="md">Run the benchmark first.</pre>
+        <div class="row"><button type="button" id="copy" disabled>Copy as Markdown</button></div>
+      </section>
+    </div>
+  </div>
+</main>
+
+<footer class="jk-foot">
+  <div class="jk-foot-in">
+    <span>just-keypoints · weights from ALIKED (BSD-3-Clause) · test image: TUM RGB-D (CC BY 4.0)</span>
+    <a href="../references.html">References and acknowledgements</a>
+  </div>
+</footer>
+<script type="module" src="bench.js"></script>
+</body>
+</html>

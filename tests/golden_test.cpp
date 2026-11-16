@@ -1,5 +1,5 @@
 // Compares every stage of a backend against golden tensors dumped from the original ALIKED.
-//   golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|cuda|metal]
+//   golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|cuda|metal|webgpu]
 // Generate golden files with: python tools/dump_golden.py <images>
 #include <cmath>
 #include <cstdio>
@@ -38,8 +38,8 @@ void check(const char* name, const float* got, size_t got_n, const jkp::Param* r
 
 int main(int argc, char** argv) {
   std::string backend = argc == 4 ? argv[3] : "cpu";
-  if (argc < 3 || argc > 4 || (backend != "cpu" && backend != "cuda" && backend != "metal")) {
-    std::fprintf(stderr, "usage: golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|cuda|metal]\n");
+  if (argc < 3 || argc > 4 || (backend != "cpu" && backend != "cuda" && backend != "metal" && backend != "webgpu")) {
+    std::fprintf(stderr, "usage: golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|cuda|metal|webgpu]\n");
     return 2;
   }
   try {

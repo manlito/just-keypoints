@@ -119,5 +119,9 @@ std::unique_ptr<Ops> make_cpu_ops(int num_threads);
 std::unique_ptr<Ops> make_cuda_ops(int device, Precision precision = Precision::Fp32);
 // Only in builds with the Metal backend (JKP_HAVE_METAL). device: index in MTLCopyAllDevices().
 std::unique_ptr<Ops> make_metal_ops(int device, Precision precision = Precision::Fp32);
+// Only in builds with the WebGPU backend (JKP_HAVE_WEBGPU). instance, device: a WGPUInstance and the
+// WGPUDevice created from it, to share the caller's device; both null to create our own.
+std::unique_ptr<Ops> make_webgpu_ops(Precision precision = Precision::Fp32, void* instance = nullptr,
+                                     void* device = nullptr);
 
 }  // namespace jkp

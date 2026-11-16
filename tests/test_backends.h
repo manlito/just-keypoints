@@ -1,4 +1,4 @@
-// Backend by name, for the tests: cpu, cuda, metal, or a GPU backend in FP16 as "cuda:fp16" / "metal:fp16".
+// Backend by name, for the tests: cpu, cuda, metal, webgpu, or a GPU backend in FP16 as "metal:fp16" etc.
 // Throws when the backend is not in this build.
 #pragma once
 
@@ -19,6 +19,9 @@ inline std::unique_ptr<jkp::Ops> make_backend(const std::string& spec) {
 #endif
 #ifdef JKP_TEST_METAL
   if (name == "metal") return jkp::make_metal_ops(0, precision);
+#endif
+#ifdef JKP_TEST_WEBGPU
+  if (name == "webgpu") return jkp::make_webgpu_ops(precision);
 #endif
   (void)precision;
   throw std::runtime_error("this build has no " + spec + " backend");

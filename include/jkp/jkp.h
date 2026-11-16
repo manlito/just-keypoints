@@ -34,6 +34,17 @@ typedef struct {
   int num_threads;
   /* GPU backends: device index; 0 = first device. */
   int device;
+  /* Optional second model that describes the keypoints of a detector without descriptors:
+     model = "raco", descriptor = "aliked-n16". NULL = only what `model` itself returns.
+     Its weights: memory blob, file path, or weights embedded at build time, as above. */
+  const char* descriptor;
+  const void* descriptor_weights_data;
+  size_t descriptor_weights_size;
+  const char* descriptor_weights_path;
+  /* raco: non-zero skips a head and leaves its output NULL. The covariance head is about three
+     quarters of the work of the network, the ranker head about a fifth. */
+  int skip_ranker;
+  int skip_covariance;
 } jkp_config;
 
 typedef struct {
@@ -47,7 +58,7 @@ typedef struct {
 /* Arrays are owned by the context and stay valid until the next jkp_extract or jkp_destroy on it. */
 typedef struct {
   int n;              /* number of keypoints */
-  int dim;            /* descriptor size (128 for aliked-n16, 0 for raco) */
+  int dim;            /* descriptor size (128 for aliked-n16, 0 for raco without a descriptor model) */
   const float* xy;    /* [n][2] pixel coordinates, x right / y down, (0,0) = centre of the top-left pixel */
   const float* score; /* [n]; aliked: in [0, 1]. raco: probability, sums to 1 over the image */
   const float* desc;  /* [n][dim], L2-normalized; NULL when dim is 0 */

@@ -38,6 +38,9 @@ int usage() {
                "  --device N        GPU index for --backend cuda (default 0)\n"
                "  --weights PATH    .jkpw file (default: weights embedded in the build)\n"
                "  --model NAME      aliked-n16 (default) or raco; picks the embedded weights\n"
+               "  --descriptor NAME aliked-n16: describe raco keypoints with it\n"
+               "  --descriptor-weights PATH   .jkpw file for --descriptor (default: embedded)\n"
+               "  --no-ranker, --no-covariance   raco: skip that head\n"
                "  --top-k K         keep the K best keypoints (default: threshold mode; raco: 2048)\n"
                "  --scores-th T     score threshold (default 0.2)\n"
                "  --n-limit N       maximum keypoints in threshold mode (default 5000)\n"
@@ -50,7 +53,7 @@ int usage() {
 
 int main(int argc, char** argv) {
   if (argc < 2) return usage();
-  std::string cmd = argv[1], image_path, out_path, weights_path, model;
+  std::string cmd = argv[1], image_path, out_path, weights_path, model, descriptor, descriptor_weights;
   int runs = 10;
   bool gray = false;
   jkp_config config;
@@ -68,6 +71,10 @@ int main(int argc, char** argv) {
     else if (a == "--out") out_path = value();
     else if (a == "--weights") weights_path = value();
     else if (a == "--model") model = value();
+    else if (a == "--descriptor") descriptor = value();
+    else if (a == "--descriptor-weights") descriptor_weights = value();
+    else if (a == "--no-ranker") config.skip_ranker = 1;
+    else if (a == "--no-covariance") config.skip_covariance = 1;
     else if (a == "--backend") {
       std::string name = value();
       if (name == "cpu") config.backend = JKP_BACKEND_CPU;
@@ -87,6 +94,8 @@ int main(int argc, char** argv) {
   if ((cmd != "extract" && cmd != "bench") || image_path.empty()) return usage();
   if (!weights_path.empty()) config.weights_path = weights_path.c_str();
   if (!model.empty()) config.model = model.c_str();
+  if (!descriptor.empty()) config.descriptor = descriptor.c_str();
+  if (!descriptor_weights.empty()) config.descriptor_weights_path = descriptor_weights.c_str();
 
   int w = 0, h = 0, n = 0;
   unsigned char* pixels = stbi_load(image_path.c_str(), &w, &h, &n, gray ? 1 : 3);

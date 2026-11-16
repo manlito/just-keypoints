@@ -10,8 +10,9 @@
 #include "models/raco/raco.h"
 
 struct jkp_ctx {
-  jkp::Weights weights;
+  jkp::Weights weights, descriptor_weights;
   std::unique_ptr<jkp::Aliked> model;  // one of model / raco is set
+  std::unique_ptr<jkp::Aliked> descriptor;  // optional, describes the keypoints of raco
   std::unique_ptr<jkp::Raco> raco;
   jkp::RacoOptions raco_options;
   std::unique_ptr<jkp::Ops> ops;
@@ -62,6 +63,25 @@ jkp_ctx* jkp_create(const jkp_config* config) {
     else if (kind.rfind("aliked-", 0) == 0) ctx->model = std::make_unique<jkp::Aliked>(ctx->weights);
     else throw std::runtime_error("unsupported model '" + kind + "'");
     ctx->raco_options.top_k = config->top_k;
+    ctx->raco_options.ranker = !config->skip_ranker;
+    ctx->raco_options.covariance = !config->skip_covariance;
+    if (config->descriptor && *config->descriptor && !(ctx->model && kind == config->descriptor)) {
+      std::string name = config->descriptor;
+      if (!ctx->raco) throw std::runtime_error("'" + kind + "' has its own descriptors; a descriptor model needs raco");
+      if (config->descriptor_weights_data && config->descriptor_weights_size) {
+        ctx->descriptor_weights =
+            jkp::Weights::from_memory(config->descriptor_weights_data, config->descriptor_weights_size);
+      } else if (config->descriptor_weights_path) {
+        ctx->descriptor_weights = jkp::Weights::from_file(config->descriptor_weights_path);
+      } else if (jkp::embedded_weights(name, &blob, &blob_size)) {
+        ctx->descriptor_weights = jkp::Weights::from_memory(blob, blob_size);
+      } else {
+        throw std::runtime_error("no descriptor weights given and '" + name + "' is not embedded in this build");
+      }
+      if (ctx->descriptor_weights.meta("model").rfind("aliked-", 0) != 0)
+        throw std::runtime_error("unsupported descriptor model '" + ctx->descriptor_weights.meta("model") + "'");
+      ctx->descriptor = std::make_unique<jkp::Aliked>(ctx->descriptor_weights);
+    }
     if (!jkp_backend_available(config->backend)) throw std::runtime_error("backend not available in this build");
     if (config->backend == JKP_BACKEND_CPU) ctx->ops = jkp::make_cpu_ops(config->num_threads);
 #ifdef JKP_HAVE_CUDA
@@ -84,7 +104,12 @@ int jkp_extract(jkp_ctx* ctx, const jkp_image* image, jkp_result* result) {
     if (ctx->raco)
       ctx->raco->extract(*ctx->ops, image->data, image->width, image->height, image->stride, channels,
                          ctx->raco_options, &ctx->features);
-    else
+    if (ctx->descriptor) {
+      ctx->descriptor->describe_at(*ctx->ops, image->data, image->width, image->height, image->stride, channels,
+                                   ctx->features.xy.data(), ctx->features.n, &ctx->features.desc);
+      ctx->features.dim = ctx->descriptor->descriptor_dim();
+    }
+    if (!ctx->raco)
       ctx->model->extract(*ctx->ops, image->data, image->width, image->height, image->stride, channels, ctx->detect,
                           &ctx->features);
     result->n = ctx->features.n;

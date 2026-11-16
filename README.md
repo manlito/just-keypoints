@@ -78,8 +78,12 @@ build/release/jkp extract image.png --model raco --weights weights/raco.jkpw --o
 python tools/compare.py --model raco image.png --b "cmd:build/release/jkp extract --weights weights/raco.jkpw"
 ```
 
+Add `--descriptor aliked-n16` (C API: `config.descriptor`) to get ALIKED descriptors for the RaCo keypoints;
+this runs both networks. `--no-covariance` and `--no-ranker` (`skip_covariance`, `skip_ranker`) leave out a head:
+the covariance head is about three quarters of the run time.
+
 `--weights` is not needed when the build embeds the model: `-DJKP_EMBED_MODELS="aliked-n16;raco"` (adds ~2 MB).
-In the C API set `config.model = "raco"`; the result then has `rank` and `cov`, and `desc` is `NULL`.
+In the C API set `config.model = "raco"`; the result then has `rank` and `cov`, and `desc` is `NULL` unless a descriptor model is set.
 `top_k` is the number of keypoints (default 2048); there is no score threshold.
 
 ## Licenses

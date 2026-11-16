@@ -23,6 +23,8 @@ python tools/export_weights.py --model raco              # -> weights/raco.jkpw 
 python tools/compare.py --model raco $A/tum/*.png        # original vs reference forward pass
 python tools/dump_golden.py --model raco $A/tum/*.png    # -> build/golden/raco/*.jkpt (not committed)
 python tools/compare.py --model raco $A/tum/*.png --b "cmd:build/release/jkp extract --weights weights/raco.jkpw"
+python tools/compare.py --model raco --descriptor aliked-n16 $A/tum/*.png \
+    --b "cmd:build/release/jkp extract --weights weights/raco.jkpw --descriptor aliked-n16"   # RaCo keypoints + ALIKED descriptors
 ```
 
 | File | Purpose |

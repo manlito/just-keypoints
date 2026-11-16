@@ -12,7 +12,9 @@ Implementations (--a / --b):
                           descriptors (N,D), ranker (N) and covariances (N,2,2).
 
 --model raco: a detector without descriptors. --top-k is the number of keypoints (default 2048);
---scores-th and --n-limit do not apply.
+--scores-th and --n-limit do not apply. With --descriptor aliked-n16 the RaCo keypoints of each side are
+described by that side's ALIKED (upstream: the original ALIKED; folded: tools/folded.py; cmd: pass
+"--descriptor aliked-n16" in the command yourself).
 
 Keypoints are paired by nearest position (within --match-px). Reported per image:
     n_a, n_b      keypoint counts
@@ -38,16 +40,33 @@ import jkpfile
 import upstream
 
 
+def with_descriptors(detect, describe):
+    def run(rgb):
+        out = detect(rgb)
+        out["descriptors"] = describe(rgb, out["keypoints"])
+        return out
+    return run
+
+
 def make_runner(spec, args):
     kind, _, rest = spec.partition(":")
     if args.model == "raco" and kind == "upstream":
         import raco_upstream
         model = raco_upstream.load_model(rest or "cpu", args.top_k)
-        return lambda rgb: raco_upstream.run(model, rgb)
+        run = lambda rgb: raco_upstream.run(model, rgb)  # noqa: E731
+        if args.descriptor:
+            aliked = upstream.load_model(args.descriptor, rest or "cpu")
+            run = with_descriptors(run, lambda rgb, xy: upstream.describe_at(aliked, rgb, xy))
+        return run
     if args.model == "raco" and kind == "folded":
         from raco_folded import RacoFolded
         weights = args.weights or os.path.join(upstream.ROOT, "weights", "raco.jkpw")
-        return RacoFolded(weights, rest or "cpu", args.top_k).run
+        run = RacoFolded(weights, rest or "cpu", args.top_k).run
+        if args.descriptor:
+            from folded import Folded
+            aliked = Folded(os.path.join(upstream.ROOT, "weights", f"{args.descriptor}.jkpw"), rest or "cpu")
+            run = with_descriptors(run, aliked.describe_at)
+        return run
     if kind == "upstream":
         model = upstream.load_model(args.model, rest or "cpu", args.top_k, args.scores_th, args.n_limit)
         return lambda rgb: upstream.run(model, rgb)
@@ -104,6 +123,7 @@ def main():
     ap.add_argument("--a", default="upstream")
     ap.add_argument("--b", default="folded")
     ap.add_argument("--model", default="aliked-n16")
+    ap.add_argument("--descriptor", default=None, help="with --model raco: describe the keypoints, e.g. aliked-n16")
     ap.add_argument("--weights", default=None, help=".jkpw file for 'folded' (default weights/<model>.jkpw)")
     ap.add_argument("--max-size", type=int, default=0, help="downscale so the longer side is at most this (0 = off)")
     ap.add_argument("--top-k", type=int, default=-1)
@@ -121,7 +141,8 @@ def main():
     run_a, run_b = make_runner(args.a, args), make_runner(args.b, args)
     print(f"a = {args.a}, b = {args.b}, model = {args.model}")
     raco = args.model == "raco"
-    extra = f"{'rank':>9} {'cov':>9}" if raco else f"{'1-desc':>9}"
+    with_desc = not raco or bool(args.descriptor)
+    extra = (f"{'rank':>9} {'cov':>9}" if raco else "") + (f"{'1-desc':>10}" if with_desc else "")
     print(f"{'image':28} {'size':>10} {'n_a':>6} {'n_b':>6} {'overlap':>8} {'pos px':>9} {'score':>9} "
           f"{extra} {'t_a s':>7} {'t_b s':>7}  result")
     failed = 0
@@ -141,8 +162,10 @@ def main():
             ok_extra = r["rank"] <= args.tol_rank and r["cov"] <= args.tol_cov
             extra = f"{r['rank']:9.2e} {r['cov']:9.2e}"
         else:
-            ok_extra = r["desc"] >= args.tol_desc
-            extra = f"{1 - r['desc']:9.2e}"
+            ok_extra, extra = True, ""
+        if with_desc:
+            ok_extra = ok_extra and r["desc"] >= args.tol_desc
+            extra += f"{1 - r['desc']:10.2e}"
         ok = (r["overlap"] >= args.tol_overlap and
               (r["n_a"] == 0 or (r["pos"] <= args.tol_pos and r["score"] <= args.tol_score and ok_extra)))
         failed += not ok

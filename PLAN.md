@@ -75,8 +75,9 @@ void      jkp_destroy(jkp_ctx*);
 - `desc` is optional too (`D = 0` and `NULL` for a detector without descriptors).
 - `xy` means the same for every model: `(0,0)` is the centre of the top-left pixel. The original RaCo adds 0.5; we do not.
 - `score` is model-specific: ALIKED in [0, 1]; RaCo a probability that sums to 1 over the image (~1e-4 for a good keypoint).
-- Today `config.model` picks one model (`aliked-n16` or `raco`). Milestone R3 splits it into `detector` and
-  `descriptor`, e.g. `detector = raco`, `descriptor = aliked-n16`.
+- `config.model` is the detector (`aliked-n16` or `raco`); `config.descriptor` optionally names a second model
+  that describes its keypoints: `model = raco`, `descriptor = aliked-n16`. It has its own weights source.
+  `skip_ranker` / `skip_covariance` leave out a RaCo head and its output.
 - RaCo selection is always "best `top_k`" (default 2048); `score_threshold` and `max_keypoints` do not apply.
 - Results can stay on the device (CUDA pointer / `MTLBuffer` / `GPUBuffer`) for a downstream GPU matcher.
 
@@ -135,9 +136,12 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
   Done: the C++ output matches the original on the same 53 images with the same bounds (ranker 6.1e-6,
   score 2.7e-5); every intermediate tensor matches the golden dump within 1.3e-6 (relative).
   Speed is not a goal here: 0.42 s for 640x470 against 0.075 s for ALIKED on the same machine.
-- [ ] **R3 — RaCo keypoints with ALIKED descriptors** (CPU; any backend that has both afterwards)
-  `detector` / `descriptor` in the config; "describe at given keypoints" entry in the ALIKED descriptor head;
-  switches to skip the ranker and covariance heads. `compare.py` checks the pair against the originals.
+- [x] **R3 — RaCo keypoints with ALIKED descriptors** (CPU; any backend that has both afterwards)
+  `jkp extract image.png --model raco --descriptor aliked-n16`; switches to skip the ranker and covariance heads.
+  Done: on the same 53 images the descriptors match the original pairing (original RaCo keypoints described
+  by the original ALIKED, as `ALIKED.describe` in cvg/LightGlue does it): descriptor cosine >= 1 - 3.4e-9,
+  the other bounds unchanged. CPU times for 640x470: 0.46 s RaCo alone, 0.53 s with descriptors,
+  0.125 s without the covariance head, 0.055 s without covariance and ranker heads.
 - [ ] **R4 — RaCo on CUDA** (NVIDIA machine)
 - [ ] **R5 — RaCo on Metal** (after M3)
 - [ ] **R6 — RaCo on WebGPU** (with M6); detector switch, covariance ellipses and top-K by ranker score in the M7 demo.
@@ -204,9 +208,9 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
 ### 8 — RaCo detector (RaCo track, R1-R6)
 - Done (R1, R2): export `raco.pth` to `.jkpw`, reference pass, `compare.py --model raco`, `src/models/raco/` graph,
   CPU backend, golden test.
-- R3: `Ops::describe` already takes keypoints as an argument; what is missing is running the ALIKED dense
-  network for its feature map and converting RaCo pixel positions to ALIKED's normalized ones. The two networks
-  share nothing but the input image, so the cost is the sum of both.
+- Done (R3): `Aliked::describe_at` runs the ALIKED dense network without its score head and calls the existing
+  `Ops::describe`, so it needs nothing new from a backend. The two networks share nothing but the input image,
+  so the cost is the sum of both.
 - R4-R6, per GPU backend: three operations (`normalize`, `pad_reflect`, `detect_raco`) and the LeakyReLU
   activation; everything else is already there for ALIKED. Then `raco_golden_test` and `compare.py` as on the CPU.
   Fusing reflect padding into the convolution and running the covariance head in FP16 belong to M5.
@@ -229,7 +233,7 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - **Covariance head:** three 3x3 convolutions with reflect padding (128 -> 64 -> 32 -> 32, LeakyReLU) and a 1x1
   convolution on the aggregated features, at full resolution: 3 Cholesky elements per pixel, softplus on the
   diagonal ones, sampled at keypoints. This is the expensive part, about three quarters of the arithmetic
-  of the whole network; it should be skippable when covariances are not needed (R3).
+  of the whole network (and 73 % of the measured CPU time); `skip_covariance` leaves it out.
 - **Detection:** softmax over the whole image, NMS in a 3x3 window (upstream calls the window size
   `nms_radius = 3`), best K (default 2048), subpixel refinement by a softmax over the 3x3 logits
   (temperature 0.5). Score, ranker and Cholesky values are bilinear samples at the refined position.
@@ -260,6 +264,10 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - `JKP_EMBED_MODELS` accepted a list but embedded only its first entry; fixed. The default is still
   `aliked-n16` only (build with `-DJKP_EMBED_MODELS="aliked-n16;raco"` or pass `--weights weights/raco.jkpw`).
   Make `raco` part of the default once M3 has landed; that line of `CMakeLists.txt` sits next to the Metal options.
+- R3: RaCo positions go to the ALIKED descriptor head as `2 * xy / (size - 1) - 1`, the formula of
+  `ALIKED.describe` in cvg/LightGlue (commit `5a650c4`) once upstream's +0.5 is removed. The head truncates the
+  pixel position it recovers, so keep this float32 order on GPU backends. Positions can lie up to one pixel
+  outside the image; the head already treats everything outside as zeros.
 - Golden files: `python tools/dump_golden.py --model raco <images>` writes `build/golden/raco/`; `ctest` picks them up.
 
 ## Development machines

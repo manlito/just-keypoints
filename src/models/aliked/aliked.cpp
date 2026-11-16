@@ -89,6 +89,8 @@ void Aliked::extract(Ops& ops, const uint8_t* data, int width, int height, int s
   out->n = kpts.n();
   out->dim = dim_;
   out->score = kpts.score;
+  out->rank.clear();
+  out->cov.clear();
   out->xy.resize(2 * static_cast<size_t>(out->n));
   const float wh[2] = {static_cast<float>(width - 1), static_cast<float>(height - 1)};
   for (int i = 0; i < 2 * out->n; ++i) out->xy[i] = wh[i % 2] * (kpts.xy_norm[i] + 1.0f) / 2.0f;

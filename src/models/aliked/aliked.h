@@ -5,17 +5,11 @@
 #include <functional>
 #include <vector>
 
+#include "core/features.h"
 #include "core/ops.h"
 #include "core/weights.h"
 
 namespace jkp {
-
-struct Features {
-  int n = 0, dim = 0;
-  std::vector<float> xy;     // [n][2] pixels
-  std::vector<float> score;  // [n]
-  std::vector<float> desc;   // [n][dim]
-};
 
 class Aliked {
  public:

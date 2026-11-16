@@ -1,5 +1,5 @@
 // jkp command line tool.
-//   jkp extract IMAGE [--out OUT.jkpt] [options]   extract keypoints and descriptors
+//   jkp extract IMAGE [--out OUT.jkpt] [options]   extract keypoints and descriptors (raco: ranker, covariances)
 //   jkp bench   IMAGE [--runs N] [options]         time the extraction
 #include <algorithm>
 #include <chrono>
@@ -37,7 +37,8 @@ int usage() {
                "  --backend NAME    cpu (default) or cuda\n"
                "  --device N        GPU index for --backend cuda (default 0)\n"
                "  --weights PATH    .jkpw file (default: weights embedded in the build)\n"
-               "  --top-k K         keep the K best keypoints (default: threshold mode)\n"
+               "  --model NAME      aliked-n16 (default) or raco; picks the embedded weights\n"
+               "  --top-k K         keep the K best keypoints (default: threshold mode; raco: 2048)\n"
                "  --scores-th T     score threshold (default 0.2)\n"
                "  --n-limit N       maximum keypoints in threshold mode (default 5000)\n"
                "  --threads N       CPU worker threads (default: all)\n"
@@ -49,7 +50,7 @@ int usage() {
 
 int main(int argc, char** argv) {
   if (argc < 2) return usage();
-  std::string cmd = argv[1], image_path, out_path, weights_path;
+  std::string cmd = argv[1], image_path, out_path, weights_path, model;
   int runs = 10;
   bool gray = false;
   jkp_config config;
@@ -66,6 +67,7 @@ int main(int argc, char** argv) {
     if (a == "--image") image_path = value();
     else if (a == "--out") out_path = value();
     else if (a == "--weights") weights_path = value();
+    else if (a == "--model") model = value();
     else if (a == "--backend") {
       std::string name = value();
       if (name == "cpu") config.backend = JKP_BACKEND_CPU;
@@ -84,6 +86,7 @@ int main(int argc, char** argv) {
   }
   if ((cmd != "extract" && cmd != "bench") || image_path.empty()) return usage();
   if (!weights_path.empty()) config.weights_path = weights_path.c_str();
+  if (!model.empty()) config.model = model.c_str();
 
   int w = 0, h = 0, n = 0;
   unsigned char* pixels = stbi_load(image_path.c_str(), &w, &h, &n, gray ? 1 : 3);
@@ -120,11 +123,13 @@ int main(int argc, char** argv) {
     std::printf("%dx%d: %d keypoints, descriptor dim %d, %.1f ms\n", w, h, r.n, r.dim, ms[0]);
     if (!out_path.empty()) {
       try {
+        std::vector<jkp::NamedTensor> tensors = {{"keypoints", {r.n, 2}, r.xy}, {"scores", {r.n}, r.score}};
+        if (r.dim > 0) tensors.push_back({"descriptors", {r.n, r.dim}, r.desc});
+        if (r.rank) tensors.push_back({"ranker", {r.n}, r.rank});
+        if (r.cov) tensors.push_back({"covariances", {r.n, 2, 2}, r.cov});
         jkp::write_container(out_path,
                              {{"kind", "features"}, {"width", std::to_string(w)}, {"height", std::to_string(h)}},
-                             {{"keypoints", {r.n, 2}, r.xy},
-                              {"scores", {r.n}, r.score},
-                              {"descriptors", {r.n, r.dim}, r.desc}});
+                             tensors);
       } catch (const std::exception& e) {
         std::fprintf(stderr, "%s\n", e.what());
         return 1;

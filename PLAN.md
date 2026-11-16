@@ -111,6 +111,22 @@ Each milestone is a state you can run and check. Phases below hold the technical
   CPU backend within 2e-5. Not tuned yet: 43 ms for 640x480, about 8x the CPU backend on 12 threads.
 - [ ] **M5 — Fast** (phase 3, plus FP16 on Metal)
   Benchmark table: jkp CUDA vs PyTorch CUDA, jkp Metal, FP32 vs FP16, at three resolutions. FP16 accuracy loss measured.
+  In progress (Metal, FP32): tiled convolutions and fewer full-resolution copies, results byte-identical
+  to M3. Top-k 1000, median of warm runs, runs interleaved with PyTorch, M5 Pro:
+
+  | Size | jkp Metal | PyTorch MPS (original) | jkp CPU | PyTorch CPU (original) |
+  |---|---|---|---|---|
+  | 640x480 | 12.8 ms (M3: 32.8) | 12.1 ms | 69 ms | 241 ms |
+  | 1241x376 | 17.6 ms (M3: 48.4) | 18.5 ms | 102 ms | 337 ms |
+  | 1024x768 | 25.1 ms (M3: 77.2) | 28.6 ms | 161 ms | 568 ms |
+  | 1920x1080 | 56.6 ms (M3: 212) | 68.7 ms | 384 ms | 1252 ms |
+
+  PyTorch MPS times vary with machine load by about 10% between sessions (68.7-75.7 ms at 1080p). The
+  PyTorch baseline runs without the original's compiled `get_patches` op (CUDA only), so its descriptor head
+  copies the whole feature map; the fair 1080p baseline is probably a few ms faster.
+
+  For reference, the ALIKED paper reports 77.4 FPS (12.9 ms) for aliked-n16 at 640x480 with 1K keypoints
+  (PyTorch, RTX 2060).
 - [ ] **M6 — Runs in the browser** (phase 5)
   WebGPU backend passes the comparison natively (Dawn) and in a browser test page.
 - [ ] **M7 — Public demo and docs** (phase 6)
@@ -273,6 +289,26 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - Known costs left for M5: same as CUDA (no tiling or fusing, O(N^2) rank sort, keypoint round trip between
   `detect` and `describe`), plus a full sync for each radix-select pass. Peak memory is ~1.7 GB at
   1024x640, mostly the deformable-convolution column buffer and the pool keeping every size it has seen.
+
+## Notes from M5 (Metal, in progress)
+
+- `JKP_METAL_PROFILE=1` gives each dispatch its own command buffer and prints GPU time per operation and
+  per kernel when the backend is destroyed. Summed GPU time matches normal wall time, so the kernels
+  themselves are the cost, not syncs or encoding.
+- Convolutions were memory bound: one thread per output value re-read the whole input once per output
+  channel (8.6 GB per frame for the 128->8 score-head layer at 1080p). `k_conv2d_tile<T, K>` and
+  `k_deform_sum_tile<T>` compute T output channels per thread with weights in the constant address space;
+  each output keeps the same accumulation order, so outputs are byte-identical to the M3 kernels.
+  T = 4, 8 or 16 by output channel count (`JKP_METAL_TILE` forces one, for tuning); 32 is slower.
+  Convolution GPU time went from 24 to ~8.5 ms at 640x480 and from 163 to ~33 ms at 1080p.
+- Fewer passes over the 128-channel full-resolution tensor (~1 GB at 1080p): `Ops` gained two fused
+  operations, `upsample_concat` and `l2_normalize_crop`, whose defaults run the separate operations
+  (CPU and CUDA unchanged). Metal writes the upsampled maps straight into their concat slices, normalizes
+  and crops in one kernel, and returns the input from an identity crop. Saved ~20 ms GPU time at 1080p.
+- Next, by GPU time at 1080p: `k_l2_normalize_crop` (11 ms, 20%; it reads the input twice), the 3x3
+  convolutions at 1/2 and 1/8 resolution (2-4x slower than MPS; threadgroup tiles of the input), the
+  aggregation conv at full resolution writing into its concat slice (saves the remaining 2 ms copy), and
+  the descriptor head (~4 ms for 1K keypoints at any size).
 
 ## Open questions (decide during implementation)
 

@@ -114,6 +114,61 @@ kernel void k_conv2d(device const float* x [[buffer(0)]], device const float* we
   out[i] = activate(acc, act);
 }
 
+// Convolution, T output channels per thread for one pixel, KxK kernel known at compile time. Each input
+// value is read once for all T outputs instead of once per output, and each output accumulates in the
+// same order as k_conv2d, so the results are identical. Weights are uniform across the threads of a
+// SIMD group and read through the constant address space. Grid: ceil(cout / T) * h * w, pixel fastest.
+template <int T, int K>
+kernel void k_conv2d_tile(device const float* x [[buffer(0)]], constant float* weight [[buffer(1)]],
+                          constant float* bias [[buffer(2)]], constant int& has_bias [[buffer(3)]],
+                          constant int& cin [[buffer(4)]], constant int& cout [[buffer(5)]], constant int& h [[buffer(6)]],
+                          constant int& w [[buffer(7)]], constant int& act [[buffer(8)]], device float* out [[buffer(9)]],
+                          uint gid [[thread_position_in_grid]]) {
+  const int hw = h * w, blocks = (cout + T - 1) / T;
+  const int i = int(gid);
+  if (i >= blocks * hw) return;
+  const int ob = i / hw, pix = i % hw, y = pix / w, xo = pix % w, pad = K / 2, oc0 = ob * T;
+  const int wstride = cin * K * K;  // weights per output channel
+  // Channels past cout (last block of an odd cout) repeat the last channel and are not stored.
+  int woff[T];
+  float acc[T];
+  for (int t = 0; t < T; ++t) {
+    const int oc = min(oc0 + t, cout - 1);
+    woff[t] = oc * wstride;
+    acc[t] = has_bias ? bias[oc] : 0.0f;
+  }
+  for (int ic = 0; ic < cin; ++ic) {
+    device const float* in = x + size_t(ic) * hw;
+    const int wic = ic * K * K;
+    for (int ky = 0; ky < K; ++ky) {
+      const int sy = y + ky - pad;
+      if (sy < 0 || sy >= h) continue;
+      for (int kx = 0; kx < K; ++kx) {
+        const int sx = xo + kx - pad;
+        if (sx < 0 || sx >= w) continue;
+        const float v = in[sy * w + sx];
+        const int tap = wic + ky * K + kx;
+        for (int t = 0; t < T; ++t) acc[t] += weight[woff[t] + tap] * v;
+      }
+    }
+  }
+  for (int t = 0; t < T; ++t)
+    if (oc0 + t < cout) out[size_t(oc0 + t) * hw + pix] = activate(acc[t], act);
+}
+
+#define JKP_CONV_TILE(T, K)                                                                                \
+  template [[host_name("k_conv2d_t" #T "_k" #K)]] kernel void k_conv2d_tile<T, K>(                          \
+      device const float*, constant float*, constant float*, constant int&, constant int&, constant int&, \
+      constant int&, constant int&, constant int&, device float*, uint);
+JKP_CONV_TILE(4, 1)
+JKP_CONV_TILE(8, 1)
+JKP_CONV_TILE(16, 1)
+JKP_CONV_TILE(32, 1)
+JKP_CONV_TILE(4, 3)
+JKP_CONV_TILE(8, 3)
+JKP_CONV_TILE(16, 3)
+JKP_CONV_TILE(32, 3)
+
 // Deformable convolution, step 1. One thread per (kernel tap, pixel): samples every input channel at
 // the offset position. col[(ic * 9 + tap) * hw + pixel].
 kernel void k_deform_sample(device const float* x [[buffer(0)]], device const float* off [[buffer(1)]],
@@ -145,6 +200,41 @@ kernel void k_deform_sum(device const float* col [[buffer(0)]], device const flo
   for (int j = 0; j < taps; ++j) acc += wk[j] * col[size_t(j) * hw + pix];
   out[i] = activate(acc, act);
 }
+
+// Deformable convolution, step 2, T output channels per thread (same order per output as k_deform_sum).
+template <int T>
+kernel void k_deform_sum_tile(device const float* col [[buffer(0)]], constant float* weight [[buffer(1)]],
+                              constant float* bias [[buffer(2)]], constant int& taps [[buffer(3)]],
+                              constant int& cout [[buffer(4)]], constant int& hw [[buffer(5)]],
+                              constant int& act [[buffer(6)]], device float* out [[buffer(7)]],
+                              uint gid [[thread_position_in_grid]]) {
+  const int blocks = (cout + T - 1) / T;
+  const int i = int(gid);
+  if (i >= blocks * hw) return;
+  const int ob = i / hw, pix = i % hw, oc0 = ob * T;
+  int woff[T];
+  float acc[T];
+  for (int t = 0; t < T; ++t) {
+    const int oc = min(oc0 + t, cout - 1);
+    woff[t] = oc * taps;
+    acc[t] = bias[oc];
+  }
+  for (int j = 0; j < taps; ++j) {
+    const float v = col[size_t(j) * hw + pix];
+    for (int t = 0; t < T; ++t) acc[t] += weight[woff[t] + j] * v;
+  }
+  for (int t = 0; t < T; ++t)
+    if (oc0 + t < cout) out[size_t(oc0 + t) * hw + pix] = activate(acc[t], act);
+}
+
+#define JKP_DEFORM_TILE(T)                                                                                   \
+  template [[host_name("k_deform_sum_t" #T)]] kernel void k_deform_sum_tile<T>(                              \
+      device const float*, constant float*, constant float*, constant int&, constant int&, constant int&,   \
+      constant int&, device float*, uint);
+JKP_DEFORM_TILE(4)
+JKP_DEFORM_TILE(8)
+JKP_DEFORM_TILE(16)
+JKP_DEFORM_TILE(32)
 
 kernel void k_add(device const float* a [[buffer(0)]], device const float* b [[buffer(1)]], constant int& n [[buffer(2)]],
                   constant int& act [[buffer(3)]], device float* out [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
@@ -204,6 +294,25 @@ kernel void k_l2_normalize(device const float* x [[buffer(0)]], constant int& c 
   }
   norm = fmax(precise::sqrt(norm), 1e-12f);
   for (int ch = 0; ch < c; ++ch) out[size_t(ch) * hw + i] = x[size_t(ch) * hw + i] / norm;
+}
+
+// L2 normalization across channels of the cropped region of x (c x h x w) at (left, top); out is
+// c x oh x ow. Same arithmetic as k_l2_normalize followed by k_crop. One thread per output pixel.
+kernel void k_l2_normalize_crop(device const float* x [[buffer(0)]], constant int& c [[buffer(1)]],
+                                constant int& h [[buffer(2)]], constant int& w [[buffer(3)]],
+                                constant int& left [[buffer(4)]], constant int& top [[buffer(5)]],
+                                constant int& oh [[buffer(6)]], constant int& ow [[buffer(7)]],
+                                device float* out [[buffer(8)]], uint gid [[thread_position_in_grid]]) {
+  const int i = int(gid), ohw = oh * ow;
+  if (i >= ohw) return;
+  const int hw = h * w, src = (i / ow + top) * w + i % ow + left;
+  float norm = 0;
+  for (int ch = 0; ch < c; ++ch) {
+    float v = x[size_t(ch) * hw + src];
+    norm += v * v;
+  }
+  norm = fmax(precise::sqrt(norm), 1e-12f);
+  for (int ch = 0; ch < c; ++ch) out[size_t(ch) * ohw + i] = x[size_t(ch) * hw + src] / norm;
 }
 
 // ---------------------------------------------------------------------------------------------

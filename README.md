@@ -33,6 +33,7 @@ build/release/jkp extract image.png --out features.jkpt    # keypoints, scores, 
 build/release/jkp bench image.png --runs 10
 build/release/jkp bench image.png --backend cuda
 build/release/jkp bench image.png --backend metal
+JKP_METAL_PROFILE=1 build/release/jkp bench image.png --backend metal   # GPU time per operation
 ```
 
 Options: `--backend cpu|cuda|metal`, `--device N`, `--top-k K`, `--scores-th T`, `--n-limit N`, `--weights file.jkpw`, `--threads N`, `--gray`.

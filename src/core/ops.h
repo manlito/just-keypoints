@@ -64,6 +64,19 @@ class Ops {
   // L2 normalization across channels.
   virtual TensorPtr l2_normalize(const TensorPtr& x) = 0;
 
+  // Fused forms of sequences in the graph. The defaults run the separate operations; a backend overrides
+  // them to save the intermediate tensors, with the same results.
+  // concat of xs[i] upsampled by scales[i] (1 = as is).
+  virtual TensorPtr upsample_concat(const std::vector<TensorPtr>& xs, const std::vector<int>& scales) {
+    std::vector<TensorPtr> parts;
+    for (size_t i = 0; i < xs.size(); ++i) parts.push_back(scales[i] == 1 ? xs[i] : upsample(xs[i], scales[i]));
+    return concat(parts);
+  }
+  // crop(l2_normalize(x), ...).
+  virtual TensorPtr l2_normalize_crop(const TensorPtr& x, int left, int top, int width, int height) {
+    return crop(l2_normalize(x), left, top, width, height);
+  }
+
   // Keypoint detection on a 1xHxW score map: NMS, selection, soft-argmax refinement.
   virtual void detect(const TensorPtr& score_map, const DetectParams& params, Keypoints* out) = 0;
   // Descriptors [n][D] for the given keypoints from a CxHxW feature map.

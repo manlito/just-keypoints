@@ -71,7 +71,7 @@ void Aliked::extract(Ops& ops, const uint8_t* data, int width, int height, int s
   TensorPtr a3 = apply(ops, x3, agg_[2], Act::Selu);
   TensorPtr a4 = apply(ops, x4, agg_[3], Act::Selu);
   emit("a1", a1), emit("a2", a2), emit("a3", a3), emit("a4", a4);
-  TensorPtr x1234 = ops.concat({a1, ops.upsample(a2, 2), ops.upsample(a3, 8), ops.upsample(a4, 32)});
+  TensorPtr x1234 = ops.upsample_concat({a1, a2, a3, a4}, {1, 2, 8, 32});
   emit("x1234", x1234);
 
   // Score head.
@@ -79,7 +79,7 @@ void Aliked::extract(Ops& ops, const uint8_t* data, int width, int height, int s
   s = apply(ops, s, score_[1], Act::Selu);
   s = apply(ops, s, score_[2], Act::Selu);
   TensorPtr score_map = ops.crop(apply(ops, s, score_[3], Act::Sigmoid), left, top, width, height);
-  TensorPtr feature_map = ops.crop(ops.l2_normalize(x1234), left, top, width, height);
+  TensorPtr feature_map = ops.l2_normalize_crop(x1234, left, top, width, height);
   emit("score_map", score_map), emit("feature_map", feature_map);
 
   Keypoints kpts;

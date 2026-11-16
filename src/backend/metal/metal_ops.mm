@@ -7,16 +7,24 @@
 //
 // The shader source is compiled at run time, in safe math mode with precise math functions and with
 // floating-point contraction off, so kernels compute what the CPU backend computes except for exp().
+//
+// Profiling: with JKP_METAL_PROFILE=1 in the environment every dispatch runs in its own command buffer
+// and its GPU time is recorded under the operation that issued it; the table goes to stderr when the
+// backend is destroyed. Wall-clock times are meaningless in that mode, GPU times per dispatch are not.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 
 #include <algorithm>
 #include <climits>
+#include <cstdarg>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "core/ops.h"
 
@@ -31,6 +39,15 @@ constexpr int kRadius = 2;       // NMS and soft-argmax window radius
 constexpr int kScanBlock = 256;  // elements handled by one thread in the compaction kernels
 
 [[noreturn]] void fail(const std::string& what) { throw std::runtime_error("metal: " + what); }
+
+std::string format(const char* fmt, ...) {
+  char buf[160];
+  va_list args;
+  va_start(args, fmt);
+  std::vsnprintf(buf, sizeof(buf), fmt, args);
+  va_end(args);
+  return buf;
+}
 
 std::string describe_error(NSError* error) {
   return error ? std::string([[error localizedDescription] UTF8String]) : std::string("unknown error");
@@ -53,6 +70,8 @@ struct View {
 class Context {
  public:
   explicit Context(int index) {
+    const char* env = std::getenv("JKP_METAL_PROFILE");
+    profile_ = env && *env && std::string(env) != "0";
     @autoreleasepool {
       NSArray<id<MTLDevice>>* devices = MTLCopyAllDevices();
       if (devices.count == 0) fail("no Metal device found");
@@ -83,6 +102,12 @@ class Context {
       sync();
     } catch (...) {
     }
+    if (profile_) report();
+  }
+
+  // Profiling label for the dispatches that follow (the operation and its shape).
+  void tag(std::string t) {
+    if (profile_) tag_ = std::move(t);
   }
 
   // Encodes `name` over n threads (1-D grid). Arguments bind to buffer indices 0, 1, ... in order:
@@ -100,6 +125,11 @@ class Context {
       NSUInteger group = std::min<NSUInteger>(256, pipeline.maxTotalThreadsPerThreadgroup);
       [enc dispatchThreads:MTLSizeMake(static_cast<NSUInteger>(n), 1, 1) threadsPerThreadgroup:MTLSizeMake(group, 1, 1)];
     }
+    if (profile_) {
+      key_ = tag_.empty() ? std::string(name) : tag_ + "  " + name;
+      if (std::strcmp(name, "k_image") == 0) ++frames_;
+      sync();
+    }
   }
 
   // Commits the open command buffer and waits for it. Afterwards the host may read and write any buffer.
@@ -115,6 +145,12 @@ class Context {
     free_.insert(pending_.begin(), pending_.end());
     pending_.clear();
     if (command.status == MTLCommandBufferStatusError) fail("command buffer failed: " + describe_error(command.error));
+    if (profile_ && !key_.empty()) {
+      Stat& st = stats_[key_];
+      st.ms += (command.GPUEndTime - command.GPUStartTime) * 1e3;
+      ++st.calls;
+      key_.clear();
+    }
   }
 
   // Pool of shared-storage buffers, reused by size. `host`: the caller writes the buffer from the host
@@ -163,6 +199,34 @@ class Context {
   }
 
  private:
+  struct Stat {
+    double ms = 0;
+    long calls = 0;
+  };
+
+  void report() const {
+    const double frames = std::max(1L, frames_);
+    double total = 0;
+    std::map<std::string, Stat> by_kernel;
+    std::vector<std::pair<std::string, Stat>> rows(stats_.begin(), stats_.end());
+    for (const auto& r : rows) {
+      total += r.second.ms;
+      std::string kernel = r.first.substr(r.first.rfind(' ') + 1);
+      by_kernel[kernel].ms += r.second.ms;
+      by_kernel[kernel].calls += r.second.calls;
+    }
+    auto print = [&](const char* title, std::vector<std::pair<std::string, Stat>> v) {
+      std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.second.ms > b.second.ms; });
+      std::fprintf(stderr, "\n%-58s %10s %7s %6s\n", title, "ms/frame", "share", "calls");
+      for (const auto& r : v)
+        std::fprintf(stderr, "%-58s %10.3f %6.1f%% %6.1f\n", r.first.c_str(), r.second.ms / frames,
+                     total > 0 ? 100.0 * r.second.ms / total : 0.0, r.second.calls / frames);
+    };
+    std::fprintf(stderr, "\njkp metal profile: %ld frames, GPU time %.2f ms/frame\n", frames_, total / frames);
+    print("operation  kernel", rows);
+    print("kernel", std::vector<std::pair<std::string, Stat>>(by_kernel.begin(), by_kernel.end()));
+  }
+
   static void bind(id<MTLComputeCommandEncoder> enc, NSUInteger i, const View& v) {
     [enc setBuffer:v.buffer offset:v.offset atIndex:i];
   }
@@ -204,6 +268,10 @@ class Context {
   id<MTLCommandBuffer> command_ = nil;
   id<MTLComputeCommandEncoder> encoder_ = nil;
   std::multimap<size_t, id<MTLBuffer>> free_, pending_;
+  bool profile_ = false;
+  std::string tag_, key_;
+  std::map<std::string, Stat> stats_;
+  long frames_ = 0;
 };
 using ContextPtr = std::shared_ptr<Context>;
 
@@ -257,6 +325,7 @@ class MetalOps : public Ops {
     MetalPtr out = make(3, height, width);
     // The last row may be shorter than the stride.
     size_t bytes = static_cast<size_t>(stride) * (height - 1) + static_cast<size_t>(width) * channels;
+    ctx_->tag(format("image %dx%d", width, height));
     Buffer<uint8_t> src(ctx_, bytes, true);
     std::memcpy(src.host(), data, bytes);
     ctx_->run("k_image", out->size(), src.view(), stride, channels, width, height, out->d());
@@ -266,13 +335,16 @@ class MetalOps : public Ops {
   TensorPtr pad_replicate(const TensorPtr& xp, int left, int right, int top, int bottom) override {
     const MetalTensor& x = dev(xp);
     MetalPtr out = make(x.c, x.h + top + bottom, x.w + left + right);
+    ctx_->tag(format("pad %dx%d", out->w, out->h));
     ctx_->run("k_pad_replicate", out->size(), x.d(), x.c, x.h, x.w, left, top, out->h, out->w, out->d());
     return out;
   }
 
   TensorPtr crop(const TensorPtr& xp, int left, int top, int width, int height) override {
     const MetalTensor& x = dev(xp);
+    if (left == 0 && top == 0 && width == x.w && height == x.h) return xp;  // tensors are never modified
     MetalPtr out = make(x.c, height, width);
+    ctx_->tag(format("crop c%d %dx%d", x.c, width, height));
     ctx_->run("k_crop", out->size(), x.d(), x.c, x.h, x.w, left, top, height, width, out->d());
     return out;
   }
@@ -282,9 +354,16 @@ class MetalOps : public Ops {
     const int cout = weight.shape[0], cin = weight.shape[1], k = weight.shape[2];
     if (cin != x.c || weight.shape[3] != k || k % 2 == 0) throw std::runtime_error("conv2d: shape mismatch");
     MetalPtr out = make(cout, x.h, x.w);
-    View w = ctx_->param(weight);
-    ctx_->run("k_conv2d", out->size(), x.d(), w, bias ? ctx_->param(*bias) : w, bias ? 1 : 0, cin, cout, x.h, x.w, k,
-              act_id(act), out->d());
+    ctx_->tag(format("conv%dx%d %3d->%-3d %4dx%-4d", k, k, cin, cout, x.w, x.h));
+    View w = ctx_->param(weight), b = bias ? ctx_->param(*bias) : w;
+    if (k == 1 || k == 3) {
+      const int t = tile(cout);
+      const long long threads = static_cast<long long>((cout + t - 1) / t) * x.h * x.w;
+      ctx_->run(format("k_conv2d_t%d_k%d", t, k).c_str(), threads, x.d(), w, b, bias ? 1 : 0, cin, cout, x.h, x.w,
+                act_id(act), out->d());
+    } else {
+      ctx_->run("k_conv2d", out->size(), x.d(), w, b, bias ? 1 : 0, cin, cout, x.h, x.w, k, act_id(act), out->d());
+    }
     return out;
   }
 
@@ -296,11 +375,13 @@ class MetalOps : public Ops {
       throw std::runtime_error("deform_conv2d: shape mismatch");
     TensorPtr offset = conv2d(xp, offset_weight, &offset_bias, Act::None);
     const float max_offset = static_cast<float>(std::max(h, w)) / 4.0f;
+    ctx_->tag(format("deform  %3d->%-3d %4dx%-4d", cin, cout, w, h));
     Buffer<float> col(ctx_, static_cast<size_t>(count(static_cast<long long>(cin) * 9 * hw)));
     ctx_->run("k_deform_sample", 9LL * hw, x.d(), dev(offset).d(), cin, h, w, max_offset, col.view());
     MetalPtr out = make(cout, h, w);
-    ctx_->run("k_deform_sum", out->size(), col.view(), ctx_->param(weight), ctx_->param(bias), cin * 9, cout, hw,
-              act_id(act), out->d());
+    const int t = tile(cout);
+    ctx_->run(format("k_deform_sum_t%d", t).c_str(), static_cast<long long>((cout + t - 1) / t) * hw, col.view(),
+              ctx_->param(weight), ctx_->param(bias), cin * 9, cout, hw, act_id(act), out->d());
     return out;
   }
 
@@ -308,6 +389,7 @@ class MetalOps : public Ops {
     const MetalTensor &a = dev(ap), &b = dev(bp);
     if (a.size() != b.size()) throw std::runtime_error("add: shape mismatch");
     MetalPtr out = make(a.c, a.h, a.w);
+    ctx_->tag(format("add c%d %dx%d", a.c, a.w, a.h));
     ctx_->run("k_add", out->size(), a.d(), b.d(), out->size(), act_id(act), out->d());
     return out;
   }
@@ -316,6 +398,7 @@ class MetalOps : public Ops {
     const MetalTensor& x = dev(xp);
     if (k < 1 || x.h % k || x.w % k) throw std::runtime_error("avg_pool: size is not a multiple of the window");
     MetalPtr out = make(x.c, x.h / k, x.w / k);
+    ctx_->tag(format("avg_pool%d c%d %dx%d", k, x.c, x.w, x.h));
     ctx_->run("k_avg_pool", out->size(), x.d(), x.c, x.w, out->h, out->w, k, out->d());
     return out;
   }
@@ -323,6 +406,7 @@ class MetalOps : public Ops {
   TensorPtr upsample(const TensorPtr& xp, int scale) override {
     const MetalTensor& x = dev(xp);
     MetalPtr out = make(x.c, x.h * scale, x.w * scale);
+    ctx_->tag(format("upsample%d c%d -> %dx%d", scale, x.c, out->w, out->h));
     auto ratio = [](int in, int outn) {
       return outn > 1 ? static_cast<float>(in - 1) / static_cast<float>(outn - 1) : 0.0f;
     };
@@ -338,6 +422,7 @@ class MetalOps : public Ops {
       c += t->c;
     }
     MetalPtr out = make(c, xs[0]->h, xs[0]->w);
+    ctx_->tag(format("concat c%d %dx%d", c, out->w, out->h));
     size_t pos = 0;
     for (const auto& t : xs) {
       const MetalTensor& x = dev(t);
@@ -350,7 +435,45 @@ class MetalOps : public Ops {
   TensorPtr l2_normalize(const TensorPtr& xp) override {
     const MetalTensor& x = dev(xp);
     MetalPtr out = make(x.c, x.h, x.w);
+    ctx_->tag(format("l2_normalize c%d %dx%d", x.c, x.w, x.h));
     ctx_->run("k_l2_normalize", x.h * x.w, x.d(), x.c, x.h * x.w, out->d());
+    return out;
+  }
+
+  // The upsampled parts are written straight into their slice of the output; parts at scale 1 are copied.
+  TensorPtr upsample_concat(const std::vector<TensorPtr>& xs, const std::vector<int>& scales) override {
+    if (xs.empty() || xs.size() != scales.size()) throw std::runtime_error("upsample_concat: bad arguments");
+    const int oh = xs[0]->h * scales[0], ow = xs[0]->w * scales[0];
+    int c = 0;
+    for (size_t i = 0; i < xs.size(); ++i) {
+      if (xs[i]->h * scales[i] != oh || xs[i]->w * scales[i] != ow) throw std::runtime_error("concat: shape mismatch");
+      c += xs[i]->c;
+    }
+    MetalPtr out = make(c, oh, ow);
+    auto ratio = [](int in, int outn) {
+      return outn > 1 ? static_cast<float>(in - 1) / static_cast<float>(outn - 1) : 0.0f;
+    };
+    size_t pos = 0;
+    for (size_t i = 0; i < xs.size(); ++i) {
+      const MetalTensor& x = dev(xs[i]);
+      const int n = x.c * oh * ow;
+      if (scales[i] == 1) {
+        ctx_->tag(format("concat c%d %dx%d", x.c, ow, oh));
+        ctx_->run("k_copy", n, x.d(), n, out->buf.view(pos));
+      } else {
+        ctx_->tag(format("upsample%d c%d -> %dx%d", scales[i], x.c, ow, oh));
+        ctx_->run("k_upsample", n, x.d(), x.c, x.h, x.w, oh, ow, ratio(x.w, ow), ratio(x.h, oh), out->buf.view(pos));
+      }
+      pos += static_cast<size_t>(n);
+    }
+    return out;
+  }
+
+  TensorPtr l2_normalize_crop(const TensorPtr& xp, int left, int top, int width, int height) override {
+    const MetalTensor& x = dev(xp);
+    MetalPtr out = make(x.c, height, width);
+    ctx_->tag(format("l2_normalize_crop c%d %dx%d", x.c, width, height));
+    ctx_->run("k_l2_normalize_crop", width * height, x.d(), x.c, x.h, x.w, left, top, height, width, out->d());
     return out;
   }
 
@@ -361,6 +484,7 @@ class MetalOps : public Ops {
     out->xy_norm.clear();
     out->score.clear();
     if (n == 0) return;
+    ctx_->tag(format("detect %dx%d", w, h));
 
     // Non-maximum suppression (simple_nms from SuperGlue, two refinement rounds).
     Buffer<float> nms(ctx_, n);
@@ -470,6 +594,7 @@ class MetalOps : public Ops {
       throw std::runtime_error("describe: shape mismatch");
     const float max_offset = static_cast<float>(std::max(h, w)) / 4.0f;
     desc->assign(static_cast<size_t>(total) * dim, 0.0f);
+    ctx_->tag("describe");
 
     // In chunks, so the per-keypoint work buffers (M*C floats each) stay small for any keypoint count.
     const int chunk = 8192;
@@ -494,6 +619,16 @@ class MetalOps : public Ops {
   }
 
  private:
+  // Output channels per thread for the tiled convolution kernels (instantiated for 4, 8, 16, 32).
+  static int tile(int cout) {
+    static const int forced = [] {
+      const char* env = std::getenv("JKP_METAL_TILE");  // tuning aid
+      return env ? std::atoi(env) : 0;
+    }();
+    if (forced == 4 || forced == 8 || forced == 16 || forced == 32) return forced;
+    return cout <= 4 ? 4 : cout <= 8 ? 8 : 16;
+  }
+
   MetalPtr make(int c, int h, int w) { return std::make_shared<MetalTensor>(ctx_, c, h, w); }
 
   ContextPtr ctx_;

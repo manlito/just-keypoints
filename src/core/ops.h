@@ -19,7 +19,7 @@ struct Tensor {
 };
 using TensorPtr = std::shared_ptr<Tensor>;
 
-enum class Act { None, Selu, Sigmoid };
+enum class Act { None, Selu, Sigmoid, LeakyRelu };  // LeakyRelu: slope 0.01
 
 struct DetectParams {
   int top_k = -1;          // > 0: top-k mode, otherwise threshold mode
@@ -41,6 +41,20 @@ struct SddhParams {
   const Param *offset1_w, *offset1_b;  // [2M, 2M, 1, 1], [2M]
   const Param* sf_w;                   // [C, C, 1, 1]
   const Param* agg_w;                  // [M, C, D]
+};
+
+// RaCo detector (see tools/raco_folded.py).
+struct RacoDetectParams {
+  int top_k = 2048;          // number of keypoints, best first; fewer when the image has fewer local maxima
+  int window = 3;            // NMS and refinement window (3 = 3x3)
+  float temperature = 0.5f;  // refinement softmax temperature
+};
+
+struct RacoKeypoints {
+  std::vector<float> xy;        // [n][2] pixels, (0, 0) = centre of the top-left pixel
+  std::vector<float> score;     // [n] probability (softmax over the whole image)
+  std::vector<float> rank;      // [n], empty without a ranker map
+  std::vector<float> cholesky;  // [n][3] as (L11, L21, L22), empty without a Cholesky map
 };
 
 class Ops {
@@ -76,6 +90,18 @@ class Ops {
   virtual TensorPtr l2_normalize_crop(const TensorPtr& x, int left, int top, int width, int height) {
     return crop(l2_normalize(x), left, top, width, height);
   }
+
+  // The operations below are used by RaCo only. A backend that has not implemented them yet inherits
+  // these, which throw, so `normalize` (the first operation of the RaCo graph) reports it.
+  // (x - mean[c]) / std[c] per channel.
+  virtual TensorPtr normalize(const TensorPtr& x, const float* mean, const float* std);
+  // Mirrors p pixels on every side without repeating the border pixel (PyTorch "reflect").
+  virtual TensorPtr pad_reflect(const TensorPtr& x, int p);
+  // RaCo keypoints from 1xHxW logits: softmax over the image, NMS, top-k (ties in raster order), subpixel
+  // refinement. ranker_map (1xHxW) and cholesky_raw (3xHxW, before softplus) may be null; when given they
+  // are sampled at the keypoints, with softplus applied to the first and third Cholesky channel.
+  virtual void detect_raco(const TensorPtr& logits, const TensorPtr& ranker_map, const TensorPtr& cholesky_raw,
+                           const RacoDetectParams& params, RacoKeypoints* out);
 
   // Keypoint detection on a 1xHxW score map: NMS, selection, soft-argmax refinement.
   virtual void detect(const TensorPtr& score_map, const DetectParams& params, Keypoints* out) = 0;

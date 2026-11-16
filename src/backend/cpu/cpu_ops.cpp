@@ -35,6 +35,8 @@ void activate(float* v, int n, Act act) {
     for (int i = 0; i < n; ++i) v[i] = selu(v[i]);
   } else if (act == Act::Sigmoid) {
     for (int i = 0; i < n; ++i) v[i] = 1.0f / (1.0f + std::exp(-v[i]));
+  } else if (act == Act::LeakyRelu) {
+    for (int i = 0; i < n; ++i) v[i] = v[i] > 0 ? v[i] : 0.01f * v[i];
   }
 }
 
@@ -59,7 +61,10 @@ inline float bilinear_apply(const float* plane, const int idx[4], const float wt
   return wt[0] * plane[idx[0]] + wt[1] * plane[idx[1]] + wt[2] * plane[idx[2]] + wt[3] * plane[idx[3]];
 }
 
-// 5x5 max filter, window clipped at the borders (same as max_pool2d with implicit -inf padding).
+// log(1 + exp(x)); linear above 20 as in PyTorch.
+inline float softplus(float x) { return x > 20.0f ? x : std::log1p(std::exp(x)); }
+
+// (2r+1)x(2r+1) max filter, window clipped at the borders (same as max_pool2d with implicit -inf padding).
 void max_filter(const std::vector<float>& src, std::vector<float>& dst, int w, int h, int r) {
   std::vector<float> tmp(src.size());
   for (int y = 0; y < h; ++y)
@@ -379,6 +384,112 @@ class CpuOps : public Ops {
       bilinear_setup(gx, gy, w, h, bi, bw);
       out->score[i] = bilinear_apply(s.data(), bi, bw);
     }
+  }
+
+  TensorPtr normalize(const TensorPtr& xp, const float* mean, const float* std) override {
+    const CpuTensor& x = cpu(xp);
+    CpuPtr out = make(x.c, x.h, x.w);
+    const size_t plane = static_cast<size_t>(x.h) * x.w;
+    for (int c = 0; c < x.c; ++c)
+      for (size_t i = 0; i < plane; ++i) out->plane(c)[i] = (x.plane(c)[i] - mean[c]) / std[c];
+    return out;
+  }
+
+  TensorPtr pad_reflect(const TensorPtr& xp, int p) override {
+    const CpuTensor& x = cpu(xp);
+    if (p < 0 || p >= x.h || p >= x.w) throw std::runtime_error("pad_reflect: padding does not fit the tensor");
+    CpuPtr out = make(x.c, x.h + 2 * p, x.w + 2 * p);
+    auto mirror = [](int i, int n) { return i < 0 ? -i : i >= n ? 2 * (n - 1) - i : i; };
+    for (int c = 0; c < x.c; ++c)
+      for (int y = 0; y < out->h; ++y) {
+        const float* src = x.plane(c) + mirror(y - p, x.h) * x.w;
+        float* dst = out->plane(c) + y * out->w;
+        for (int i = 0; i < out->w; ++i) dst[i] = src[mirror(i - p, x.w)];
+      }
+    return out;
+  }
+
+  void detect_raco(const TensorPtr& logits_p, const TensorPtr& ranker_map, const TensorPtr& cholesky_raw,
+                   const RacoDetectParams& params, RacoKeypoints* out) override {
+    const CpuTensor& lm = cpu(logits_p);
+    const int w = lm.w, h = lm.h, n = w * h, k = params.window, r = k / 2;
+    if (lm.c != 1 || k < 1 || k % 2 == 0 || k > 9) throw std::runtime_error("detect_raco: bad arguments");
+    for (const TensorPtr& t : {ranker_map, cholesky_raw})
+      if (t && (t->w != w || t->h != h)) throw std::runtime_error("detect_raco: map size mismatch");
+    const std::vector<float>& logit = lm.d;
+
+    // Probabilities: softmax over the whole image.
+    std::vector<float> prob(n), pooled, nms(n);
+    const float max_logit = *std::max_element(logit.begin(), logit.end());
+    double sum = 0;
+    for (int i = 0; i < n; ++i) sum += prob[i] = std::exp(logit[i] - max_logit);
+    const float total = static_cast<float>(sum);
+    for (int i = 0; i < n; ++i) prob[i] /= total;
+
+    // Non-maximum suppression: keep pixels equal to the maximum of their window, then the best top_k.
+    max_filter(prob, pooled, w, h, r);
+    for (int i = 0; i < n; ++i) nms[i] = prob[i] == pooled[i] ? prob[i] : 0.0f;
+    std::vector<int> idx(n);
+    std::iota(idx.begin(), idx.end(), 0);
+    int count = std::min(std::max(params.top_k, 0), n);
+    std::partial_sort(idx.begin(), idx.begin() + count, idx.end(),
+                      [&](int a, int b) { return nms[a] != nms[b] ? nms[a] > nms[b] : a < b; });
+    while (count > 0 && !(nms[idx[count - 1]] > 0)) --count;  // suppressed pixels are not keypoints
+    idx.resize(count);
+
+    out->xy.resize(2 * idx.size());
+    out->score.resize(idx.size());
+    out->rank.resize(ranker_map ? idx.size() : 0);
+    out->cholesky.resize(cholesky_raw ? 3 * idx.size() : 0);
+    const float wh[2] = {static_cast<float>(w - 1), static_cast<float>(h - 1)};
+    parallel_for(static_cast<int>(idx.size()), [&](int begin, int end) {
+      std::vector<float> patch(static_cast<size_t>(k) * k);
+      for (int i = begin; i < end; ++i) {
+        // Subpixel refinement: softmax of the logits in the window (outside the map counts as logit 0),
+        // expected offset in pixels.
+        const int x = idx[i] % w, y = idx[i] / w;
+        float max_v = -INFINITY;
+        for (int dy = -r; dy <= r; ++dy)
+          for (int dx = -r; dx <= r; ++dx) {
+            int px = x + dx, py = y + dy;
+            float v = ((px >= 0 && px < w && py >= 0 && py < h) ? logit[py * w + px] : 0.0f) / params.temperature;
+            patch[(dy + r) * k + dx + r] = v;
+            max_v = std::max(max_v, v);
+          }
+        float psum = 0, sx = 0, sy = 0;
+        for (int j = 0; j < k * k; ++j) psum += patch[j] = std::exp(patch[j] - max_v);
+        for (int j = 0; j < k * k; ++j) {
+          const float p = patch[j] / psum;
+          sx += p * static_cast<float>(j % k - r);
+          sy += p * static_cast<float>(j / k - r);
+        }
+        float* xy = &out->xy[2 * static_cast<size_t>(i)];
+        xy[0] = static_cast<float>(x) + sx;
+        xy[1] = static_cast<float>(y) + sy;
+
+        // Bilinear samples at the refined position, clamped to the map (grid_sample, padding_mode = border,
+        // align_corners = true; same float32 steps: normalize to [-1, 1], map back, clamp).
+        float g[2];
+        for (int a = 0; a < 2; ++a) {
+          g[a] = wh[a] > 0 ? ((2.0f * xy[a] / wh[a] - 1.0f) + 1.0f) / 2.0f * wh[a] : 0.0f;
+          g[a] = std::min(wh[a], std::max(g[a], 0.0f));
+        }
+        int bi[4];
+        float bw[4];
+        bilinear_setup(g[0], g[1], w, h, bi, bw);
+        out->score[i] = bilinear_apply(prob.data(), bi, bw);
+        if (ranker_map) out->rank[i] = bilinear_apply(cpu(ranker_map).d.data(), bi, bw);
+        if (cholesky_raw) {
+          const CpuTensor& ch = cpu(cholesky_raw);
+          for (int c = 0; c < 3; ++c) {
+            float v[4];
+            for (int j = 0; j < 4; ++j) v[j] = c == 1 ? ch.plane(c)[bi[j]] : softplus(ch.plane(c)[bi[j]]);
+            const int id[4] = {0, 1, 2, 3};
+            out->cholesky[3 * static_cast<size_t>(i) + c] = bilinear_apply(v, id, bw);
+          }
+        }
+      }
+    });
   }
 
   void describe(const TensorPtr& feature_map, const Keypoints& kpts, const SddhParams& p,

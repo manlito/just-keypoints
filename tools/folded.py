@@ -159,6 +159,17 @@ class Folded:
         desc = torch.einsum("ncp,pcd->nd", f, self.w["desc_head.agg_weights"])
         return F.normalize(desc, p=2.0, dim=1), offsets
 
+    @torch.no_grad()
+    def describe_at(self, rgb, xy):
+        """Descriptors at given keypoints, e.g. from another detector. rgb: HxWx3 uint8;
+        xy: (N,2) pixels, (0, 0) = centre of the top-left pixel. Returns N x D."""
+        image = torch.from_numpy(rgb).to(self.device).permute(2, 0, 1).float().div(255.0).unsqueeze(0)
+        feature_map, _, _ = self.dense(image)
+        h, w = rgb.shape[:2]
+        wh = torch.tensor([w - 1, h - 1], device=self.device)
+        kpts_norm = 2.0 * torch.from_numpy(xy).to(self.device) / wh - 1
+        return self.describe(feature_map, kpts_norm)[0].cpu().numpy()
+
     # ---------------------------------------------------------------- full pipeline
     @torch.no_grad()
     def run(self, rgb, stages=False):

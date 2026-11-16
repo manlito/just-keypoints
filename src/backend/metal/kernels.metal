@@ -15,6 +15,7 @@ using namespace metal;
 constant int kActNone = 0;
 constant int kActSelu = 1;
 constant int kActSigmoid = 2;
+constant int kActLeakyRelu = 3;  // slope 0.01
 constant int kGreater = 0;
 constant int kRadius = 2;       // NMS and soft-argmax window radius
 constant int kScanBlock = 256;  // elements handled by one thread in the compaction kernels
@@ -31,6 +32,7 @@ inline float selu(float x) {
 inline float activate(float v, int act) {
   if (act == kActSelu) return selu(v);
   if (act == kActSigmoid) return 1.0f / (1.0f + precise::exp(-v));
+  if (act == kActLeakyRelu) return v > 0 ? v : 0.01f * v;
   return v;
 }
 

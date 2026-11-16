@@ -3,6 +3,7 @@
 
     python tools/export_weights.py                       # aliked-n16 -> weights/aliked-n16.jkpw
     python tools/export_weights.py --model aliked-t16
+    python tools/export_weights.py --model raco          # original RaCo -> weights/raco.jkpw
 """
 import argparse
 import os
@@ -64,6 +65,59 @@ def export(model_name):
     return meta, {k: v.numpy() for k, v in out.items()}
 
 
+def export_raco():
+    import numpy as np
+
+    import raco_upstream
+
+    model = raco_upstream.load_model()
+    sd = {k: v.detach().cpu() for k, v in model.state_dict().items()}
+    out, used = {}, set()
+
+    def take(key):
+        used.add(key)
+        return sd[key]
+
+    def folded_pair(src, dst):
+        """Two conv + BatchNorm pairs of a ConvBlock / ResBlock."""
+        for i in ("1", "2"):
+            out[f"{dst}.conv{i}.weight"], out[f"{dst}.conv{i}.bias"] = fold(take(f"{src}.conv{i}.weight"), f"bn{i}",
+                                                                           src, sd)
+            used.update(f"{src}.bn{i}.{s}" for s in
+                        ("weight", "bias", "running_mean", "running_var", "num_batches_tracked"))
+        if f"{src}.match_dims.weight" in sd:
+            out[f"{dst}.down.weight"] = take(f"{src}.match_dims.weight")
+            out[f"{dst}.down.bias"] = take(f"{src}.match_dims.bias")
+
+    out["norm.mean"] = np.array(model.normalizer.mean, dtype=np.float32)
+    out["norm.std"] = np.array(model.normalizer.std, dtype=np.float32)
+    for block in ("block1", "block2", "block3", "block4"):
+        folded_pair(block, block)
+    for key in sd:
+        if key.startswith(("conv", "score_head.")):
+            out[key] = take(key)
+    blocks = len(model.ranker_head) - 1
+    for i in range(blocks):
+        folded_pair(f"ranker_head.{i}", f"ranker.{i}")
+    out["ranker.out.weight"] = take(f"ranker_head.{blocks}.weight")
+    out["ranker.out.bias"] = take(f"ranker_head.{blocks}.bias")
+    for i in range(3):
+        out[f"cov.{i}.weight"] = take(f"covariance_estimator_head.{2 * i}.weight")
+    out["cov.3.weight"] = take("covariance_estimator_head.6.weight")
+    out["cov.3.bias"] = take("covariance_estimator_head.6.bias")
+    missing = set(sd) - used
+    assert not missing, f"checkpoint tensors not exported: {sorted(missing)}"
+
+    commit = subprocess.run(["git", "-C", raco_upstream.RACO_DIR, "rev-parse", "HEAD"],
+                            capture_output=True, text=True).stdout.strip() or "unknown"
+    meta = {"kind": "weights", "model": "raco", "c1": 16, "c2": 32, "c3": 64, "c4": 128, "dim": 0,
+            "ranker_blocks": blocks, "nms": model.conf.nms_radius, "subpixel_temp": model.conf.subpixel_temp,
+            "top_k": model.default_conf["max_num_keypoints"],
+            "source": "https://github.com/cvg/RaCo", "source_commit": commit,
+            "source_weights": model.default_conf["weights"], "license": "Apache-2.0"}
+    return meta, {k: (v.numpy() if hasattr(v, "numpy") else v) for k, v in out.items()}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="aliked-n16")
@@ -71,7 +125,7 @@ def main():
     args = ap.parse_args()
     path = args.out or os.path.join(upstream.ROOT, "weights", f"{args.model}.jkpw")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    meta, tensors = export(args.model)
+    meta, tensors = export_raco() if args.model == "raco" else export(args.model)
     jkpfile.write(path, meta, tensors)
 
     # Round-trip check.

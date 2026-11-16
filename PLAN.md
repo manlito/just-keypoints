@@ -49,7 +49,7 @@ tools/dump_golden.py     dev-only: per-layer activations for test images
 tools/compare.py         dev-only: run the original (ALIKED or RaCo) and jkp on the same images, report differences
 tests/                   golden comparison tests per backend
 web/                     WebAssembly entry points, JS wrapper (npm package in M8), browser test page
-docs/                    documentation site + live demo (static, GitHub Pages)
+docs/                    documentation site + live demo (static, Cloudflare Pages)
 ```
 
 Python/PyTorch is used only in `tools/` to produce weights and test vectors. It is never a runtime dependency.
@@ -170,7 +170,20 @@ Each milestone is a state you can run and check. Phases below hold the technical
   - Same keypoint sets, not always the same order: keypoints whose scores nearly tie can swap in top-k mode
     and under the cap. See the notes from M6.
 - [ ] **M7 — Public demo and docs** (phase 6)
-  GitHub Pages site: load two images, see keypoints, matches and timings.
+  Cloudflare Pages site (as just-ba's): load two images, see keypoints, matches and timings.
+  Built and checked locally (M5 Pro, Chrome 156 in the desktop app's browser pane); not yet published: the
+  Cloudflare Pages project and the repository secrets are still to be made (docs/README.md, "Deploying").
+  - Site: Sphinx + MyST in `docs/`, just-ba's theme with this project's accent; pages: build, quick start, in the
+    browser, accuracy and speed, C API, weights format, references. `sphinx-build -W` passes.
+  - Live demo (`docs/_extra/demo/`): two sample pairs (TUM RGB-D, KITTI), upload, drop or camera; keypoints and
+    match lines; best-K or threshold, resolution, FP32/FP16, WebGPU/CPU, ratio test. TUM pair, top-k 1000,
+    WebGPU FP32: 11-13 ms per image, 229 matches at ratio 0.9; KITTI: 14-16 ms FP32, 12-13 ms FP16.
+    The CPU backend in the page: 0.5-0.8 s per image at 640x194.
+  - Benchmark page (`docs/_extra/bench/`): the native benchmark's four sizes, top-k 1000, median of warm runs,
+    copied out as Markdown. With the pane hidden: 13.6 / 16.5 / 23.0 / 41.2 ms in FP32 and 12.0 / 15.1 / 20.2 /
+    36.0 ms in FP16 (640x480, 1241x376, 1024x768, 1920x1080).
+  - Not as planned: the timings are per step of the page (prepare, extract, match), not per stage inside the
+    library; see the notes from M7.
 - [ ] **M8 — v1.0** (phase 7)
   CMake package, npm package, tagged release with weights and benchmark numbers.
 - **RaCo** is no longer a last milestone; it has its own track below and its demo part moves into M7.
@@ -270,7 +283,7 @@ one app. just-ba already ships a WebGPU backend built this way (its document 16,
   sets bit for bit as Metal and CUDA do. Measured against the original with the overlap metrics of M5.
 
 ### 6 — Documentation site and live demo
-- Static site in `docs/`, built and deployed to GitHub Pages by CI. No server: wasm, shaders and weights are static assets.
+- Static site in `docs/`, built by a workflow started by hand and deployed to Cloudflare Pages (as just-ba's). No server: wasm, shaders and weights are static assets.
 - Content: quick start per backend (C, CUDA, Metal, web), API reference, weights format, benchmark tables.
 - **Live demo** (runs fully in the visitor's browser on WebGPU):
   - Pick two images (samples, upload, or webcam); keypoints drawn on both.
@@ -501,6 +514,38 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - Still open: no profiler on WebGPU (timestamp queries would give GPU time per dispatch), bind groups are
   created per dispatch, and the browser numbers were taken with the pane hidden. Not checked: Safari and
   Firefox (JSPI), Dawn on Vulkan or Direct3D 12 (the laptop).
+
+## Notes from M7
+
+- The site follows just-ba's: Sphinx with MyST, its own theme on Sphinx's basic theme (`docs/_theme/jkp`, just-ba's
+  layout and stylesheet with another accent), and `.github/workflows/docs.yml`, started by hand, which builds the
+  WebAssembly module (Emscripten 7.0.0 from emsdk, emdawnwebgpu from `tools/fetch_webgpu.sh browser`), builds the
+  site with warnings as errors and, with `deploy=true`, uploads it with wrangler. Same secrets and variable
+  names as just-ba (`CLOUDFLARE_API_TOKEN`, `CLOUDFLARE_ACCOUNT_ID`, `CLOUDFLARE_PAGES_PROJECT`, default
+  `just-keypoints`).
+- Public pages carry no references to this plan, milestones, commit hashes or the repository (it is private),
+  as just-ba's rule for its site.
+- The demo and benchmark pages are static files in `docs/_extra/` (copied as they are), sharing the theme's
+  stylesheet. `conf.py` copies the module, `jkp.js` and the weights into `lib/` after the build, from
+  `JKP_WASM_DIR` (default `build/wasm/web`); without them the build warns, so `-W` fails.
+- Stage timings: the plan asked for ms per stage (upload, network, top-K, descriptors). The library reports no
+  stage times, and timing stages from outside would need a GPU round trip per stage. The page shows its own steps
+  (prepare, extract, match) and the first run (shader compilation). Per-stage GPU time needs WebGPU timestamp
+  queries in the backend (the M6 open point).
+- Warm timings: the first run of a new extractor compiles the shaders (45-60 ms with the browser's shader cache
+  warm, about 600 ms cold), and the first run at a new image size allocates its buffers (66 ms against 16 ms
+  warm for 1241x376). The demo runs both untimed; the benchmark page has warm-up runs.
+- The matcher (mutual nearest neighbours, Lowe's ratio test both ways) is plain JavaScript in a worker:
+  about 70 ms for 1000 x 1000 keypoints. A GPU matcher would be faster but stays out of scope.
+- The browser pane, when hidden, delays an `<img>`'s decoding and `OffscreenCanvas.convertToBlob` by seconds:
+  the pages load images with `fetch` + `createImageBitmap` and draw thumbnails on canvases.
+- Sample images: two TUM RGB-D frames (CC BY 4.0) and two KITTI frames (CC BY-NC-SA 3.0, non-commercial) from
+  the ALIKED repository, as JPEG; credited on the references page and in the demo's footer. The St Paul's and
+  San Marco photos there were left out: their source and licence are not stated.
+- Not checked: Edge, Chrome on Windows and Linux, the fallback without WebGPU in a real browser (the CPU
+  backend path itself was run), and the camera (needs a device and a permission prompt).
+- RaCo in the demo (detector switch, covariance ellipses) waits for R6: the browser module has no model
+  option yet.
 
 ## Open questions (decide during implementation)
 

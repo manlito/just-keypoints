@@ -42,6 +42,9 @@ int jkp_backend_available(jkp_backend backend) {
 #ifdef JKP_HAVE_METAL
   if (backend == JKP_BACKEND_METAL) return 1;
 #endif
+#ifdef JKP_HAVE_WEBGPU
+  if (backend == JKP_BACKEND_WEBGPU) return 1;
+#endif
   return backend == JKP_BACKEND_CPU;
 }
 
@@ -100,6 +103,10 @@ jkp_ctx* jkp_create(const jkp_config* config) {
 #endif
 #ifdef JKP_HAVE_METAL
     if (config->backend == JKP_BACKEND_METAL) ctx->ops = jkp::make_metal_ops(config->device, precision);
+#endif
+#ifdef JKP_HAVE_WEBGPU
+    if (config->backend == JKP_BACKEND_WEBGPU)
+      ctx->ops = jkp::make_webgpu_ops(precision, config->webgpu_instance, config->webgpu_device);
 #endif
     ctx->detect.top_k = config->top_k;
     ctx->detect.scores_th = config->score_threshold;

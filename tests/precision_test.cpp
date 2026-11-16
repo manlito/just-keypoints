@@ -1,6 +1,6 @@
 // FP16 against FP32 on the same GPU backend: how many keypoints survive, how far they move and how much
 // the descriptors change. Fails when the loss exceeds the bounds below.
-//   precision_test WEIGHTS.jkpw cuda|metal [GOLDEN.jkpt ...]
+//   precision_test WEIGHTS.jkpw cuda|metal|webgpu [GOLDEN.jkpt ...]
 // Runs on generated images, plus the image stored in each golden file given (real photographs).
 #include <algorithm>
 #include <cmath>
@@ -82,8 +82,8 @@ struct Image {
 
 int main(int argc, char** argv) {
   const std::string backend = argc >= 3 ? argv[2] : "";
-  if (backend != "cuda" && backend != "metal") {
-    std::fprintf(stderr, "usage: precision_test WEIGHTS.jkpw cuda|metal [GOLDEN.jkpt ...]\n");
+  if (backend != "cuda" && backend != "metal" && backend != "webgpu") {
+    std::fprintf(stderr, "usage: precision_test WEIGHTS.jkpw cuda|metal|webgpu [GOLDEN.jkpt ...]\n");
     return 2;
   }
   int failed = 0;

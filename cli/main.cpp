@@ -34,9 +34,9 @@ int usage() {
                "       jkp bench   IMAGE [--runs N] [--warmup N] [options]   (default 10 runs after 2 warm-up runs)\n"
                "options:\n"
                "  --image PATH      input image (same as the positional argument)\n"
-               "  --backend NAME    cpu (default), cuda or metal\n"
+               "  --backend NAME    cpu (default), cuda, metal or webgpu\n"
                "  --device N        GPU index for --backend cuda or metal (default 0)\n"
-               "  --precision P     fp32 (default, matches the original) or fp16 (cuda and metal: faster)\n"
+               "  --precision P     fp32 (default, matches the original) or fp16 (gpu backends: faster)\n"
                "  --weights PATH    .jkpw file (default: weights embedded in the build)\n"
                "  --model NAME      aliked-n16 (default) or raco; picks the embedded weights\n"
                "  --descriptor NAME aliked-n16: describe raco keypoints with it\n"
@@ -81,6 +81,7 @@ int main(int argc, char** argv) {
       if (name == "cpu") config.backend = JKP_BACKEND_CPU;
       else if (name == "cuda") config.backend = JKP_BACKEND_CUDA;
       else if (name == "metal") config.backend = JKP_BACKEND_METAL;
+      else if (name == "webgpu") config.backend = JKP_BACKEND_WEBGPU;
       else return usage();
     }
     else if (a == "--device") config.device = std::atoi(value());

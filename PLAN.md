@@ -48,7 +48,7 @@ tools/export_weights.py  dev-only: PyTorch checkpoint -> flat .jkpw file
 tools/dump_golden.py     dev-only: per-layer activations for test images
 tools/compare.py         dev-only: run the original (ALIKED or RaCo) and jkp on the same images, report differences
 tests/                   golden comparison tests per backend
-web/                     JS wrapper (npm package)
+web/                     WebAssembly entry points, JS wrapper (npm package in M8), browser test page
 docs/                    documentation site + live demo (static, GitHub Pages)
 ```
 
@@ -143,8 +143,32 @@ Each milestone is a state you can run and check. Phases below hold the technical
 
   For reference, the ALIKED paper reports 77.4 FPS (12.9 ms) for aliked-n16 at 640x480 with 1K keypoints
   (PyTorch, RTX 2060).
-- [ ] **M6 — Runs in the browser** (phase 5)
+- [x] **M6 — Runs in the browser** (phase 5)
   WebGPU backend passes the comparison natively (Dawn) and in a browser test page.
+  Done (M5 Pro, macOS 26, Dawn v20261113.214538 natively, Chrome 156 in the desktop app's browser pane):
+  - Natively, `jkp extract --backend webgpu` matches the original on 57/57 sample images in threshold and
+    top-k mode: identical keypoint sets, position error <= 2.4e-4 px, score error <= 7.6e-5, descriptor cosine
+    >= 1 - 3.6e-9 (Metal in M3: 2.6e-4, 8e-5, 1 - 4e-9). Every intermediate tensor matches the golden dump
+    within 2.3e-5; all 24 WebGPU tests pass (operations, against the CPU, 20 golden frames, FP16 against FP32,
+    the caller's device).
+  - In Chrome (`web/test.html`, 10 images from 640x480 to 2075x1491, threshold and top-k 1000): WebGPU FP32 gives
+    the native CPU backend's keypoint sets on every image (position <= 1.4e-4 px, score <= 4.7e-5, cosine
+    >= 1 - 6e-7); FP16 finds 99.6-100 % of them within 1 px. The module's own CPU backend agrees as closely.
+  - FP16 against the original (57 images, threshold): overlap >= 99.31 %, mean 99.77 % (Metal: 99.45 %, 99.8 %).
+  - Speed, top-k 1000, ms per image (`tools/bench.py`, same method as M5):
+
+    | Size | Metal FP32 | WebGPU FP32 | Metal FP16 | WebGPU FP16 |
+    |---|---|---|---|---|
+    | 640x480 | 8.4 | 10.1 | 7.3 | 8.8 |
+    | 1241x376 | 10.6 | 12.7 | 8.7 | 11.0 |
+    | 1024x768 | 13.9 | 17.1 | 11.2 | 15.2 |
+    | 1920x1080 | 29.7 | 38.0 | 23.2 | 33.3 |
+
+    Native WebGPU takes 1.2-1.4 times Metal's time. In Chrome, median of 5 warm runs with the pane hidden:
+    12-13 ms at 640x480 and 58 ms at 2075x1491 in FP32, 10 ms at 640x480 in FP16. The CPU backend in the
+    browser (one thread) takes about 1.2 s at 640x480.
+  - Same keypoint sets, not always the same order: keypoints whose scores nearly tie can swap in top-k mode
+    and under the cap. See the notes from M6.
 - [ ] **M7 — Public demo and docs** (phase 6)
   GitHub Pages site: load two images, see keypoints, matches and timings.
 - [ ] **M8 — v1.0** (phase 7)
@@ -216,8 +240,34 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
 - Port each kernel to WGSL; same graph, same tests.
 - Run natively through Dawn first (fast iteration, same golden tests in CI), then build with Emscripten.
 - JS wrapper: `await jkp.create({weightsUrl})`, `await jkp.extract(imageBitmap)` → typed arrays.
-- FP32 reference mode; opt-in FP16 when `shader-f16` is available.
+- FP32 reference mode; opt-in FP16 as storage only, arithmetic float32 as on Metal and CUDA. Storage is
+  `array<f16>`, so it needs the `shader-f16` feature (`jkp_create` fails without it). Packing two values per
+  32-bit word with `pack2x16float` would need no feature, but neighbouring threads write the two halves of
+  one word, so every kernel would have to write pairs.
 - **Exit:** minimal test page; results match golden within FP16 tolerance.
+
+Settled before starting (2026-11-15), so that just-keypoints, just-ba and just-matching can be linked into
+one app. just-ba already ships a WebGPU backend built this way (its document 16, decisions D120-D128):
+
+- **Same toolchain as just-ba:** Dawn's prebuilt release v20261113.214538 natively, emdawnwebgpu from the
+  same release and Emscripten 7.0.0 in the browser, unpacked under `third_party/webgpu` (ignored by git;
+  `JKP_DAWN_DIR`, `JKP_EMDAWNWEBGPU_DIR`). Dawn's `webgpu.h` changes between releases; an app links one Dawn.
+  Rejected: wgpu-native (its `webgpu.h` differs from emdawnwebgpu's), building Dawn from source.
+- **Same WebAssembly settings as just-ba:** single-threaded host (no `SharedArrayBuffer`, any static host),
+  JSPI for waits on the GPU, native wasm exceptions. Asyncify cannot be combined with native exceptions.
+- **The library is a static library under Emscripten too.** The `.js`/`.wasm` module and the JS wrapper are
+  a separate target. An app links all three libraries into one module: separate modules cannot share a
+  GPU device through emdawnwebgpu.
+- **The caller may supply the device** (`jkp_config.webgpu_device`, a `WGPUDevice`); otherwise the backend
+  creates its own. Dawn's device is not thread-safe, and three libraries each opening one would mean three
+  memory budgets next to FlexGlue's ~1 GB.
+- **Selection on the device, as on CUDA.** Metal's host-side prefix sums rely on unified memory; on WebGPU
+  every readback is a map and a wait, slower still in the browser.
+- **One binding per tensor.** Kernels bind at most a handful of buffers; the device requests the adapter's
+  `maxStorageBufferBindingSize` and `maxBufferSize` (the defaults are 128 and 256 MiB).
+- **CPU fallback in the browser runs on one thread** (`std::thread` needs pthreads).
+- **WGSL cannot turn off fused multiply-add**, so WebGPU is not expected to reproduce the CPU's keypoint
+  sets bit for bit as Metal and CUDA do. Measured against the original with the overlap metrics of M5.
 
 ### 6 — Documentation site and live demo
 - Static site in `docs/`, built and deployed to GitHub Pages by CI. No server: wasm, shaders and weights are static assets.
@@ -410,9 +460,52 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - The CUDA laptop has a separate tree at `~/Repos/just-keypoints/.claude/worktrees/m5` with its own `.venv`
   holding CUDA-enabled PyTorch; the M4 worktree's `.venv` is CPU-only.
 
+## Notes from M6
+
+- `src/backend/webgpu/kernels.wgsl` is a kernel-by-kernel port of the Metal kernels (same names, arithmetic and
+  order); `webgpu_ops.cpp` is the host side over `webgpu.h`, the same source natively (Dawn) and in the browser
+  (emdawnwebgpu). The `Ops` interface did not change. WGSL has no templates: a kernel section holds `$T`, `$K`,
+  `$O` and the host instantiates it by name (`k_conv2d_t8_k3_f32`); each instance is its own shader module, so
+  sections declare their own bindings. Pipelines are created on first use.
+- Arguments: buffers bind in the order they are passed; scalars go into a 256-byte uniform slot per dispatch
+  (a ring written just before the submission), read in WGSL by position (`pi(0u)`, `pf(3u)`). Each dispatch has
+  its own bind group. Offsets into a buffer (concatenation, compaction) are scalars, not binding offsets, which
+  WebGPU requires to be multiples of 256 bytes.
+- Ordering: one compute pass per batch, submitted when the host needs a value or writes a buffer. A
+  `wgpuQueueWriteBuffer` runs before work submitted after it, even if encoded earlier, so every write submits
+  the open batch first; with that, a buffer returned to the pool can be reused at once, as on Metal.
+- Selection as on CUDA (count, scan and write on the device). Round trips per image: threshold mode one count
+  and the results; top-k two histogram passes and the results; the descriptor head one per 8192 keypoints.
+  Several ranges are copied into one staging buffer per round trip.
+- Errors: every batch is wrapped in validation and out-of-memory error scopes, checked at the next read, so
+  they are reported also on a device the caller created (`webgpu_shared_test`).
+- WGSL gives no control over floating-point modes, and on Dawn's Metal path division is not correctly rounded
+  (a correctly rounded replacement removed the flips below; whether Dawn asks for fast math was not checked)
+  and multiply-adds may be fused. Values then differ from the CPU in the last bits (stages within
+  2.3e-5, the same order of size as Metal). One place matters: a keypoint on an integer pixel recovered as
+  4.9999995 truncates to the neighbouring 3x3 patch in the descriptor head (2 of 20 golden frames; descriptor
+  values off by up to 0.017). `k_refine` therefore divides with `div_rn`, a correctly rounded division from two
+  `fma` corrections; since then every golden test passes. Keypoints whose scores nearly tie can still come out
+  in another order (top-k and the cap sort by score): same set, different order, natively and in Chrome alike.
+- `tests/ops_test.cpp` (`<backend>_ops`) compares each operation with the CPU backend on random weights; it
+  found the one host bug (the plain `k_conv2d` section taken for `k_conv2d_t8_k3`) at once. Any GPU backend
+  can use it.
+- Browser module: 293 KB of wasm and 100 KB of JS (`-sJSPI`, `-fwasm-exceptions`, `MODULARIZE`, `EXPORT_ES6`,
+  memory growth to 4 GB), weights fetched separately (2.7 MB). `jkpw_create` and `jkpw_extract` are JSPI
+  exports. `web/test.html` runs WebGPU FP32 and FP16 and the module's CPU backend on images decoded natively
+  (raw RGBA from `tools/web_testdata.py`), against the native CPU backend's results; `window.jkpTest` resolves
+  to the summary, so the check can be automated.
+- The CPU backend in WebAssembly: one thread, about 1.2 s at 640x480 (native on all cores of the M5 Pro: 66 ms), and
+  at most about 1.5 MP: it stores the 128-channel full-resolution map and its copies (about 2 GB per megapixel)
+  and wasm32 has 4 GB. A lazy pyramid on the CPU backend, as on the GPU backends, would lift that.
+- Still open: no profiler on WebGPU (timestamp queries would give GPU time per dispatch), bind groups are
+  created per dispatch, and the browser numbers were taken with the pane hidden. Not checked: Safari and
+  Firefox (JSPI), Dawn on Vulkan or Direct3D 12 (the laptop).
+
 ## Open questions (decide during implementation)
 
-- Tensor layout for speed: NCHW vs NHWC on CUDA; texture vs storage-buffer representation in WGSL.
-- WebGPU limits (storage buffer size, bindings per shader stage) at large resolutions — may need tiling.
+- Tensor layout for speed: NCHW vs NHWC on CUDA. (WGSL: storage buffers, one per tensor, settled in M6.)
+- WebGPU limits: settled in M6 for the sizes tried (up to 2075x1491): the device asks for the adapter's
+  buffer limits and no kernel binds more than seven buffers. Past 4 GB per tensor it would need tiling.
 - Whether to add `aliked-t16` as a second, faster web-friendly variant (same op set, different widths).
 - Descriptor output quantization for the downstream matcher.

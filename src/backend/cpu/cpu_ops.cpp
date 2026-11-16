@@ -87,6 +87,9 @@ class CpuOps : public Ops {
   explicit CpuOps(int num_threads) {
     threads_ = num_threads > 0 ? num_threads : static_cast<int>(std::thread::hardware_concurrency());
     threads_ = std::max(1, threads_);
+#if defined(__EMSCRIPTEN__) && !defined(__EMSCRIPTEN_PTHREADS__)
+    threads_ = 1;  // the WebAssembly build has no threads (PLAN.md, phase 5)
+#endif
   }
 
   TensorPtr image(const uint8_t* data, int width, int height, int stride, int channels) override {

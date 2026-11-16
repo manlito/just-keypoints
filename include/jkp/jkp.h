@@ -51,6 +51,12 @@ typedef struct {
   int skip_covariance;
   /* Default JKP_PRECISION_FP32. jkp_create fails when the backend does not support the precision. */
   jkp_precision precision;
+  /* WebGPU backend: a WGPUInstance and a WGPUDevice created from it, to run on the caller's device
+     (an app that also runs other GPU work shares one device). Both NULL: the backend creates its own.
+     The device must outlive the context; it must not be used from another thread during jkp_extract.
+     fp16 needs the device to have the shader-f16 feature. `device` above is not used by WebGPU. */
+  void* webgpu_instance;
+  void* webgpu_device;
 } jkp_config;
 
 typedef struct {

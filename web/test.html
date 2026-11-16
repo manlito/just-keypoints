@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>just-keypoints browser test</title>
+<style>
+  :root { --bg: #fff; --fg: #1d1d1f; --muted: #6e6e73; --line: #e5e5ea; --ok: #1a7f37; --bad: #c62828; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #161618; --fg: #f2f2f7; --muted: #a1a1a6; --line: #333336; --ok: #4ac26b; --bad: #ff6b6b; }
+  }
+  body { background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, sans-serif; margin: 24px 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p { margin: 4px 0 12px; color: var(--muted); max-width: 72ch; }
+  #status { font-weight: 600; color: var(--fg); }
+  .wrap { overflow-x: auto; }
+  table { border-collapse: collapse; font-variant-numeric: tabular-nums; margin: 8px 0 24px; }
+  th, td { padding: 4px 10px; border-bottom: 1px solid var(--line); text-align: right; white-space: nowrap; }
+  th:first-child, td:first-child, th:nth-child(2), td:nth-child(2) { text-align: left; }
+  th { color: var(--muted); font-weight: 500; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); font-weight: 600; }
+</style>
+</head>
+<body>
+<h1>just-keypoints in the browser</h1>
+<p>Runs the WebAssembly module on WebGPU (FP32, and FP16 when the adapter has <code>shader-f16</code>) and on its
+CPU backend, and compares each result with the native CPU backend on the same pixels (testdata/).
+FP32 must give the same keypoints in the same order (position within 0.01 px, score within 1e-4, descriptor
+cosine at least 0.9999); FP16 at least 97 % of the keypoints within 1 px.</p>
+<p id="status">Loading…</p>
+<p id="adapter"></p>
+<div class="wrap" id="tables"></div>
+<script type="module">
+import * as jkp from './jkp.js';
+
+const status = document.getElementById('status');
+const tables = document.getElementById('tables');
+
+// Reader for the .jkpt container (tools/jkpfile.py): float32 tensors only.
+function readJkpt(buffer) {
+  const v = new DataView(buffer), dec = new TextDecoder();
+  if (dec.decode(new Uint8Array(buffer, 0, 4)) !== 'JKPW') throw new Error('not a .jkpt file');
+  let p = 8;
+  const nMeta = v.getUint32(p, true), nTensors = v.getUint32(p + 4, true);
+  p += 8;
+  const str = () => { const n = v.getUint16(p, true); const s = dec.decode(new Uint8Array(buffer, p + 2, n)); p += 2 + n; return s; };
+  const meta = {}, tensors = {};
+  for (let i = 0; i < nMeta; i++) { const k = str(); meta[k] = str(); }
+  for (let i = 0; i < nTensors; i++) {
+    const name = str(), dtype = v.getUint8(p), ndim = v.getUint8(p + 1);
+    p += 2;
+    const dims = [];
+    for (let d = 0; d < ndim; d++, p += 4) dims.push(v.getUint32(p, true));
+    const offset = Number(v.getBigUint64(p, true)), bytes = Number(v.getBigUint64(p + 8, true));
+    p += 16;
+    if (dtype !== 0) throw new Error(`${name}: not float32`);
+    tensors[name] = { dims, data: new Float32Array(buffer.slice(offset, offset + bytes)) };
+  }
+  return { meta, tensors };
+}
+
+async function fetchBuffer(url) {
+  const r = await fetch(url);
+  if (!r.ok) throw new Error(`${url}: ${r.status}`);
+  return r.arrayBuffer();
+}
+
+async function loadImage(entry) {
+  const buf = await fetchBuffer('testdata/' + entry.pixels);
+  const v = new DataView(buf);
+  const w = v.getUint32(0, true), h = v.getUint32(4, true);
+  return new ImageData(new Uint8ClampedArray(buf, 8, w * h * 4), w, h);
+}
+
+// Result against the reference, keypoint by keypoint: each reference keypoint is paired with the nearest
+// result keypoint. Keypoints whose scores nearly tie may come out in another order (top-k and the cap sort
+// by score, and WebGPU's last bits differ), so the sets are compared, not the order.
+function compare(got, ref, dim) {
+  const n = ref.score.length;
+  const used = new Uint8Array(got.n);
+  let dxy = 0, dscore = 0, minCos = 1, found = 0, oneToOne = true;
+  for (let i = 0; i < n; i++) {
+    const x = ref.xy[2 * i], y = ref.xy[2 * i + 1];
+    let best = -1, bestD = Infinity;
+    // Same index first (the usual case), then a search.
+    if (i < got.n) { best = i; bestD = Math.hypot(got.xy[2 * i] - x, got.xy[2 * i + 1] - y); }
+    if (bestD > 0.01)
+      for (let j = 0; j < got.n; j++) {
+        const dx = got.xy[2 * j] - x;
+        if (dx > bestD || -dx > bestD) continue;
+        const d = Math.hypot(dx, got.xy[2 * j + 1] - y);
+        if (d < bestD) { bestD = d; best = j; }
+      }
+    if (best < 0) continue;
+    if (bestD <= 1) found++;
+    dxy = Math.max(dxy, bestD);
+    if (used[best]) oneToOne = false;
+    used[best] = 1;
+    dscore = Math.max(dscore, Math.abs(got.score[best] - ref.score[i]));
+    let c = 0;
+    for (let j = 0; j < dim; j++) c += got.desc[best * dim + j] * ref.desc[i * dim + j];
+    minCos = Math.min(minCos, c);
+  }
+  const sameSet = got.n === n && oneToOne && dxy <= 0.01;
+  return { n, got: got.n, sameSet, dxy, dscore, minCos, overlap: n ? found / n : 1 };
+}
+
+// The CPU backend stores the 128-channel full-resolution map and its copies, about 2 GB per megapixel:
+// past ~1.5 MP that does not fit in WebAssembly's 4 GB of memory. WebGPU keeps it on the GPU and lazy.
+const CPU_MAX_PIXELS = 1.5e6;
+
+function median(a) { const s = [...a].sort((x, y) => x - y); return s[Math.floor(s.length / 2)]; }
+const fmt = (x, d = 1) => (x === undefined || Number.isNaN(x) ? '–' : x.toExponential(d));
+
+async function run() {
+  const manifest = await (await fetch('testdata/manifest.json')).json();
+  const weights = await fetchBuffer('aliked-n16.jkpw');
+  const images = await Promise.all(manifest.images.map(loadImage));
+  const refs = await Promise.all(manifest.images.map(async e => {
+    const out = {};
+    for (const [mode, file] of Object.entries(e.refs)) {
+      const t = readJkpt(await fetchBuffer('testdata/' + file)).tensors;
+      out[mode] = { xy: t.keypoints.data, score: t.scores.data, desc: t.descriptors.data, dim: t.descriptors.dims[1] };
+    }
+    return out;
+  }));
+
+  let adapterInfo = 'no WebGPU', hasF16 = false;
+  if (jkp.webgpuSupported()) {
+    const adapter = await navigator.gpu.requestAdapter({ powerPreference: 'high-performance' });
+    if (adapter) {
+      const i = adapter.info || {};
+      adapterInfo = [i.vendor, i.architecture, i.device, i.description].filter(Boolean).join(' / ') || 'WebGPU adapter';
+      hasF16 = adapter.features.has('shader-f16');
+    }
+  }
+  document.getElementById('adapter').textContent = `Adapter: ${adapterInfo}. shader-f16: ${hasF16 ? 'yes' : 'no'}. ` +
+    `${navigator.userAgent.match(/Chrome\/[\d.]+/)?.[0] ?? navigator.userAgent}`;
+
+  const configs = [];
+  if (jkp.webgpuSupported()) configs.push({ backend: 'webgpu', precision: 'fp32' });
+  if (hasF16) configs.push({ backend: 'webgpu', precision: 'fp16' });
+  configs.push({ backend: 'cpu', precision: 'fp32' });
+
+  const summary = { pass: true, adapter: adapterInfo, shaderF16: hasF16, runs: [] };
+  for (const cfg of configs) {
+    for (const [mode, modeOpts] of Object.entries(manifest.modes)) {
+      status.textContent = `Running ${cfg.backend} ${cfg.precision}, ${mode}…`;
+      const t0 = performance.now();
+      const ex = await jkp.create({ weights, ...cfg, ...modeOpts });
+      const createMs = performance.now() - t0;
+      const rows = [];
+      for (let i = 0; i < images.length; i++) {
+        const entry = manifest.images[i], ref = refs[i][mode];
+        if (cfg.backend === 'cpu' && entry.width * entry.height > CPU_MAX_PIXELS) {
+          rows.push({ skipped: true, pass: true, image: `${entry.source} ${entry.width}x${entry.height}`, n: ref.score.length });
+          continue;
+        }
+        let got = await ex.extract(images[i]);  // first run compiles kernels and fills the pool
+        const times = [];
+        const reps = cfg.backend === 'cpu' ? 1 : 5;
+        for (let r = 0; r < reps; r++) {
+          const s = performance.now();
+          got = await ex.extract(images[i]);
+          times.push(performance.now() - s);
+        }
+        const c = compare(got, ref, ref.dim);
+        c.pass = cfg.precision === 'fp32'
+          ? c.sameSet && c.dscore <= 1e-4 && c.minCos >= 0.9999
+          : c.overlap >= 0.97;
+        c.ms = median(times);
+        c.image = `${entry.source} ${entry.width}x${entry.height}`;
+        rows.push(c);
+        if (!c.pass) summary.pass = false;
+      }
+      ex.destroy();
+      summary.runs.push({ ...cfg, mode, createMs, rows });
+      render(summary);
+    }
+  }
+  status.textContent = summary.pass ? 'All results match the native CPU backend.' : 'Some results do not match (marked).';
+  status.className = summary.pass ? 'ok' : 'bad';
+  return summary;
+}
+
+function render(summary) {
+  tables.innerHTML = '';
+  for (const r of summary.runs) {
+    const t = document.createElement('table');
+    const passed = r.rows.filter(x => x.pass && !x.skipped).length, checked = r.rows.filter(x => !x.skipped).length;
+    t.innerHTML = `<caption style="text-align:left;font-weight:600;padding:4px 0">${r.backend} ${r.precision}, ${r.mode}:
+      ${passed} / ${checked} pass; first create ${r.createMs.toFixed(0)} ms</caption>
+      <tr><th></th><th>image</th><th>keypoints</th><th>native</th><th>same set</th><th>position px</th><th>score</th>
+      <th>min cosine</th><th>within 1 px</th><th>ms</th></tr>`;
+    for (const x of r.rows) {
+      const tr = document.createElement('tr');
+      if (x.skipped) {
+        tr.innerHTML = `<td>skip</td><td>${x.image}</td><td colspan="8" style="text-align:left">over ${CPU_MAX_PIXELS / 1e6} MP: ` +
+                       `the CPU backend needs more than WebAssembly's 4 GB</td>`;
+        t.appendChild(tr);
+        continue;
+      }
+      tr.innerHTML = `<td class="${x.pass ? 'ok' : 'bad'}">${x.pass ? 'ok' : 'FAIL'}</td><td>${x.image}</td>
+        <td>${x.got}</td><td>${x.n}</td><td>${x.sameSet ? 'yes' : 'no'}</td><td>${fmt(x.dxy)}</td><td>${fmt(x.dscore)}</td>
+        <td>${(1 - x.minCos).toExponential(1).replace(/^/, "1 − ")}</td>
+        <td>${(100 * x.overlap).toFixed(2)} %</td><td>${x.ms.toFixed(1)}</td>`;
+      t.appendChild(tr);
+    }
+    tables.appendChild(t);
+  }
+}
+
+window.jkpTest = run().catch(e => {
+  status.textContent = 'Error: ' + e.message;
+  status.className = 'bad';
+  console.error(e);
+  return { pass: false, error: String(e) };
+});
+</script>
+</body>
+</html>

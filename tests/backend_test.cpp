@@ -69,8 +69,8 @@ Run run(const jkp::Aliked& model, jkp::Ops& ops, const Case& c, const std::vecto
 
 int main(int argc, char** argv) {
   const std::string backend = argc == 3 ? argv[2] : "";
-  if (backend != "cuda" && backend != "metal") {
-    std::fprintf(stderr, "usage: backend_test WEIGHTS.jkpw cuda|metal\n");
+  if (backend != "cuda" && backend != "metal" && backend != "webgpu") {
+    std::fprintf(stderr, "usage: backend_test WEIGHTS.jkpw cuda|metal|webgpu\n");
     return 2;
   }
   const Case cases[] = {

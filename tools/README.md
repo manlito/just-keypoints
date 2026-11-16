@@ -46,6 +46,7 @@ python tools/compare.py --model raco --descriptor aliked-n16 $A/tum/*.png \
 | `dump_golden.py` | golden test vectors from the original |
 | `bench.py` | times `jkp bench` and the original ALIKED at several image sizes; prints a Markdown table |
 | `compare.py` | compares two implementations: `upstream`, `folded`, or `cmd:<program>` (the `jkp` CLI, any backend) |
+| `web_testdata.py` | test data for `web/test.html`: images as raw RGBA and the native CPU backend's results on them |
 
 The original needs a compiled CUDA extension (`custom_ops/get_patches`). When it is not built,
 `upstream.py` substitutes an equivalent pure-torch version so the original runs on CPU-only machines.

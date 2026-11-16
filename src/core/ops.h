@@ -78,6 +78,19 @@ class Ops {
   // L2 normalization across channels.
   virtual TensorPtr l2_normalize(const TensorPtr& x) = 0;
 
+  // Fused forms of sequences in the graph. The defaults run the separate operations; a backend overrides
+  // them to save the intermediate tensors, with the same results.
+  // concat of xs[i] upsampled by scales[i] (1 = as is).
+  virtual TensorPtr upsample_concat(const std::vector<TensorPtr>& xs, const std::vector<int>& scales) {
+    std::vector<TensorPtr> parts;
+    for (size_t i = 0; i < xs.size(); ++i) parts.push_back(scales[i] == 1 ? xs[i] : upsample(xs[i], scales[i]));
+    return concat(parts);
+  }
+  // crop(l2_normalize(x), ...).
+  virtual TensorPtr l2_normalize_crop(const TensorPtr& x, int left, int top, int width, int height) {
+    return crop(l2_normalize(x), left, top, width, height);
+  }
+
   // The operations below are used by RaCo only. A backend that has not implemented them yet inherits
   // these, which throw, so `normalize` (the first operation of the RaCo graph) reports it.
   // (x - mean[c]) / std[c] per channel.
@@ -100,5 +113,7 @@ class Ops {
 std::unique_ptr<Ops> make_cpu_ops(int num_threads);
 // Only in builds with the CUDA backend (JKP_HAVE_CUDA). device: GPU index.
 std::unique_ptr<Ops> make_cuda_ops(int device);
+// Only in builds with the Metal backend (JKP_HAVE_METAL). device: index in MTLCopyAllDevices().
+std::unique_ptr<Ops> make_metal_ops(int device);
 
 }  // namespace jkp

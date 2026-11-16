@@ -103,8 +103,13 @@ Each milestone is a state you can run and check. Phases below hold the technical
   Done: 31/31 sample images match the original (identical keypoint sets, position error <= 1.3e-4 px,
   score error <= 5e-5, descriptor cosine >= 1 - 5e-10); every intermediate tensor matches the golden dump
   within 2e-5. Speed is not a goal here: ~0.8 s for 640x480 on 4 CPU threads.
-- [ ] **M3 — Runs on the Mac GPU** (phase 4, FP32)
+- [x] **M3 — Runs on the Mac GPU** (phase 4, FP32)
   Metal backend passes the same comparison on the M5 laptop.
+  Done (M5 Pro, macOS 26): `jkp extract --backend metal` matches the original on 57/57 sample images,
+  in threshold and top-k mode (identical keypoint sets, position error <= 2.6e-4 px, score error <= 8e-5,
+  descriptor cosine >= 1 - 4e-9); every intermediate tensor matches the golden dump within 3.1e-5 and the
+  CPU backend within 2.3e-5. Not tuned yet: 25 ms for 640x400, 60-75 ms for 1024x640, 230 ms for
+  1920x1200, about 2x the CPU backend on the same machine.
 - [x] **M4 — Runs on NVIDIA** (phase 2)
   CUDA backend passes the same comparison. Order of M3/M4 depends on the machine in use.
   Done (RTX 2070, CUDA 13.4): `jkp extract --backend cuda` matches the original on 57/57 sample images,
@@ -113,6 +118,22 @@ Each milestone is a state you can run and check. Phases below hold the technical
   CPU backend within 2e-5. Not tuned yet: 43 ms for 640x480, about 8x the CPU backend on 12 threads.
 - [ ] **M5 — Fast** (phase 3, plus FP16 on Metal)
   Benchmark table: jkp CUDA vs PyTorch CUDA, jkp Metal, FP32 vs FP16, at three resolutions. FP16 accuracy loss measured.
+  In progress (Metal, FP32): tiled convolutions and fewer full-resolution copies, results byte-identical
+  to M3. Top-k 1000, median of warm runs, runs interleaved with PyTorch, M5 Pro:
+
+  | Size | jkp Metal | PyTorch MPS (original) | jkp CPU | PyTorch CPU (original) |
+  |---|---|---|---|---|
+  | 640x480 | 12.8 ms (M3: 32.8) | 12.1 ms | 69 ms | 241 ms |
+  | 1241x376 | 17.6 ms (M3: 48.4) | 18.5 ms | 102 ms | 337 ms |
+  | 1024x768 | 25.1 ms (M3: 77.2) | 28.6 ms | 161 ms | 568 ms |
+  | 1920x1080 | 56.6 ms (M3: 212) | 68.7 ms | 384 ms | 1252 ms |
+
+  PyTorch MPS times vary with machine load by about 10% between sessions (68.7-75.7 ms at 1080p). The
+  PyTorch baseline runs without the original's compiled `get_patches` op (CUDA only), so its descriptor head
+  copies the whole feature map; the fair 1080p baseline is probably a few ms faster.
+
+  For reference, the ALIKED paper reports 77.4 FPS (12.9 ms) for aliked-n16 at 640x480 with 1K keypoints
+  (PyTorch, RTX 2060).
 - [ ] **M6 — Runs in the browser** (phase 5)
   WebGPU backend passes the comparison natively (Dawn) and in a browser test page.
 - [ ] **M7 — Public demo and docs** (phase 6)
@@ -313,6 +334,50 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - `tests/backend_test.cpp` compares CUDA with CPU on generated images (selection modes, pixel formats,
   flat and tiny images) and needs no golden files; `golden_test` takes the backend as a third argument.
   A Metal or WebGPU backend can reuse both.
+
+## Notes from M3
+
+- `src/backend/metal/kernels.metal` is a kernel-by-kernel port of the CUDA file (same names, same argument
+  order, one scalar per buffer index via `setBytes`); `metal_ops.mm` is the host glue. Dependencies:
+  Metal.framework and Foundation only. The `Ops` interface did not change.
+- The shader source is embedded in the library (`cmake/embed_text.cmake`) and compiled at `jkp_create`
+  with `newLibraryWithSource`, so building needs no Metal toolchain (`xcodebuild -downloadComponent
+  MetalToolchain` is not installed on the M5). Compile options: safe math mode, precise math functions,
+  and `#pragma METAL fp contract(off)` in the source. As on CUDA, results differ from the CPU backend only
+  through `exp()`. Precompiling a `.metallib` (when the toolchain is present) would save the compile at startup.
+- All buffers use shared storage: the image is written and results are read in place, with no copies.
+  Work is encoded into one command buffer with serial dispatch and committed only when the host needs a
+  value (stage readback, selection counts, results). The buffer pool hands a buffer released during the
+  open command buffer back to GPU work at once (dispatch order makes that safe) but never to a buffer the
+  host writes; those wait for the next sync.
+- Selection matches CUDA: block-wise ordered compaction, radix select on the float bits, rank sort. The
+  prefix sum over block counts and the mean-score fallback sum run on the host (shared memory makes that
+  free and the fallback sum identical to the CPU backend).
+- `tests/backend_test.cpp` now takes `cuda|metal`; ctest registers `<backend>_vs_cpu` for each GPU backend
+  in the build and the golden tests per backend.
+- Known costs left for M5: same as CUDA (no tiling or fusing, O(N^2) rank sort, keypoint round trip between
+  `detect` and `describe`), plus a full sync for each radix-select pass. Peak memory is ~1.7 GB at
+  1024x640, mostly the deformable-convolution column buffer and the pool keeping every size it has seen.
+
+## Notes from M5 (Metal, in progress)
+
+- `JKP_METAL_PROFILE=1` gives each dispatch its own command buffer and prints GPU time per operation and
+  per kernel when the backend is destroyed. Summed GPU time matches normal wall time, so the kernels
+  themselves are the cost, not syncs or encoding.
+- Convolutions were memory bound: one thread per output value re-read the whole input once per output
+  channel (8.6 GB per frame for the 128->8 score-head layer at 1080p). `k_conv2d_tile<T, K>` and
+  `k_deform_sum_tile<T>` compute T output channels per thread with weights in the constant address space;
+  each output keeps the same accumulation order, so outputs are byte-identical to the M3 kernels.
+  T = 4, 8 or 16 by output channel count (`JKP_METAL_TILE` forces one, for tuning); 32 is slower.
+  Convolution GPU time went from 24 to ~8.5 ms at 640x480 and from 163 to ~33 ms at 1080p.
+- Fewer passes over the 128-channel full-resolution tensor (~1 GB at 1080p): `Ops` gained two fused
+  operations, `upsample_concat` and `l2_normalize_crop`, whose defaults run the separate operations
+  (CPU and CUDA unchanged). Metal writes the upsampled maps straight into their concat slices, normalizes
+  and crops in one kernel, and returns the input from an identity crop. Saved ~20 ms GPU time at 1080p.
+- Next, by GPU time at 1080p: `k_l2_normalize_crop` (11 ms, 20%; it reads the input twice), the 3x3
+  convolutions at 1/2 and 1/8 resolution (2-4x slower than MPS; threadgroup tiles of the input), the
+  aggregation conv at full resolution writing into its concat slice (saves the remaining 2 ms copy), and
+  the descriptor head (~4 ms for 1K keypoints at any size).
 
 ## Open questions (decide during implementation)
 

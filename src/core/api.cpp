@@ -39,6 +39,9 @@ int jkp_backend_available(jkp_backend backend) {
 #ifdef JKP_HAVE_CUDA
   if (backend == JKP_BACKEND_CUDA) return 1;
 #endif
+#ifdef JKP_HAVE_METAL
+  if (backend == JKP_BACKEND_METAL) return 1;
+#endif
   return backend == JKP_BACKEND_CPU;
 }
 
@@ -86,6 +89,9 @@ jkp_ctx* jkp_create(const jkp_config* config) {
     if (config->backend == JKP_BACKEND_CPU) ctx->ops = jkp::make_cpu_ops(config->num_threads);
 #ifdef JKP_HAVE_CUDA
     if (config->backend == JKP_BACKEND_CUDA) ctx->ops = jkp::make_cuda_ops(config->device);
+#endif
+#ifdef JKP_HAVE_METAL
+    if (config->backend == JKP_BACKEND_METAL) ctx->ops = jkp::make_metal_ops(config->device);
 #endif
     ctx->detect.top_k = config->top_k;
     ctx->detect.scores_th = config->score_threshold;

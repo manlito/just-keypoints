@@ -1,5 +1,5 @@
 // Compares every stage of a backend against golden tensors dumped from the original ALIKED.
-//   golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|cuda]
+//   golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|cuda|metal]
 // Generate golden files with: python tools/dump_golden.py <images>
 #include <cmath>
 #include <cstdio>
@@ -11,6 +11,7 @@
 #include "core/ops.h"
 #include "core/weights.h"
 #include "models/aliked/aliked.h"
+#include "test_backends.h"
 
 namespace {
 
@@ -37,8 +38,8 @@ void check(const char* name, const float* got, size_t got_n, const jkp::Param* r
 
 int main(int argc, char** argv) {
   std::string backend = argc == 4 ? argv[3] : "cpu";
-  if (argc < 3 || argc > 4 || (backend != "cpu" && backend != "cuda")) {
-    std::fprintf(stderr, "usage: golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|cuda]\n");
+  if (argc < 3 || argc > 4 || (backend != "cpu" && backend != "cuda" && backend != "metal")) {
+    std::fprintf(stderr, "usage: golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|cuda|metal]\n");
     return 2;
   }
   try {
@@ -52,12 +53,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < image.size(); ++i) image[i] = static_cast<uint8_t>(image_f.data[i]);
 
     jkp::Aliked model(weights);
-#ifdef JKP_TEST_CUDA
-    auto ops = backend == "cuda" ? jkp::make_cuda_ops(0) : jkp::make_cpu_ops(0);
-#else
-    if (backend != "cpu") throw std::runtime_error("this build has no " + backend + " backend");
-    auto ops = jkp::make_cpu_ops(0);
-#endif
+    auto ops = make_backend(backend);
     jkp::DetectParams detect;
     detect.top_k = golden.meta_int("top_k");
     detect.scores_th = std::stof(golden.meta("scores_th"));

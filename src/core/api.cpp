@@ -86,12 +86,20 @@ jkp_ctx* jkp_create(const jkp_config* config) {
       ctx->descriptor = std::make_unique<jkp::Aliked>(ctx->descriptor_weights);
     }
     if (!jkp_backend_available(config->backend)) throw std::runtime_error("backend not available in this build");
+    if (config->precision != JKP_PRECISION_FP32 && config->precision != JKP_PRECISION_FP16)
+      throw std::runtime_error("unknown precision");
+    const jkp::Precision precision =
+        config->precision == JKP_PRECISION_FP16 ? jkp::Precision::Fp16 : jkp::Precision::Fp32;
+    if (precision == jkp::Precision::Fp16 && config->backend == JKP_BACKEND_CPU)
+      throw std::runtime_error("the cpu backend runs in fp32 only");
+    if (precision == jkp::Precision::Fp16 && ctx->raco)
+      throw std::runtime_error("raco runs in fp32 only");
     if (config->backend == JKP_BACKEND_CPU) ctx->ops = jkp::make_cpu_ops(config->num_threads);
 #ifdef JKP_HAVE_CUDA
-    if (config->backend == JKP_BACKEND_CUDA) ctx->ops = jkp::make_cuda_ops(config->device);
+    if (config->backend == JKP_BACKEND_CUDA) ctx->ops = jkp::make_cuda_ops(config->device, precision);
 #endif
 #ifdef JKP_HAVE_METAL
-    if (config->backend == JKP_BACKEND_METAL) ctx->ops = jkp::make_metal_ops(config->device);
+    if (config->backend == JKP_BACKEND_METAL) ctx->ops = jkp::make_metal_ops(config->device, precision);
 #endif
     ctx->detect.top_k = config->top_k;
     ctx->detect.scores_th = config->score_threshold;

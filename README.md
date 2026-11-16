@@ -4,7 +4,17 @@ Keypoint and descriptor extraction (ALIKED) with minimal dependencies, for featu
 No PyTorch, no ONNX Runtime. Plan and status: [PLAN.md](PLAN.md).
 
 Status: the CPU reference backend, the CUDA backend and the Metal backend work and match the original ALIKED.
-The GPU backends are not optimized yet. A WebGPU backend is planned.
+A WebGPU backend is planned.
+
+Milliseconds per image with 1000 keypoints (image in host memory to keypoints and descriptors in host memory):
+
+| Size | Metal FP32 | Metal FP16 | PyTorch MPS | CUDA FP32 | CUDA FP16 | PyTorch CUDA |
+|---|---|---|---|---|---|---|
+| 640x480 | 8.3 | 7.2 | 13.1 | 15.2 | 13.4 | 15.6 |
+| 1024x768 | 13.8 | 11.3 | 28.9 | 26.8 | 24.5 | 31.8 |
+| 1920x1080 | 30.2 | 23.3 | 74.8 | 59.1 | 53.9 | 77.3 |
+
+Metal and MPS on an M5 Pro, CUDA on an RTX 2070 Max-Q laptop; PyTorch runs the original ALIKED. Details in [PLAN.md](PLAN.md), M5.
 
 ## Build
 
@@ -33,10 +43,12 @@ build/release/jkp extract image.png --out features.jkpt    # keypoints, scores, 
 build/release/jkp bench image.png --runs 10
 build/release/jkp bench image.png --backend cuda
 build/release/jkp bench image.png --backend metal
+build/release/jkp bench image.png --backend metal --precision fp16
 JKP_METAL_PROFILE=1 build/release/jkp bench image.png --backend metal   # GPU time per operation
+JKP_CUDA_PROFILE=1 build/release/jkp bench image.png --backend cuda     # kernel time per operation
 ```
 
-Options: `--backend cpu|cuda|metal`, `--device N`, `--top-k K`, `--scores-th T`, `--n-limit N`, `--weights file.jkpw`, `--threads N`, `--gray`.
+Options: `--backend cpu|cuda|metal`, `--device N`, `--precision fp32|fp16`, `--top-k K`, `--scores-th T`, `--n-limit N`, `--weights file.jkpw`, `--threads N`, `--gray`.
 
 ## C API
 
@@ -55,6 +67,14 @@ if (jkp_extract(ctx, &image, &r) == 0) {
 }
 jkp_destroy(ctx);
 ```
+
+## Precision
+
+FP32 is the default on every backend and matches the original network: the same keypoints, positions within
+3e-4 px. `--precision fp16` (C API: `config.precision = JKP_PRECISION_FP16`, CUDA and Metal only) stores feature
+maps and weights as 16-bit floats. It is 10-20 % faster and its results differ slightly: about 99.8 % of the
+keypoints are the same, those move by about 0.001 px (median), and their descriptors differ by about 1e-5 in
+cosine similarity. `ctest -R fp16` measures this on your machine.
 
 ## Validation against the original
 

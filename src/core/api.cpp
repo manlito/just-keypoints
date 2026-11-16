@@ -7,10 +7,14 @@
 #include "core/weights.h"
 #include "jkp/jkp.h"
 #include "models/aliked/aliked.h"
+#include "models/raco/raco.h"
 
 struct jkp_ctx {
-  jkp::Weights weights;
-  std::unique_ptr<jkp::Aliked> model;
+  jkp::Weights weights, descriptor_weights;
+  std::unique_ptr<jkp::Aliked> model;  // one of model / raco is set
+  std::unique_ptr<jkp::Aliked> descriptor;  // optional, describes the keypoints of raco
+  std::unique_ptr<jkp::Raco> raco;
+  jkp::RacoOptions raco_options;
   std::unique_ptr<jkp::Ops> ops;
   jkp::DetectParams detect;
   jkp::Features features;
@@ -54,9 +58,30 @@ jkp_ctx* jkp_create(const jkp_config* config) {
     } else {
       throw std::runtime_error("no weights given and '" + model + "' is not embedded in this build");
     }
-    if (ctx->weights.meta("model").rfind("aliked-", 0) != 0)
-      throw std::runtime_error("unsupported model '" + ctx->weights.meta("model") + "'");
-    ctx->model = std::make_unique<jkp::Aliked>(ctx->weights);
+    const std::string& kind = ctx->weights.meta("model");
+    if (kind == "raco") ctx->raco = std::make_unique<jkp::Raco>(ctx->weights);
+    else if (kind.rfind("aliked-", 0) == 0) ctx->model = std::make_unique<jkp::Aliked>(ctx->weights);
+    else throw std::runtime_error("unsupported model '" + kind + "'");
+    ctx->raco_options.top_k = config->top_k;
+    ctx->raco_options.ranker = !config->skip_ranker;
+    ctx->raco_options.covariance = !config->skip_covariance;
+    if (config->descriptor && *config->descriptor && !(ctx->model && kind == config->descriptor)) {
+      std::string name = config->descriptor;
+      if (!ctx->raco) throw std::runtime_error("'" + kind + "' has its own descriptors; a descriptor model needs raco");
+      if (config->descriptor_weights_data && config->descriptor_weights_size) {
+        ctx->descriptor_weights =
+            jkp::Weights::from_memory(config->descriptor_weights_data, config->descriptor_weights_size);
+      } else if (config->descriptor_weights_path) {
+        ctx->descriptor_weights = jkp::Weights::from_file(config->descriptor_weights_path);
+      } else if (jkp::embedded_weights(name, &blob, &blob_size)) {
+        ctx->descriptor_weights = jkp::Weights::from_memory(blob, blob_size);
+      } else {
+        throw std::runtime_error("no descriptor weights given and '" + name + "' is not embedded in this build");
+      }
+      if (ctx->descriptor_weights.meta("model").rfind("aliked-", 0) != 0)
+        throw std::runtime_error("unsupported descriptor model '" + ctx->descriptor_weights.meta("model") + "'");
+      ctx->descriptor = std::make_unique<jkp::Aliked>(ctx->descriptor_weights);
+    }
     if (!jkp_backend_available(config->backend)) throw std::runtime_error("backend not available in this build");
     if (config->backend == JKP_BACKEND_CPU) ctx->ops = jkp::make_cpu_ops(config->num_threads);
 #ifdef JKP_HAVE_CUDA
@@ -76,13 +101,24 @@ int jkp_extract(jkp_ctx* ctx, const jkp_image* image, jkp_result* result) {
   try {
     if (!ctx || !image || !result || !image->data) throw std::runtime_error("null argument");
     int channels = image->format == JKP_FORMAT_GRAY8 ? 1 : image->format == JKP_FORMAT_RGB8 ? 3 : 4;
-    ctx->model->extract(*ctx->ops, image->data, image->width, image->height, image->stride, channels, ctx->detect,
-                        &ctx->features);
+    if (ctx->raco)
+      ctx->raco->extract(*ctx->ops, image->data, image->width, image->height, image->stride, channels,
+                         ctx->raco_options, &ctx->features);
+    if (ctx->descriptor) {
+      ctx->descriptor->describe_at(*ctx->ops, image->data, image->width, image->height, image->stride, channels,
+                                   ctx->features.xy.data(), ctx->features.n, &ctx->features.desc);
+      ctx->features.dim = ctx->descriptor->descriptor_dim();
+    }
+    if (!ctx->raco)
+      ctx->model->extract(*ctx->ops, image->data, image->width, image->height, image->stride, channels, ctx->detect,
+                          &ctx->features);
     result->n = ctx->features.n;
     result->dim = ctx->features.dim;
     result->xy = ctx->features.xy.data();
     result->score = ctx->features.score.data();
-    result->desc = ctx->features.desc.data();
+    result->desc = ctx->features.desc.empty() ? nullptr : ctx->features.desc.data();
+    result->rank = ctx->features.rank.empty() ? nullptr : ctx->features.rank.data();
+    result->cov = ctx->features.cov.empty() ? nullptr : ctx->features.cov.data();
     return 0;
   } catch (const std::exception& e) {
     g_error = e.what();

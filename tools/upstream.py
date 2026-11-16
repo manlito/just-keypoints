@@ -44,6 +44,20 @@ def load_model(model_name="aliked-n16", device="cpu", top_k=-1, scores_th=0.2, n
     return model
 
 
+@torch.no_grad()
+def describe_at(model, rgb, xy):
+    """Descriptors of the original ALIKED at given keypoints. xy: (N,2) pixels, (0, 0) = centre of the
+    top-left pixel. Same steps as ALIKED.describe in cvg/LightGlue, which is how the RaCo authors pair
+    RaCo keypoints with ALIKED descriptors (their keypoints carry a +0.5 offset that it removes first)."""
+    image = to_tensor(rgb, model.device)
+    h, w = image.shape[-2:]
+    wh = torch.tensor([w - 1, h - 1], device=image.device)
+    keypoints = torch.from_numpy(xy).to(image.device) + 0.5
+    keypoints_n = 2.0 * (keypoints - 0.5) / wh[None] - 1
+    feature_map, _ = model.extract_dense_map(image)
+    return model.desc_head(feature_map, [keypoints_n])[0][0].cpu().numpy()
+
+
 def load_image(path, max_size=0):
     """Returns an HxWx3 uint8 RGB image, optionally downscaled so its longer side is <= max_size."""
     bgr = cv2.imread(path, cv2.IMREAD_COLOR)

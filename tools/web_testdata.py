@@ -1,5 +1,5 @@
 """Test data for the browser test page (web/test.html): images as raw RGBA and the native CPU backend's
-results on them, in threshold mode and top-k 1000.
+results on them, in threshold mode and top-k 1000, and RaCo's (top 2048, with ALIKED descriptors).
 
     python tools/web_testdata.py --jkp build/release/jkp --out build/wasm/web/testdata IMAGE...
 
@@ -24,6 +24,9 @@ def main():
     ap.add_argument("--jkp", required=True, help="native jkp command line tool")
     ap.add_argument("--out", required=True, help="output directory (served next to test.html)")
     ap.add_argument("--weights", help=".jkpw for the native run (default: embedded)")
+    ap.add_argument("--raco-weights", default="weights/raco.jkpw", help="RaCo .jkpw for the native run; '' skips RaCo")
+    ap.add_argument("--descriptor-weights", default="weights/aliked-n16.jkpw",
+                    help="aliked-n16 .jkpw that describes the RaCo keypoints")
     ap.add_argument("images", nargs="+")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
@@ -44,12 +47,21 @@ def main():
                 cmd += ["--weights", args.weights]
             subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL)
             refs[mode] = ref
+        if args.raco_weights:
+            ref = f"{name}.raco.jkpt"
+            subprocess.run([args.jkp, "extract", png, "--backend", "cpu", "--out", os.path.join(args.out, ref),
+                            "--weights", args.raco_weights, "--descriptor", "aliked-n16",
+                            "--descriptor-weights", args.descriptor_weights], check=True, stdout=subprocess.DEVNULL)
+            refs["raco"] = ref
         os.remove(png)
         entries.append({"name": name, "source": os.path.basename(path), "width": rgb.width, "height": rgb.height,
                         "pixels": name + ".rgba", "refs": refs})
         print(f"{name}: {rgb.width}x{rgb.height}", file=sys.stderr)
     with open(os.path.join(args.out, "manifest.json"), "w") as f:
-        json.dump({"modes": {"threshold": {"topK": -1}, "topk": {"topK": 1000}}, "images": entries}, f, indent=1)
+        modes = {"threshold": {"topK": -1}, "topk": {"topK": 1000}}
+        if args.raco_weights:
+            modes["raco"] = {"model": "raco"}
+        json.dump({"modes": modes, "images": entries}, f, indent=1)
 
 
 if __name__ == "__main__":

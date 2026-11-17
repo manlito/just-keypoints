@@ -184,7 +184,7 @@ if(EMSCRIPTEN AND JKP_BUILD_WASM)
   target_link_options(jkp_wasm PRIVATE
     -sJSPI
     "-sJSPI_EXPORTS=jkpw_create,jkpw_extract"
-    "-sEXPORTED_FUNCTIONS=_malloc,_free,_jkpw_backend_available,_jkpw_create,_jkpw_extract,_jkpw_dim,_jkpw_xy,_jkpw_score,_jkpw_desc,_jkpw_error,_jkpw_destroy"
+    "-sEXPORTED_FUNCTIONS=_malloc,_free,_jkpw_backend_available,_jkpw_create,_jkpw_extract,_jkpw_dim,_jkpw_xy,_jkpw_score,_jkpw_desc,_jkpw_rank,_jkpw_cov,_jkpw_error,_jkpw_destroy"
     "-sEXPORTED_RUNTIME_METHODS=HEAPU8,HEAPF32,UTF8ToString"
     -sMODULARIZE
     -sEXPORT_ES6
@@ -197,8 +197,10 @@ if(EMSCRIPTEN AND JKP_BUILD_WASM)
     add_custom_command(TARGET jkp_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                        "${CMAKE_CURRENT_SOURCE_DIR}/web/${f}" "${CMAKE_CURRENT_BINARY_DIR}/web/${f}")
   endforeach()
-  add_custom_command(TARGET jkp_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
-                     "${CMAKE_CURRENT_SOURCE_DIR}/weights/aliked-n16.jkpw" "${CMAKE_CURRENT_BINARY_DIR}/web/aliked-n16.jkpw")
+  foreach(f aliked-n16.jkpw raco.jkpw)
+    add_custom_command(TARGET jkp_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                       "${CMAKE_CURRENT_SOURCE_DIR}/weights/${f}" "${CMAKE_CURRENT_BINARY_DIR}/web/${f}")
+  endforeach()
 endif()
 
 if(JKP_BUILD_CLI)
@@ -220,6 +222,9 @@ if(JKP_BUILD_TESTS)
   set(raco_backends cpu)
   if(JKP_HAVE_METAL)
     list(APPEND raco_backends metal)
+  endif()
+  if(JKP_HAVE_WEBGPU)
+    list(APPEND raco_backends webgpu)
   endif()
   if(JKP_HAVE_CUDA)
     target_compile_definitions(golden_test PRIVATE JKP_TEST_CUDA)
@@ -301,6 +306,9 @@ if(JKP_BUILD_TESTS)
   target_link_libraries(raco_golden_test PRIVATE jkp)
   if(JKP_HAVE_METAL)
     target_compile_definitions(raco_golden_test PRIVATE JKP_TEST_METAL)
+  endif()
+  if(JKP_HAVE_WEBGPU)
+    target_compile_definitions(raco_golden_test PRIVATE JKP_TEST_WEBGPU)
   endif()
   file(GLOB raco_golden_files "${CMAKE_CURRENT_SOURCE_DIR}/build/golden/raco/*.jkpt")
   foreach(golden IN LISTS raco_golden_files)

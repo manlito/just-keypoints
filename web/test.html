@@ -26,7 +26,10 @@
 <p>Runs the WebAssembly module on WebGPU (FP32, and FP16 when the adapter has <code>shader-f16</code>) and on its
 CPU backend, and compares each result with the native CPU backend on the same pixels (testdata/).
 FP32 must give the same keypoints in the same order (position within 0.01 px, score within 1e-4, descriptor
-cosine at least 0.9999); FP16 at least 97 % of the keypoints within 1 px.</p>
+cosine at least 0.9999); FP16 at least 97 % of the keypoints within 1 px. RaCo (FP32 only, top 2048, ALIKED
+descriptors) must pair at least 99.8 % of the keypoints one to one within 0.01 px (near-tied scores may cross
+the top-k cut), with score and ranker within 1e-4 of the largest value, covariance within 1e-3 (relative) and
+the same descriptor bound.</p>
 <p id="status">Loading…</p>
 <p id="adapter"></p>
 <div class="wrap" id="tables"></div>
@@ -105,6 +108,43 @@ function compare(got, ref, dim) {
   return { n, got: got.n, sameSet, dxy, dscore, minCos, overlap: n ? found / n : 1 };
 }
 
+// RaCo: keypoints paired one to one by position (nearest unused result keypoint within 0.01 px, searched
+// in score order). Scores and ranker scores relative to the reference's largest magnitude, covariances by
+// the relative Frobenius norm.
+function compareRaco(got, ref, dim) {
+  const n = ref.score.length, used = new Uint8Array(got.n);
+  const maxAbs = (a) => a.reduce((m, v) => Math.max(m, Math.abs(v)), 0) || 1;
+  const sMax = maxAbs(ref.score), rMax = maxAbs(ref.rank);
+  let paired = 0, dxy = 0, dscore = 0, drank = 0, dcov = 0, minCos = 1;
+  for (let i = 0; i < n; i++) {
+    const x = ref.xy[2 * i], y = ref.xy[2 * i + 1];
+    let best = -1, bestD = 0.01;
+    for (let j = 0; j < got.n; j++) {
+      if (used[j]) continue;
+      const d = Math.hypot(got.xy[2 * j] - x, got.xy[2 * j + 1] - y);
+      if (d <= bestD) { bestD = d; best = j; }
+    }
+    if (best < 0) continue;
+    used[best] = 1;
+    paired++;
+    dxy = Math.max(dxy, bestD);
+    dscore = Math.max(dscore, Math.abs(got.score[best] - ref.score[i]) / sMax);
+    drank = Math.max(drank, Math.abs(got.rank[best] - ref.rank[i]) / rMax);
+    let num = 0, den = 0;
+    for (let k = 0; k < 4; k++) {
+      num += (got.cov[4 * best + k] - ref.cov[4 * i + k]) ** 2;
+      den += ref.cov[4 * i + k] ** 2;
+    }
+    dcov = Math.max(dcov, Math.sqrt(num / Math.max(den, 1e-30)));
+    let c = 0;
+    for (let k = 0; k < dim; k++) c += got.desc[best * dim + k] * ref.desc[i * dim + k];
+    minCos = Math.min(minCos, c);
+  }
+  const fraction = n ? paired / Math.max(n, got.n) : 1;
+  return { raco: true, n, got: got.n, fraction, dxy, dscore, drank, dcov, minCos,
+           pass: fraction >= 0.998 && dscore <= 1e-4 && drank <= 1e-4 && dcov <= 1e-3 && minCos >= 0.9999 };
+}
+
 // The CPU backend stores the 128-channel full-resolution map and its copies, about 2 GB per megapixel:
 // past ~1.5 MP that does not fit in WebAssembly's 4 GB of memory. WebGPU keeps it on the GPU and lazy.
 const CPU_MAX_PIXELS = 1.5e6;
@@ -115,12 +155,14 @@ const fmt = (x, d = 1) => (x === undefined || Number.isNaN(x) ? '–' : x.toExpo
 async function run() {
   const manifest = await (await fetch('testdata/manifest.json')).json();
   const weights = await fetchBuffer('aliked-n16.jkpw');
+  const racoWeights = 'raco' in manifest.modes ? await fetchBuffer('raco.jkpw') : null;
   const images = await Promise.all(manifest.images.map(loadImage));
   const refs = await Promise.all(manifest.images.map(async e => {
     const out = {};
     for (const [mode, file] of Object.entries(e.refs)) {
       const t = readJkpt(await fetchBuffer('testdata/' + file)).tensors;
-      out[mode] = { xy: t.keypoints.data, score: t.scores.data, desc: t.descriptors.data, dim: t.descriptors.dims[1] };
+      out[mode] = { xy: t.keypoints.data, score: t.scores.data, desc: t.descriptors.data, dim: t.descriptors.dims[1],
+                    rank: t.ranker?.data, cov: t.covariances?.data };
     }
     return out;
   }));
@@ -145,9 +187,12 @@ async function run() {
   const summary = { pass: true, adapter: adapterInfo, shaderF16: hasF16, runs: [] };
   for (const cfg of configs) {
     for (const [mode, modeOpts] of Object.entries(manifest.modes)) {
+      const raco = modeOpts.model === 'raco';
+      if (raco && cfg.precision !== 'fp32') continue;  // RaCo runs in FP32 only
       status.textContent = `Running ${cfg.backend} ${cfg.precision}, ${mode}…`;
       const t0 = performance.now();
-      const ex = await jkp.create({ weights, ...cfg, ...modeOpts });
+      const ex = await jkp.create(raco ? { weights: racoWeights, descriptorWeights: weights, ...cfg }
+                                       : { weights, ...cfg, ...modeOpts });
       const createMs = performance.now() - t0;
       const rows = [];
       for (let i = 0; i < images.length; i++) {
@@ -164,10 +209,11 @@ async function run() {
           got = await ex.extract(images[i]);
           times.push(performance.now() - s);
         }
-        const c = compare(got, ref, ref.dim);
-        c.pass = cfg.precision === 'fp32'
-          ? c.sameSet && c.dscore <= 1e-4 && c.minCos >= 0.9999
-          : c.overlap >= 0.97;
+        const c = raco ? compareRaco(got, ref, ref.dim) : compare(got, ref, ref.dim);
+        if (!raco)
+          c.pass = cfg.precision === 'fp32'
+            ? c.sameSet && c.dscore <= 1e-4 && c.minCos >= 0.9999
+            : c.overlap >= 0.97;
         c.ms = median(times);
         c.image = `${entry.source} ${entry.width}x${entry.height}`;
         rows.push(c);
@@ -188,15 +234,26 @@ function render(summary) {
   for (const r of summary.runs) {
     const t = document.createElement('table');
     const passed = r.rows.filter(x => x.pass && !x.skipped).length, checked = r.rows.filter(x => !x.skipped).length;
+    const raco = r.mode === 'raco';
     t.innerHTML = `<caption style="text-align:left;font-weight:600;padding:4px 0">${r.backend} ${r.precision}, ${r.mode}:
-      ${passed} / ${checked} pass; first create ${r.createMs.toFixed(0)} ms</caption>
-      <tr><th></th><th>image</th><th>keypoints</th><th>native</th><th>same set</th><th>position px</th><th>score</th>
-      <th>min cosine</th><th>within 1 px</th><th>ms</th></tr>`;
+      ${passed} / ${checked} pass; first create ${r.createMs.toFixed(0)} ms</caption>` + (raco
+      ? `<tr><th></th><th>image</th><th>keypoints</th><th>native</th><th>paired</th><th>position px</th><th>score</th>
+         <th>ranker</th><th>covariance</th><th>min cosine</th><th>ms</th></tr>`
+      : `<tr><th></th><th>image</th><th>keypoints</th><th>native</th><th>same set</th><th>position px</th><th>score</th>
+         <th>min cosine</th><th>within 1 px</th><th>ms</th></tr>`);
     for (const x of r.rows) {
       const tr = document.createElement('tr');
       if (x.skipped) {
         tr.innerHTML = `<td>skip</td><td>${x.image}</td><td colspan="8" style="text-align:left">over ${CPU_MAX_PIXELS / 1e6} MP: ` +
                        `the CPU backend needs more than WebAssembly's 4 GB</td>`;
+        t.appendChild(tr);
+        continue;
+      }
+      if (x.raco) {
+        tr.innerHTML = `<td class="${x.pass ? 'ok' : 'bad'}">${x.pass ? 'ok' : 'FAIL'}</td><td>${x.image}</td>
+          <td>${x.got}</td><td>${x.n}</td><td>${(100 * x.fraction).toFixed(2)} %</td><td>${fmt(x.dxy)}</td>
+          <td>${fmt(x.dscore)}</td><td>${fmt(x.drank)}</td><td>${fmt(x.dcov)}</td>
+          <td>${(1 - x.minCos).toExponential(1).replace(/^/, "1 − ")}</td><td>${x.ms.toFixed(1)}</td>`;
         t.appendChild(tr);
         continue;
       }

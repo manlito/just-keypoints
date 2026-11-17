@@ -4,6 +4,7 @@ import * as jkp from './lib/jkp.js';
 export { jkp };
 
 export const WEIGHTS_URL = new URL('./lib/aliked-n16.jkpw', import.meta.url).href;
+export const RACO_WEIGHTS_URL = new URL('./lib/raco.jkpw', import.meta.url).href;
 
 // What this browser can run. The module waits for the GPU through JSPI (WebAssembly.Suspending); without
 // it the module cannot run at all. Without WebGPU the module's CPU backend still runs, slowly.
@@ -27,18 +28,19 @@ export async function environment() {
   return env;
 }
 
-let weightsPromise = null;
+const weightsPromises = new Map();
 
-// The weights file, fetched once per page.
-export function weights() {
-  if (!weightsPromise) {
-    weightsPromise = fetch(WEIGHTS_URL).then((r) => {
+// A weights file, fetched once per page: ALIKED's by default, RaCo's with RACO_WEIGHTS_URL.
+export function weights(url = WEIGHTS_URL) {
+  if (!weightsPromises.has(url)) {
+    const p = fetch(url).then((r) => {
       if (!r.ok) throw new Error(`cannot load the weights: HTTP ${r.status}`);
       return r.arrayBuffer();
     }).then((b) => new Uint8Array(b));
-    weightsPromise.catch(() => { weightsPromise = null; });
+    p.catch(() => weightsPromises.delete(url));
+    weightsPromises.set(url, p);
   }
-  return weightsPromise;
+  return weightsPromises.get(url);
 }
 
 export function sourceSize(source) {

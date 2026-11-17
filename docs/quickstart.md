@@ -72,12 +72,13 @@ tensors `xy`, `score` and `desc`.
 ## RaCo
 
 RaCo is a second detector: it returns, per keypoint, a ranker score and a 2x2 covariance in pixels² (usable as a
-weight in bundle adjustment), and no descriptors. It runs on the CPU and Metal backends (FP32), and gives the
-original RaCo's results.
+weight in bundle adjustment), and no descriptors. It runs on the CPU, Metal and WebGPU backends (FP32), and gives
+the original RaCo's results. In the browser, see [the JavaScript options](browser.md).
 
 ```bash
 jkp extract image.png --model raco --backend metal
 jkp extract image.png --model raco --backend metal --descriptor aliked-n16   # with ALIKED descriptors
+jkp extract image.png --model raco --backend webgpu
 ```
 
 A build that embeds only ALIKED (`JKP_EMBED_MODELS=aliked-n16`) needs `--weights raco.jkpw` as well.

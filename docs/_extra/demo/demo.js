@@ -1,5 +1,5 @@
 // The live demo: two images, their keypoints, the matches between them, and the time each step takes.
-import { jkp, environment, weights, pixels, loadImage, sourceSize, ms, unsupportedMessage } from '../common.js';
+import { jkp, environment, weights, RACO_WEIGHTS_URL, pixels, loadImage, sourceSize, ms, unsupportedMessage } from '../common.js';
 
 const $ = (id) => document.getElementById(id);
 const SAMPLES = {
@@ -14,7 +14,8 @@ const LEVEL = { draw: 0, match: 1, extract: 2 };
 const state = {
   env: null,
   images: [null, null],      // { bitmap, name }
-  results: [null, null],     // { n, dim, xy, score, desc, w, h, prepMs, extractMs }
+  results: [null, null],     // { n, dim, xy, score, desc, rank, cov, w, h, prepMs, extractMs }
+  shown: [null, null],       // the results drawn and matched: RaCo's best by ranker score, otherwise results
   firstMs: null,             // the first run after creating an extractor (compiles the shaders)
   matches: null,             // { pairs, sims, ms }
   extractor: null,
@@ -32,8 +33,10 @@ window.jkpDemo = state;
 function settings() {
   const mode = document.querySelector('input[name="mode"]:checked').value;
   return {
+    detector: document.querySelector('input[name="det"]:checked').value,
     mode,
     topK: +$('topk').value,
+    rankKeep: +$('rank').value,
     th: +$('th').value,
     cap: +$('cap').value,
     res: +$('res').value,
@@ -44,7 +47,26 @@ function settings() {
 }
 
 function extractorKey(s) {
+  if (s.detector === 'raco') return `raco|${s.backend}|k${s.topK}`;
   return s.mode === 'topk' ? `${s.backend}|${s.precision}|k${s.topK}` : `${s.backend}|${s.precision}|t${s.th}|${s.cap}`;
+}
+
+// RaCo: the `keep` keypoints with the highest ranker scores, best first (0 or more than detected: all).
+function byRanker(r, keep) {
+  if (!r.rank || keep <= 0 || keep >= r.n) return r;
+  const order = Array.from({ length: r.n }, (_, i) => i).sort((a, b) => r.rank[b] - r.rank[a] || a - b).slice(0, keep);
+  const pick = (src, width) => {
+    const out = new Float32Array(order.length * width);
+    order.forEach((k, i) => out.set(src.subarray(k * width, (k + 1) * width), i * width));
+    return out;
+  };
+  return { ...r, n: order.length, xy: pick(r.xy, 2), score: pick(r.score, 1), desc: pick(r.desc, r.dim),
+           rank: pick(r.rank, 1), cov: r.cov && pick(r.cov, 4), detected: r.n };
+}
+
+function selectAll() {
+  const s = settings();
+  state.shown = state.results.map((r) => r && (s.detector === 'raco' ? byRanker(r, s.rankKeep) : r));
 }
 
 function targetSize(image, s) {
@@ -73,7 +95,10 @@ async function pump() {
       state.error = null;
       state.step = level;
       if (level >= LEVEL.extract) await extractAll();
-      if (level >= LEVEL.match) await matchAll();
+      if (level >= LEVEL.match) {
+        selectAll();
+        await matchAll();
+      }
     } catch (e) {
       console.error(e);
       state.error = e;
@@ -93,9 +118,16 @@ async function ensureExtractor(s) {
   if (state.extractor) state.extractor.destroy();
   state.extractor = null;
   busy('Preparing the backend…');
-  const options = { weights: await weights(), backend: s.backend, precision: s.precision };
-  if (s.mode === 'topk') options.topK = s.topK;
-  else Object.assign(options, { scoreThreshold: s.th, maxKeypoints: s.cap });
+  let options;
+  if (s.detector === 'raco') {
+    // RaCo keypoints, described by ALIKED for matching; RaCo runs in FP32 only.
+    options = { weights: await weights(RACO_WEIGHTS_URL), descriptorWeights: await weights(), backend: s.backend,
+                precision: 'fp32', topK: s.topK };
+  } else {
+    options = { weights: await weights(), backend: s.backend, precision: s.precision };
+    if (s.mode === 'topk') options.topK = s.topK;
+    else Object.assign(options, { scoreThreshold: s.th, maxKeypoints: s.cap });
+  }
   state.extractor = await jkp.create(options);
   state.key = key;
   state.fresh = true;
@@ -107,6 +139,7 @@ async function extractAll() {
   await ensureExtractor(s);
   state.matches = null;
   state.results = [null, null];
+  state.shown = [null, null];
   for (let i = 0; i < 2; i++) {
     const image = state.images[i];
     const { w, h } = targetSize(image, s);
@@ -132,6 +165,7 @@ async function extractAll() {
     t = performance.now();
     const r = await state.extractor.extract(data);
     state.results[i] = { ...r, w, h, prepMs, extractMs: performance.now() - t };
+    selectAll();
     draw();
   }
 }
@@ -139,7 +173,7 @@ async function extractAll() {
 let worker = null, nextId = 1;
 
 function matchAll() {
-  const [a, b] = state.results;
+  const [a, b] = state.shown;
   if (!a || !b || !a.dim || !b.dim) { state.matches = null; return; }
   busy('Matching…');
   worker ??= new Worker(new URL('./matcher.js', import.meta.url));
@@ -186,13 +220,34 @@ function draw() {
   // Keypoint k of image i on the canvas. xy is in the pixels sent to the library, (0, 0) = centre of the
   // top-left pixel.
   const at = (i, k) => {
-    const res = state.results[i], r = rects[i];
+    const res = state.shown[i], r = rects[i];
     return [r.x + (res.xy[2 * k] + 0.5) * r.w / res.w, r.y + (res.xy[2 * k + 1] + 0.5) * r.h / res.h];
   };
+  // RaCo covariances as ellipses of `sigmas` standard deviations, in canvas pixels: Sigma = R diag(l1, l2) R^T.
+  const sigmas = $('cov').disabled ? 0 : +$('cov').value;
+  if (sigmas > 0) {
+    g.lineWidth = 0.9;
+    g.strokeStyle = 'rgba(64, 200, 255, 0.75)';
+    for (let i = 0; i < 2; i++) {
+      const res = state.shown[i], r = rects[i];
+      if (!res?.cov) continue;
+      const scale = sigmas * r.w / res.w;
+      g.beginPath();
+      for (let k = 0; k < res.n; k++) {
+        const a = res.cov[4 * k], b = res.cov[4 * k + 1], d = res.cov[4 * k + 3];
+        const mid = (a + d) / 2, rad = Math.hypot((a - d) / 2, b);
+        const r1 = scale * Math.sqrt(Math.max(mid + rad, 0)), r2 = scale * Math.sqrt(Math.max(mid - rad, 0));
+        const [x, y] = at(i, k), theta = 0.5 * Math.atan2(2 * b, a - d);
+        g.moveTo(x + r1 * Math.cos(theta), y + r1 * Math.sin(theta));
+        g.ellipse(x, y, r1, r2, theta, 0, 2 * Math.PI);
+      }
+      g.stroke();
+    }
+  }
   if ($('show-kp').checked) {
     const radius = Math.max(1.2, Math.min(2.2, rects[0].w / 400));
     for (let i = 0; i < 2; i++) {
-      const res = state.results[i];
+      const res = state.shown[i];
       if (!res) continue;
       g.beginPath();
       for (let k = 0; k < res.n; k++) {
@@ -230,12 +285,15 @@ function draw() {
 
 function renderStats() {
   const s = settings();
-  const [a, b] = state.results;
+  const [a, b] = state.shown;
+  const raco = s.detector === 'raco';
   const rows = [];
   const cell = (r, f) => (r ? f(r) : '–');
   rows.push(['Size', cell(a, (r) => `${r.w}x${r.h}`), cell(b, (r) => `${r.w}x${r.h}`)]);
   rows.push(['Prepare', cell(a, (r) => ms(r.prepMs)), cell(b, (r) => ms(r.prepMs))]);
   rows.push(['Extract', cell(a, (r) => ms(r.extractMs)), cell(b, (r) => ms(r.extractMs))]);
+  if (raco && (a?.detected || b?.detected))
+    rows.push(['Detected', cell(a, (r) => r.detected ?? r.n), cell(b, (r) => r.detected ?? r.n)]);
   rows.push(['Keypoints', cell(a, (r) => r.n), cell(b, (r) => r.n)]);
   const tbody = $('times').tBodies[0];
   tbody.replaceChildren(...rows.map(([k, x, y]) => tr([k, x, y])));
@@ -250,11 +308,15 @@ function renderStats() {
   if (state.firstMs != null) tbody.append(tr(['First run (compiles shaders)', ms(state.firstMs)], true));
 
   const env = state.env;
+  const selection = raco
+    ? `the best ${s.topK} by detection score` + (s.rankKeep > 0 ? `, then the best ${s.rankKeep} by ranker score` : '')
+    : s.mode === 'topk' ? `the best ${s.topK}` : `score above ${s.th.toFixed(2)}, at most ${s.cap}`;
   const kv = [
+    ['Detector', raco ? 'RaCo, ALIKED descriptors' : 'ALIKED'],
     ['Backend', s.backend === 'webgpu' ? 'WebGPU' : 'CPU (WebAssembly, one thread)'],
     ['GPU', env?.webgpu ? env.adapter : 'no WebGPU adapter'],
-    ['Precision', s.precision.toUpperCase()],
-    ['Selection', s.mode === 'topk' ? `the best ${s.topK}` : `score above ${s.th.toFixed(2)}, at most ${s.cap}`],
+    ['Precision', raco ? 'FP32' : s.precision.toUpperCase()],
+    ['Selection', selection],
     ['Descriptors', a ? `${a.dim} floats, L2-normalized` : '–'],
     ['Matches', m ? `${m.sims.length}, ratio ${s.ratio >= 1 ? 'off' : s.ratio.toFixed(2)}` : '–'],
   ];
@@ -296,6 +358,7 @@ function showBanner(text, kind = '') {
 function setImage(i, bitmap, name) {
   state.images[i] = { bitmap, name };
   state.results[i] = null;
+  state.shown[i] = null;
   state.matches = null;
   const slot = document.querySelector(`.slot[data-slot="${i}"]`);
   const { w, h } = sourceSize(bitmap);
@@ -360,12 +423,20 @@ function wire() {
   out('th', (v) => v.toFixed(2));
   out('cap', (v) => v);
   out('ratio', (v) => (v >= 1 ? 'off' : v.toFixed(2)));
+  out('rank', (v) => (v > 0 ? v : 'all'));
+
+  for (const r of document.querySelectorAll('input[name="det"]')) {
+    r.addEventListener('change', () => {
+      syncControls();
+      request('extract');
+    });
+  }
+  $('rank').addEventListener('change', () => request('match'));
+  $('cov').addEventListener('change', () => request('draw'));
 
   for (const r of document.querySelectorAll('input[name="mode"]')) {
     r.addEventListener('change', () => {
-      const topk = settings().mode === 'topk';
-      $('f-topk').hidden = !topk;
-      $('f-th').hidden = topk;
+      syncControls();
       request('extract');
     });
   }
@@ -375,8 +446,7 @@ function wire() {
     r.addEventListener('change', () => {
       const s = settings();
       if (s.backend === 'cpu' && (s.res === 0 || s.res > 640)) $('res').value = '640';
-      if (s.backend === 'cpu') document.querySelector('input[name="prec"][value="fp32"]').checked = true;
-      document.querySelector('input[name="prec"][value="fp16"]').disabled = s.backend === 'cpu' || !state.env.f16;
+      syncControls();
       request('extract');
     });
   }
@@ -421,6 +491,27 @@ function wire() {
   new ResizeObserver(() => draw()).observe(stage);
 }
 
+// Controls that depend on the detector, backend and selection mode.
+function syncControls() {
+  const s = settings(), raco = s.detector === 'raco';
+  $('f-mode').hidden = raco;
+  $('f-topk').hidden = !raco && s.mode !== 'topk';
+  $('f-th').hidden = raco || s.mode === 'topk';
+  $('f-rank').hidden = !raco;
+  $('topk-l').textContent = raco ? 'Detected per image' : 'Keypoints per image';
+  $('cov').disabled = !raco;
+  $('det-hint').textContent = raco
+    ? 'RaCo detects keypoints and adds a ranker score and a covariance to each; ALIKED describes them for ' +
+      'matching. Two networks per image, FP32 only.'
+    : 'ALIKED detects and describes keypoints in one network.';
+  $('backend-hint').textContent = raco
+    ? 'The CPU backend runs in WebAssembly on one thread: RaCo with descriptors takes about 12 s per 640x480 image.'
+    : 'The CPU backend runs in WebAssembly on one thread: about a second per 640x480 image.';
+  const fp16 = document.querySelector('input[name="prec"][value="fp16"]');
+  fp16.disabled = raco || s.backend === 'cpu' || !state.env?.f16 || !state.env?.webgpu;
+  if (fp16.disabled) document.querySelector('input[name="prec"][value="fp32"]').checked = true;
+}
+
 async function main() {
   wire();
   const env = state.env = await environment();
@@ -446,6 +537,7 @@ async function main() {
       ? 'This GPU adapter has no shader-f16 feature, so FP16 is not available. FP32 matches the original network.'
       : 'FP16 needs WebGPU with the shader-f16 feature. FP32 matches the original network.';
   }
+  syncControls();
   busy('Loading the module…');
   await Promise.all([jkp.module(), weights(), loadPair('tum')]);
   request('extract');

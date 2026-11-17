@@ -21,6 +21,9 @@
 // Keypoint selection (threshold, top-k, compaction, ordering) runs on the device; only the selected
 // keypoints and their descriptors are copied back to the host.
 //
+// RaCo (normalize, pad_reflect, detect_raco) is ported from the CPU backend as on Metal (R5);
+// detect_raco reuses the device-side top-k selection of detect (Selection).
+//
 // Profiling: with JKP_CUDA_PROFILE=1 in the environment every kernel launch is followed by a device
 // synchronization and its time is recorded under the operation that issued it; the table goes to stderr
 // when the backend is destroyed. Total times are meaningless in that mode, times per launch are not.
@@ -28,6 +31,7 @@
 #include <cuda_runtime.h>
 
 #include <algorithm>
+#include <cfloat>
 #include <chrono>
 #include <climits>
 #include <cstdarg>
@@ -742,6 +746,140 @@ __global__ void k_sddh_sample_pyramid(const R* p0, const R* p1, const R* p2, con
 }
 
 // ---------------------------------------------------------------------------------------------
+// RaCo kernels (normalize, pad_reflect, detect_raco). Same float32 steps as the CPU backend, except
+// that the softmax sum is a double sum in blocks instead of a double sum in raster order.
+// ---------------------------------------------------------------------------------------------
+
+// (x - mean[c]) / std[c]; ms holds the c means, then the c standard deviations.
+template <typename R>
+__global__ void k_normalize(const R* x, int c, int hw, const float* ms, R* out) {
+  int i = thread_index();
+  if (i >= c * hw) return;
+  int ch = i / hw;
+  st(out + i, (ld(x[i]) - ms[ch]) / ms[c + ch]);
+}
+
+// Mirror padding by p on every side, without repeating the border pixel (PyTorch "reflect").
+__device__ __forceinline__ int mirror(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * (n - 1) - i : i); }
+template <typename R>
+__global__ void k_pad_reflect(const R* src, int c, int h, int w, int p, R* dst) {
+  const int oh = h + 2 * p, ow = w + 2 * p, ohw = oh * ow;
+  int i = thread_index();
+  if (i >= c * ohw) return;
+  int ch = i / ohw, y = (i % ohw) / ow, x = i % ow;
+  dst[i] = src[(static_cast<size_t>(ch) * h + mirror(y - p, h)) * w + mirror(x - p, w)];
+}
+
+// Softmax over the whole map: block maxima, the maximum (stats[0]); block sums of exp(l - max) in double,
+// their sum as float (stats[1]); then the probabilities. One thread per block of kScanBlock elements for
+// the block steps, one thread for the reductions. The double sums keep the result as close to the CPU
+// backend's raster-order double sum as float32 can show.
+template <typename R>
+__global__ void k_softmax_block_max(const R* l, int n, float* partial) {
+  int b = thread_index(), begin = b * kScanBlock;
+  if (begin >= n) return;
+  int end = min(n, begin + kScanBlock);
+  float m = ld(l[begin]);
+  for (int i = begin + 1; i < end; ++i) m = fmaxf(m, ld(l[i]));
+  partial[b] = m;
+}
+__global__ void k_softmax_max(const float* partial, int blocks, float* stats) {
+  if (thread_index() != 0) return;
+  float m = partial[0];
+  for (int b = 1; b < blocks; ++b) m = fmaxf(m, partial[b]);
+  stats[0] = m;
+}
+template <typename R>
+__global__ void k_softmax_block_sum(const R* l, int n, const float* stats, double* partial) {
+  int b = thread_index(), begin = b * kScanBlock;
+  if (begin >= n) return;
+  int end = min(n, begin + kScanBlock);
+  const float m = stats[0];
+  double sum = 0;
+  for (int i = begin; i < end; ++i) sum += static_cast<double>(expf(ld(l[i]) - m));
+  partial[b] = sum;
+}
+__global__ void k_softmax_sum(const double* partial, int blocks, float* stats) {
+  if (thread_index() != 0) return;
+  double sum = 0;
+  for (int b = 0; b < blocks; ++b) sum += partial[b];
+  stats[1] = static_cast<float>(sum);
+}
+template <typename R>
+__global__ void k_softmax_prob(const R* l, int n, const float* stats, float* prob) {
+  int i = thread_index();
+  if (i >= n) return;
+  prob[i] = expf(ld(l[i]) - stats[0]) / stats[1];
+}
+
+// nms = probability where it equals the maximum of its window, zero elsewhere (no border exclusion).
+// Probabilities below FLT_MIN are not maxima, as on the CPU: GPUs may flush them to zero.
+__global__ void k_raco_nms(const float* prob, const float* pooled, int n, float* nms) {
+  int i = thread_index();
+  if (i >= n) return;
+  nms[i] = prob[i] == pooled[i] && prob[i] >= FLT_MIN ? prob[i] : 0.0f;
+}
+
+// log(1 + exp(x)); linear above 20 as in PyTorch.
+__device__ __forceinline__ float softplus(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
+
+// Subpixel refinement and sampling, one thread per keypoint: softmax of logit / temperature in the k x k
+// window (outside the map counts as logit 0), expected offset; then bilinear samples at the refined
+// position, clamped to the map, of the probabilities, the ranker map and the Cholesky map (softplus on
+// channels 0 and 2 at each of the four neighbours). ranker and chol may be null.
+template <typename R>
+__global__ void k_raco_refine(const R* logits, const float* prob, const R* ranker, const R* chol, int w, int h,
+                              const int* idx, int n, int k, float temperature, float* xy_out, float* score,
+                              float* rank, float* chol_out) {
+  int i = thread_index();
+  if (i >= n) return;
+  const int r = k / 2, x = idx[i] % w, y = idx[i] / w;
+  float patch[81], max_v = -INFINITY;
+  for (int dy = -r; dy <= r; ++dy)
+    for (int dx = -r; dx <= r; ++dx) {
+      int px = x + dx, py = y + dy;
+      float v = ((px >= 0 && px < w && py >= 0 && py < h) ? ld(logits[py * w + px]) : 0.0f) / temperature;
+      patch[(dy + r) * k + dx + r] = v;
+      max_v = fmaxf(max_v, v);
+    }
+  float psum = 0, sx = 0, sy = 0;
+  for (int j = 0; j < k * k; ++j) {
+    patch[j] = expf(patch[j] - max_v);
+    psum += patch[j];
+  }
+  for (int j = 0; j < k * k; ++j) {
+    const float p = patch[j] / psum;
+    sx += p * static_cast<float>(j % k - r);
+    sy += p * static_cast<float>(j / k - r);
+  }
+  const float xy[2] = {static_cast<float>(x) + sx, static_cast<float>(y) + sy};
+  xy_out[2 * i] = xy[0];
+  xy_out[2 * i + 1] = xy[1];
+
+  // grid_sample, padding_mode = border, align_corners = true: normalize to [-1, 1], map back, clamp.
+  const float wh[2] = {static_cast<float>(w - 1), static_cast<float>(h - 1)};
+  float g[2];
+  for (int a = 0; a < 2; ++a) {
+    g[a] = wh[a] > 0 ? ((2.0f * xy[a] / wh[a] - 1.0f) + 1.0f) / 2.0f * wh[a] : 0.0f;
+    g[a] = fminf(wh[a], fmaxf(g[a], 0.0f));
+  }
+  int bi[4];
+  float bw[4];
+  bilinear_setup(g[0], g[1], w, h, bi, bw);
+  score[i] = bilinear_apply(prob, bi, bw);
+  if (ranker) rank[i] = bilinear_apply(ranker, bi, bw);
+  if (chol) {
+    const int hw = w * h;
+    for (int c = 0; c < 3; ++c) {
+      const R* plane = chol + static_cast<size_t>(c) * hw;
+      float v[4];
+      for (int j = 0; j < 4; ++j) v[j] = c == 1 ? ld(plane[bi[j]]) : softplus(ld(plane[bi[j]]));
+      chol_out[3 * i + c] = bw[0] * v[0] + bw[1] * v[1] + bw[2] * v[2] + bw[3] * v[3];
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------------------------
 // Host side
 // ---------------------------------------------------------------------------------------------
 
@@ -883,6 +1021,62 @@ class Buffer {
   PoolPtr pool_;
   size_t n_;
   T* p_;
+};
+
+// Ordered selection on a device map of n non-negative floats. Counting is a round trip to the host.
+class Selection {
+ public:
+  Selection(const PoolPtr& pool, const float* v, int n)
+      : pool_(pool), v_(v), n_(n), blocks_((n + kScanBlock - 1) / kScanBlock), offsets_(pool, static_cast<size_t>(blocks_) + 1) {}
+
+  // Number of {v `mode` th}; leaves the per-block offsets for write().
+  int count(int mode, float th) {
+    launch(k_select_count, blocks_, v_, n_, mode, th, offsets_.get());
+    launch(k_select_scan, 1, offsets_.get(), blocks_);
+    unsigned total = 0;
+    JKP_CUDA_CHECK(cudaMemcpy(&total, offsets_.get() + blocks_, sizeof(total), cudaMemcpyDeviceToHost));
+    return static_cast<int>(total);
+  }
+  // Writes the first `limit` of that set in raster order; must follow the matching count().
+  void write(int mode, float th, int limit, int* dst) {
+    launch(k_select_write, blocks_, v_, n_, mode, th, offsets_.get(), static_cast<unsigned>(limit), dst);
+  }
+  // Indices of the `best` (<= n) highest values, best first, ties in raster order.
+  void top(int best, int* dst) {
+    // Radix select for the value of the `best`-th highest, 16 bits of the float bits per pass (each pass
+    // is a round trip to the host).
+    const int bins = 65536;
+    Buffer<unsigned> hist_dev(pool_, bins);
+    std::vector<unsigned> hist(bins);
+    unsigned prefix = 0, mask = 0;
+    int remaining = best;  // how many are still needed from the values matching the prefix
+    for (int shift = 16; shift >= 0; shift -= 16) {
+      JKP_CUDA_CHECK(cudaMemset(hist_dev.get(), 0, bins * sizeof(unsigned)));
+      launch(k_histogram, n_, v_, n_, mask, prefix, shift, hist_dev.get());
+      hist_dev.download(hist.data(), bins);
+      int bin = bins - 1;
+      for (; bin > 0 && static_cast<long long>(hist[bin]) < remaining; --bin) remaining -= static_cast<int>(hist[bin]);
+      prefix |= static_cast<unsigned>(bin) << shift;
+      mask |= 65535u << shift;
+    }
+    float kth;
+    std::memcpy(&kth, &prefix, sizeof(kth));
+    // Everything above that value, then the first `remaining` equal to it in raster order.
+    const int above = best - remaining;
+    Buffer<int> unsorted(pool_, best);
+    if (count(kGreater, kth) != above) throw std::runtime_error("cuda: top-k selection is inconsistent");
+    write(kGreater, kth, above, unsorted.get());
+    count(kEqual, kth);
+    write(kEqual, kth, remaining, unsorted.get() + above);
+    g_profile.tag("rank sort");
+    launch(k_rank_sort, best, v_, unsorted.get(), best, dst);
+  }
+
+ private:
+  PoolPtr pool_;
+  const float* v_;
+  int n_, blocks_;
+  Buffer<unsigned> offsets_;
 };
 
 struct CudaTensor;
@@ -1062,15 +1256,18 @@ class CudaOps : public Ops {
       if (t == 4) launch(k_conv1x1_pyramid<R, R, 4>, threads, p0, p1, p2, p3, args, w, b, cout, a, o);
       else if (t == 8) launch(k_conv1x1_pyramid<R, R, 8>, threads, p0, p1, p2, p3, args, w, b, cout, a, o);
       else launch(k_conv1x1_pyramid<R, R, 16>, threads, p0, p1, p2, p3, args, w, b, cout, a, o);
-    } else if (k == 1 || k == 3) {
+    } else if (k == 1 || k == 3 || k == 5) {  // 5: RaCo's ranker output
       const R* w = param_tiled(weight, t);
       const R* in = x.as<R>();
       if (k == 1 && t == 4) launch(k_conv2d_tile<R, R, 4, 1>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
       else if (k == 1 && t == 8) launch(k_conv2d_tile<R, R, 8, 1>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
       else if (k == 1) launch(k_conv2d_tile<R, R, 16, 1>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
-      else if (t == 4) launch(k_conv2d_tile<R, R, 4, 3>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
-      else if (t == 8) launch(k_conv2d_tile<R, R, 8, 3>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
-      else launch(k_conv2d_tile<R, R, 16, 3>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else if (k == 3 && t == 4) launch(k_conv2d_tile<R, R, 4, 3>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else if (k == 3 && t == 8) launch(k_conv2d_tile<R, R, 8, 3>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else if (k == 3) launch(k_conv2d_tile<R, R, 16, 3>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else if (t == 4) launch(k_conv2d_tile<R, R, 4, 5>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else if (t == 8) launch(k_conv2d_tile<R, R, 8, 5>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
+      else launch(k_conv2d_tile<R, R, 16, 5>, threads, in, w, b, cin, cout, x.h, x.w, a, o);
     } else {
       launch(k_conv2d<R>, out->size(), x.as<R>(), param(weight), b, cin, cout, x.h, x.w, k, a, o);
     }
@@ -1216,34 +1413,20 @@ class CudaOps : public Ops {
 
     // Selection, on the device. `idx` receives the pixel indices of the keypoints in output order.
     g_profile.tag("detect select");
-    const int blocks = (n + kScanBlock - 1) / kScanBlock;
-    Buffer<unsigned> offsets(pool_, static_cast<size_t>(blocks) + 1);
-    // Counts {nms `mode` th} and leaves the per-block offsets in `offsets`.
-    auto select_count = [&](int mode, float th) {
-      launch(k_select_count, blocks, nms.get(), n, mode, th, offsets.get());
-      launch(k_select_scan, 1, offsets.get(), blocks);
-      unsigned total = 0;
-      JKP_CUDA_CHECK(cudaMemcpy(&total, offsets.get() + blocks, sizeof(total), cudaMemcpyDeviceToHost));
-      return static_cast<int>(total);
-    };
-    // Writes the first `limit` of that set in raster order; must follow the matching select_count.
-    auto select_write = [&](int mode, float th, int limit, int* dst) {
-      launch(k_select_write, blocks, nms.get(), n, mode, th, offsets.get(), static_cast<unsigned>(limit), dst);
-    };
-
+    Selection select(pool_, nms.get(), n);
     int kept = 0;         // number of keypoints
     int best = -1;        // >= 0: keep the `best` highest scores, best first
     float threshold = 0;  // otherwise: keep nms > threshold, in raster order
     if (params.top_k > 0) {
       best = std::min(params.top_k, n);
     } else {
-      int passing = params.scores_th > 0 ? select_count(kGreater, threshold = params.scores_th) : 0;
+      int passing = params.scores_th > 0 ? select.count(kGreater, threshold = params.scores_th) : 0;
       if (passing == 0) {  // fall back to the mean score
         Buffer<float> sum(pool_, 1);
         launch(k_sum_sequential, 1, s, n, sum.get());
         float total = 0;
         sum.download(&total, 1);
-        passing = select_count(kGreater, threshold = total / static_cast<float>(n));
+        passing = select.count(kGreater, threshold = total / static_cast<float>(n));
       }
       if (passing > params.n_limit) best = std::max(0, params.n_limit);
       else kept = passing;
@@ -1252,37 +1435,8 @@ class CudaOps : public Ops {
     if (kept == 0) return;
 
     Buffer<int> idx(pool_, kept);
-    if (best < 0) {
-      select_write(kGreater, threshold, kept, idx.get());
-    } else {
-      // Radix select for the value of the `best`-th highest score, 16 bits of the float bits per pass
-      // (each pass is a round trip to the host).
-      const int bins = 65536;
-      Buffer<unsigned> hist_dev(pool_, bins);
-      std::vector<unsigned> hist(bins);
-      unsigned prefix = 0, mask = 0;
-      int remaining = best;  // how many are still needed from the values matching the prefix
-      for (int shift = 16; shift >= 0; shift -= 16) {
-        JKP_CUDA_CHECK(cudaMemset(hist_dev.get(), 0, bins * sizeof(unsigned)));
-        launch(k_histogram, n, nms.get(), n, mask, prefix, shift, hist_dev.get());
-        hist_dev.download(hist.data(), bins);
-        int bin = bins - 1;
-        for (; bin > 0 && static_cast<long long>(hist[bin]) < remaining; --bin) remaining -= static_cast<int>(hist[bin]);
-        prefix |= static_cast<unsigned>(bin) << shift;
-        mask |= 65535u << shift;
-      }
-      float kth;
-      std::memcpy(&kth, &prefix, sizeof(kth));
-      // Everything above that value, then the first `remaining` equal to it in raster order.
-      const int above = best - remaining;
-      Buffer<int> unsorted(pool_, kept);
-      if (select_count(kGreater, kth) != above) throw std::runtime_error("cuda: top-k selection is inconsistent");
-      select_write(kGreater, kth, above, unsorted.get());
-      select_count(kEqual, kth);
-      select_write(kEqual, kth, remaining, unsorted.get() + above);
-      g_profile.tag("detect rank sort");
-      launch(k_rank_sort, kept, nms.get(), unsorted.get(), kept, idx.get());
-    }
+    if (best < 0) select.write(kGreater, threshold, kept, idx.get());
+    else select.top(best, idx.get());
 
     // Refinement and readback of the kept keypoints only.
     Buffer<float> xy(pool_, 2 * static_cast<size_t>(kept)), score(pool_, kept);
@@ -1292,6 +1446,93 @@ class CudaOps : public Ops {
     out->score.resize(kept);
     xy.download(out->xy_norm.data(), out->xy_norm.size());
     score.download(out->score.data(), out->score.size());
+  }
+
+  TensorPtr normalize(const TensorPtr& xp, const float* mean, const float* std) override {
+    use();
+    const CudaTensor& x = dev(xp);
+    CudaPtr out = make(x.c, x.h, x.w);
+    std::vector<float> host(2 * static_cast<size_t>(x.c));
+    for (int c = 0; c < x.c; ++c) host[c] = mean[c], host[x.c + c] = std[c];
+    Buffer<float> ms(pool_, host.size());
+    ms.upload(host.data(), host.size());
+    g_profile.tag("normalize c%d %dx%d", x.c, x.w, x.h);
+    launch(k_normalize<R>, out->size(), x.as<R>(), x.c, x.h * x.w, ms.get(), out->template out<R>());
+    return out;
+  }
+
+  TensorPtr pad_reflect(const TensorPtr& xp, int p) override {
+    use();
+    const CudaTensor& x = dev(xp);
+    if (p < 0 || p >= x.h || p >= x.w) throw std::runtime_error("pad_reflect: padding does not fit the tensor");
+    CudaPtr out = make(x.c, x.h + 2 * p, x.w + 2 * p);
+    g_profile.tag("pad_reflect c%d %dx%d", x.c, out->w, out->h);
+    launch(k_pad_reflect<R>, out->size(), x.as<R>(), x.c, x.h, x.w, p, out->template out<R>());
+    return out;
+  }
+
+  void detect_raco(const TensorPtr& logits_p, const TensorPtr& ranker_map, const TensorPtr& cholesky_raw,
+                   const RacoDetectParams& params, RacoKeypoints* out) override {
+    use();
+    const CudaTensor& lm = dev(logits_p);
+    const int w = lm.w, h = lm.h, n = w * h, k = params.window, r = k / 2;
+    if (lm.c != 1 || k < 1 || k % 2 == 0 || k > 9) throw std::runtime_error("detect_raco: bad arguments");
+    if ((ranker_map && ranker_map->c != 1) || (cholesky_raw && cholesky_raw->c != 3))
+      throw std::runtime_error("detect_raco: bad arguments");
+    for (const TensorPtr& t : {ranker_map, cholesky_raw})
+      if (t && (t->w != w || t->h != h)) throw std::runtime_error("detect_raco: map size mismatch");
+    const R* logits = lm.as<R>();
+    const R* ranker = ranker_map ? dev(ranker_map).as<R>() : nullptr;
+    const R* chol = cholesky_raw ? dev(cholesky_raw).as<R>() : nullptr;
+    out->xy.clear(), out->score.clear(), out->rank.clear(), out->cholesky.clear();
+    if (n == 0) return;
+
+    // Probabilities: softmax over the whole image (stats: maximum logit, sum of the exponentials).
+    g_profile.tag("detect_raco softmax %dx%d", w, h);
+    const int blocks = (n + kScanBlock - 1) / kScanBlock;
+    Buffer<float> partial_max(pool_, blocks), stats(pool_, 2), prob(pool_, n), nms(pool_, n);
+    Buffer<double> partial_sum(pool_, blocks);
+    launch(k_softmax_block_max<R>, blocks, logits, n, partial_max.get());
+    launch(k_softmax_max, 1, partial_max.get(), blocks, stats.get());
+    launch(k_softmax_block_sum<R>, blocks, logits, n, stats.get(), partial_sum.get());
+    launch(k_softmax_sum, 1, partial_sum.get(), blocks, stats.get());
+    launch(k_softmax_prob<R>, n, logits, n, stats.get(), prob.get());
+
+    // Non-maximum suppression: keep pixels equal to the maximum of their window.
+    g_profile.tag("detect_raco nms %dx%d", w, h);
+    {
+      Buffer<float> tmp(pool_, n), pooled(pool_, n);
+      launch(k_max_filter, n, prob.get(), w, h, r, 0, tmp.get());
+      launch(k_max_filter, n, tmp.get(), w, h, r, 1, pooled.get());
+      launch(k_raco_nms, n, prob.get(), pooled.get(), n, nms.get());
+    }
+
+    // The best top_k of the maxima; suppressed pixels (zero) are not keypoints.
+    g_profile.tag("detect_raco select");
+    Selection select(pool_, nms.get(), n);
+    const int kept = std::min(std::max(params.top_k, 0), select.count(kGreater, 0.0f));
+    if (kept == 0) return;
+    Buffer<int> idx(pool_, kept);
+    select.top(kept, idx.get());
+
+    // Refinement and sampling of the kept keypoints only.
+    const size_t nk = static_cast<size_t>(kept);
+    Buffer<float> xy(pool_, 2 * nk), score(pool_, nk), rank(pool_, ranker ? nk : 0), cov(pool_, chol ? 3 * nk : 0);
+    g_profile.tag("detect_raco refine");
+    launch(k_raco_refine<R>, kept, logits, prob.get(), ranker, chol, w, h, idx.get(), kept, k, params.temperature,
+           xy.get(), score.get(), rank.get(), cov.get());
+    out->xy.resize(2 * nk);
+    out->score.resize(nk);
+    xy.download(out->xy.data(), out->xy.size());
+    score.download(out->score.data(), out->score.size());
+    if (ranker) {
+      out->rank.resize(nk);
+      rank.download(out->rank.data(), nk);
+    }
+    if (chol) {
+      out->cholesky.resize(3 * nk);
+      cov.download(out->cholesky.data(), 3 * nk);
+    }
   }
 
   void describe(const TensorPtr& feature_map, const Keypoints& kpts, const SddhParams& p,

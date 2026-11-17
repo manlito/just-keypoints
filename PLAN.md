@@ -209,7 +209,18 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
   by the original ALIKED, as `ALIKED.describe` in cvg/LightGlue does it): descriptor cosine >= 1 - 3.4e-9,
   the other bounds unchanged. CPU times for 640x470: 0.46 s RaCo alone, 0.53 s with descriptors,
   0.125 s without the covariance head, 0.055 s without covariance and ranker heads.
-- [ ] **R4 — RaCo on CUDA** (NVIDIA machine)
+- [x] **R4 — RaCo on CUDA** (NVIDIA machine)
+  `jkp extract image.png --model raco --backend cuda`, with `--descriptor aliked-n16` and the head switches.
+  Done (RTX 2070 Max-Q laptop, CUDA 13.4, driver 620.70), on the R1 image set (53 images), against the original
+  (PyTorch on the CPU): keypoint overlap >= 99.95 %, position error <= 2.4e-4 px, score error <= 5.6e-5 of the
+  best score, ranker error <= 6.3e-6 of the largest score, covariance error <= 1.4e-4 (relative); with ALIKED
+  descriptors, descriptor cosine >= 1 - 1.5e-9 and the other bounds unchanged (Metal in R5: 1.2e-4 px, 4.3e-5,
+  7.5e-6, 1.4e-4, 1 - 1.3e-9). The position bound is one float32 step at x > 2048 (`imw.png`, 2522 px wide);
+  every other image is within 1.2e-4 px. Every intermediate tensor of the three RaCo golden files matches within
+  1.3e-6 (relative); `cuda_raco_vs_cpu` pairs every keypoint one to one on all 13 cases (24,646 keypoints on the
+  largest), every stage within 2.0e-6; `ops_test` passes the RaCo operations in FP32 and FP16 storage.
+  FP32 only, as on the other backends. Not tuned: 89 ms at 640x480 and 626 ms at 1920x1080, 6-10 times ALIKED
+  on the same GPU (table in R6). See the notes from R4.
 - [x] **R5 — RaCo on Metal** (after M3)
   `jkp extract image.png --model raco --backend metal`, with `--descriptor aliked-n16` and the head switches.
   Done (M5 Pro, macOS 26), on the R1 image set (53 images, 501x380 to 2522x818), against the original:
@@ -239,29 +250,30 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
     agrees as closely (9 images; the 3-megapixel one does not fit its memory).
   - Speed, ms per image, same method as M5 (`tools/bench.py`: top-k 1000, FP32, median of 30 warm runs, median
     over 3 rounds, columns timed in turn; load average below 2, and ALIKED on Metal reproduces M5's numbers). CPU
-    backend: 3 runs, one round, all threads. CUDA has no RaCo yet (R4); its ALIKED column is M5's (RTX 2070).
+    backend: 3 runs, one round, all threads. CUDA: RTX 2070 Max-Q laptop; its ALIKED row is M5's, and R4
+    reproduced it within 3 % (15.3 / 19.9 / 27.4 / 60.8 ms) in the same run as its RaCo rows.
 
     | Size | Model | CPU | Metal | WebGPU | CUDA |
     |---|---|---|---|---|---|
     | 640x480 | ALIKED | 68 | 8.3 | 9.7 | 15.2 |
-    | | RaCo | 410 | 44.6 | 45.8 | |
-    | | RaCo + ALIKED descriptors | 465 | 51.2 | 52.7 | |
-    | | RaCo without covariance | 109 | 18.3 | 19.0 | |
+    | | RaCo | 410 | 44.6 | 45.8 | 89.1 |
+    | | RaCo + ALIKED descriptors | 465 | 51.2 | 52.7 | 103.2 |
+    | | RaCo without covariance | 109 | 18.3 | 19.0 | 30.9 |
     | 1241x376 | ALIKED | 101 | 10.3 | 12.4 | 19.6 |
-    | | RaCo | 649 | 67.4 | 69.6 | |
-    | | RaCo + ALIKED descriptors | 730 | 75.4 | 78.4 | |
-    | | RaCo without covariance | 167 | 26.0 | 27.6 | |
+    | | RaCo | 649 | 67.4 | 69.6 | 139.6 |
+    | | RaCo + ALIKED descriptors | 730 | 75.4 | 78.4 | 157.0 |
+    | | RaCo without covariance | 167 | 26.0 | 27.6 | 47.2 |
     | 1024x768 | ALIKED | 164 | 13.7 | 17.2 | 26.8 |
-    | | RaCo | 1080 | 109.0 | 112.7 | |
-    | | RaCo + ALIKED descriptors | 1211 | 119.7 | 124.6 | |
-    | | RaCo without covariance | 287 | 41.9 | 43.3 | |
+    | | RaCo | 1080 | 109.0 | 112.7 | 231.6 |
+    | | RaCo + ALIKED descriptors | 1211 | 119.7 | 124.6 | 254.4 |
+    | | RaCo without covariance | 287 | 41.9 | 43.3 | 77.6 |
     | 1920x1080 | ALIKED | 376 | 29.5 | 37.7 | 59.1 |
-    | | RaCo | 2732 | 286.1 | 295.2 | |
-    | | RaCo + ALIKED descriptors | 3050 | 308.9 | 319.0 | |
-    | | RaCo without covariance | 750 | 107.6 | 111.0 | |
+    | | RaCo | 2732 | 286.1 | 295.2 | 626.3 |
+    | | RaCo + ALIKED descriptors | 3050 | 308.9 | 319.0 | 675.6 |
+    | | RaCo without covariance | 750 | 107.6 | 111.0 | 207.7 |
 
     RaCo costs about 5 times ALIKED at 640x480 on the GPUs and 8-10 times at 1920x1080: its heads run at full
-    resolution. WebGPU is within 2-4 % of Metal on RaCo (15-28 % slower on ALIKED). An earlier run at 640x480
+    resolution (CUDA: 6 and 10 times). WebGPU is within 2-4 % of Metal on RaCo (15-28 % slower on ALIKED). An earlier run at 640x480
     with 2048 keypoints, under load: without both heads 8.3 ms on WebGPU and 8.1 ms on Metal. In Chrome with
     descriptors, top 2048, pane hidden: 56 ms at 640x480, 81 ms at 1241x376, 0.47 s at 2075x1491. The module's
     CPU backend (one thread) takes about 12 s at 640x480, against 1.1 s for ALIKED.
@@ -368,8 +380,9 @@ one app. just-ba already ships a WebGPU backend built this way (its document 16,
   selection of `detect` is shared with `detect_raco` (`Selection` in `metal_ops.mm`).
 - Done (R6): WebGPU, the same port (`Selection` in `webgpu_ops.cpp`, `k_conv2d_tile` with K = 5); the browser
   module takes RaCo weights and descriptor weights, the demo has the detector switch.
+- Done (R4): CUDA, the same port (`Selection` in `cuda_ops.cu`, `k_conv2d_tile` instantiated with K = 5).
 - **Exit:** RaCo keypoints, ranker scores and covariances match the original on every backend; RaCo + ALIKED
-  descriptors selectable in the demo.
+  descriptors selectable in the demo. Met with R4 (CPU, CUDA, Metal, WebGPU).
 
 ## RaCo
 
@@ -475,6 +488,28 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - The browser module's `jkpw_create` takes the descriptor weights and the head switches; results add `rank` and
   `cov` (null when absent). `web/test.html` has a RaCo run per backend (FP32 only), with test data from
   `tools/web_testdata.py` (`--raco-weights`, on by default).
+
+### Notes from R4
+
+- The CUDA kernels follow the CPU backend; the file is compiled with `--fmad=false`, as for ALIKED. The softmax
+  sum is in double (block sums of `expf(l - max)`, then their sum), closer to the CPU's raster-order double sum
+  than the compensated float sums of Metal and WebGPU, which have no double. Softplus uses `log1pf` as on the CPU.
+  NMS on the probabilities with the FLT_MIN rule of R5.
+- `Selection` (count, ordered write, radix select + rank sort) is now shared by `detect` and `detect_raco`, as on
+  Metal and WebGPU. ALIKED's results do not change: `jkp extract --backend cuda` output is byte-identical to the
+  M5 build on the 53 images, in threshold and top-k mode, FP32 and FP16 (212 runs).
+- 5x5 convolutions (the ranker output, 12 -> 1) use the tiled kernel; before R4 they would have fallen back to
+  the one-value-per-thread `k_conv2d`. Same accumulation order, so the same results.
+- `compare.py` against the original on the same GPU runs out of memory on the 3-megapixel images: PyTorch's
+  caching allocator keeps its blocks in the same process. The R4 numbers use the original on the CPU
+  (`--a upstream:cpu`). On its own, `nvidia-smi` shows at most 6.1 GB at 2522x818 and 7.4 GB at 2075x1491 (with
+  ALIKED descriptors) on the 8 GB card. That includes blocks the pool keeps for reuse, which it frees and
+  retries when an allocation fails, but full-resolution 128-channel tensors are 1.6 GB each at that size, so
+  on an 8 GB card RaCo at 3 megapixels needs the GPU mostly to itself.
+- Speed (`JKP_CUDA_PROFILE=1`, 640x480, 98 ms of kernel time): the covariance head is 64 % (its 128 -> 64
+  convolution alone 43 ms, about 1 TFLOP/s without fused multiply-add), the ranker head 21 %, `detect_raco`
+  about 1 ms. CUDA takes about twice Metal's time on RaCo, as on ALIKED in FP32 (15.2 against 8.3 ms): the
+  same untuned full-resolution convolutions on a smaller GPU.
 
 ## Development machines
 

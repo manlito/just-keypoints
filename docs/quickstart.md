@@ -84,4 +84,4 @@ A build that embeds only ALIKED (`JKP_EMBED_MODELS=aliked-n16`) needs `--weights
 
 In the C API: `config.model = "raco"`, and `config.descriptor = "aliked-n16"` to describe its keypoints with
 ALIKED. `skip_ranker` and `skip_covariance` leave out a head; the covariance head is about three quarters of the
-run time.
+run time on the CPU and more than half on Metal.

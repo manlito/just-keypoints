@@ -224,31 +224,37 @@ int main(int argc, char** argv) {
       const jkp::Param& bl = rp.make({32}, 0.2f);
       both("conv3x3 16->32 leaky_relu", [&](jkp::Ops& o, int b) { return o.conv2d(f16[b], wl, &bl, jkp::Act::LeakyRelu); });
 
-      // Logits with a few peaks, a ranker map, raw Cholesky elements; and a flat map where every pixel ties.
+      // Logits with a few peaks, a ranker map, raw Cholesky elements; a flat map where every pixel ties; and a
+      // wide map whose logits span far more than 87, so that many probabilities are below FLT_MIN.
       const jkp::Param& wlog = rp.make({1, 16, 3, 3}, 1.5f);
+      const jkp::Param& wwide = rp.make({1, 16, 3, 3}, 8.0f);
       const jkp::Param& wzero = rp.make({1, 16, 3, 3}, 0.0f);
       const jkp::Param& wrank = rp.make({1, 16, 3, 3}, 0.5f);
       const jkp::Param& wchol = rp.make({3, 16, 1, 1}, 2.0f);
-      jkp::TensorPtr logits[2], flat[2], ranker[2], chol[2];
+      jkp::TensorPtr logits[2], flat[2], wide[2], ranker[2], chol[2];
       for (int b = 0; b < 2; ++b) {
         logits[b] = ops[b]->conv2d(f16[b], wlog, &bs, jkp::Act::None);
+        wide[b] = ops[b]->conv2d(f16[b], wwide, &bs, jkp::Act::None);
         flat[b] = ops[b]->conv2d(f16[b], wzero, &bs, jkp::Act::None);
         ranker[b] = ops[b]->conv2d(f16[b], wrank, &bs, jkp::Act::None);
         chol[b] = ops[b]->conv2d(f16[b], wchol, nullptr, jkp::Act::None);
       }
       check("raco logits", logits[0], logits[1]);
-      // Scores are probabilities over the whole map: compared relative to the best one.
-      auto relative = [](std::vector<float> v) {
+      // Scores are probabilities over the whole map: both compared relative to the CPU's best one, so that a
+      // wrong normalization on the GPU shows.
+      auto relative = [](std::vector<float> v, const std::vector<float>& ref) {
         float m = 0;
-        for (float x : v) m = std::fmax(m, x);
+        for (float x : ref) m = std::fmax(m, x);
         for (float& x : v) x /= m > 0 ? m : 1.0f;
         return v;
       };
-      for (int flat_map : {0, 1})
+      const char* map_names[3] = {"", "flat ", "wide "};
+      jkp::TensorPtr* maps_by_kind[3] = {logits, flat, wide};
+      for (int kind : {0, 1, 2})
         for (int top_k : {40, 100000})
           for (int window : {3, 5})
             for (bool maps : {true, false}) {
-              if (flat_map && (window == 5 || !maps)) continue;
+              if (kind > 0 && (window == 5 || !maps)) continue;
               // FP16 logits tie where float32 ones do not, so the set of all local maxima differs; only
               // the clear peaks of the top-40 cases are comparable.
               if (g_tol > 1e-3 && top_k > 40) continue;
@@ -256,13 +262,13 @@ int main(int argc, char** argv) {
               dp.top_k = top_k, dp.window = window;
               jkp::RacoKeypoints kp[2];
               for (int b = 0; b < 2; ++b)
-                ops[b]->detect_raco(flat_map ? flat[b] : logits[b], maps ? ranker[b] : nullptr, maps ? chol[b] : nullptr,
-                                    dp, &kp[b]);
-              const std::string mode = std::string("detect_raco ") + (flat_map ? "flat " : "") + "top-" +
+                ops[b]->detect_raco(maps_by_kind[kind][b], maps ? ranker[b] : nullptr, maps ? chol[b] : nullptr, dp,
+                                    &kp[b]);
+              const std::string mode = std::string("detect_raco ") + map_names[kind] + "top-" +
                                        std::to_string(top_k) + " " + std::to_string(window) + "x" +
                                        std::to_string(window) + (maps ? "" : " no maps");
               check_vec(mode + " positions", kp[0].xy, kp[1].xy);
-              check_vec(mode + " scores", relative(kp[0].score), relative(kp[1].score));
+              check_vec(mode + " scores", relative(kp[0].score, kp[0].score), relative(kp[1].score, kp[0].score));
               if (maps) {
                 check_vec(mode + " ranker", kp[0].rank, kp[1].rank);
                 check_vec(mode + " cholesky", kp[0].cholesky, kp[1].cholesky);

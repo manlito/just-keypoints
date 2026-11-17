@@ -210,7 +210,8 @@ class Context {
 
   bool fp16() const { return fp16_; }
 
-  // Device copy of a weight tensor, made on first use. Weights outlive the backend (see jkp_ctx).
+  // Device copy of a weight tensor, made on first use and cached by its host address, so weights must stay
+  // alive and unchanged for the backend's lifetime (see jkp_ctx).
   // param: in the kernels' storage type (`real`); param_f32: always float.
   View param(const Param& p) { return param(p, fp16_); }
   View param_f32(const Param& p) { return param(p, false); }
@@ -833,9 +834,10 @@ class MetalOps : public Ops {
     Buffer<int> idx(ctx_, kept);
     select.top(kept, idx.view());
 
-    // Refinement and sampling of the kept keypoints only. A missing map binds the logits as a dummy.
-    Buffer<float> xy(ctx_, 2 * static_cast<size_t>(kept)), score(ctx_, kept), rank(ctx_, kept),
-        chol(ctx_, 3 * static_cast<size_t>(kept));
+    // Refinement and sampling of the kept keypoints only. A missing map binds the logits as a dummy input
+    // and a one-element dummy output.
+    Buffer<float> xy(ctx_, 2 * static_cast<size_t>(kept)), score(ctx_, kept), rank(ctx_, ranker_map ? kept : 1),
+        chol(ctx_, cholesky_raw ? 3 * static_cast<size_t>(kept) : 1);
     const View ranker = ranker_map ? dev(ranker_map).d() : lm.d();
     const View cholesky = cholesky_raw ? dev(cholesky_raw).d() : lm.d();
     ctx_->run("k_raco_refine", kept, lm.d(), prob.view(), ranker, cholesky, ranker_map ? 1 : 0, cholesky_raw ? 1 : 0, w, h,

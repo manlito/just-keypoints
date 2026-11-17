@@ -159,7 +159,7 @@ python tools/compare.py --model raco image.png --b "cmd:build/release/jkp extrac
 
 Add `--descriptor aliked-n16` (C API: `config.descriptor`) to get ALIKED descriptors for the RaCo keypoints;
 this runs both networks. `--no-covariance` and `--no-ranker` (`skip_covariance`, `skip_ranker`) leave out a head:
-the covariance head is about three quarters of the run time.
+the covariance head is about three quarters of the run time on the CPU and more than half on Metal.
 
 The default build embeds both models; with `-DJKP_EMBED_MODELS=aliked-n16` (RaCo adds ~2 MB) pass
 `--weights weights/raco.jkpw` instead. RaCo runs in FP32 only.

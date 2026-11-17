@@ -3,6 +3,7 @@
 //   backend_test WEIGHTS.jkpw cuda|metal|webgpu
 // Needs no golden files. The CPU backend is itself checked against the original by golden_test and
 // raco_golden_test. With raco.jkpw it runs the RaCo graph instead of ALIKED.
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -103,9 +104,11 @@ int run_raco(const jkp::Weights& weights, const std::string& backend) {
       {"no ranker", 203, 157, 3, 0, 0, false, true, false},
       {"no covariance", 203, 157, 3, 0, 0, true, false, false},
       {"detector only", 203, 157, 3, 0, 0, false, false, false},
-      {"flat image", 150, 100, 3, 0, 500, true, true, true},
+      // Not flat for the network: the border padding breaks the ties (ops_test covers a flat logit map).
+      {"uniform gray image", 150, 100, 3, 0, 500, true, true, true},
       {"tiny image", 9, 7, 3, 0, 0, true, true, false},
-      {"large", 1024, 768, 3, 0, 5000, true, true, false},
+      {"large, cut at top-k", 1024, 768, 3, 0, 5000, true, true, false},
+      {"large, every maximum", 1024, 768, 3, 0, 100000, true, true, false},
   };
   jkp::Raco model(weights);
   auto cpu = jkp::make_cpu_ops(0);
@@ -131,21 +134,30 @@ int run_raco(const jkp::Weights& weights, const std::string& backend) {
     for (const auto& stage : r[0].stages)
       worst = std::fmax(worst, compare_rel(stage.first.c_str(), stage.second, r[1].stages[stage.first], 1e-5, false));
     // Keypoints are ordered by score, and scores that differ by float32 rounding swap places (or fall on
-    // the other side of the top-k cut). So pair each CPU keypoint with the GPU keypoint nearest to it.
+    // the other side of the top-k cut). So pair each CPU keypoint with the nearest unused GPU keypoint.
+    // Without a cut (fewer maxima than top_k) every keypoint must pair; with one, a keypoint may lack a
+    // partner only among the last ones of its list, where it ties with the cut.
     const jkp::Features &a = r[0].out, &g = r[1].out;
-    jkp::Features pa, pg;  // paired, in the CPU's order
-    int unpaired = 0;
+    const int top_k = c.top_k > 0 ? c.top_k : weights.meta_int("top_k");
+    const bool cut = a.n >= top_k;
+    const int tail = std::max(2, a.n / 500);  // 0.2 %
+    jkp::Features pa, pg;                    // paired, in the CPU's order
+    std::vector<char> used(g.n, 0);
+    int unpaired = 0, misplaced = 0;
     for (int i = 0; i < a.n; ++i) {
       int best = -1;
       double best_d = 0.01;  // within 0.1 px
       for (int j = 0; j < g.n; ++j) {
+        if (used[j]) continue;
         const double dx = g.xy[2 * j] - a.xy[2 * i], dy = g.xy[2 * j + 1] - a.xy[2 * i + 1];
         if (dx * dx + dy * dy < best_d) best_d = dx * dx + dy * dy, best = j;
       }
       if (best < 0) {
         ++unpaired;
+        misplaced += !cut || i < a.n - tail;
         continue;
       }
+      used[best] = 1;
       for (const auto& pair : {std::make_pair(&a, i), std::make_pair(&g, best)}) {
         const jkp::Features& f = *pair.first;
         jkp::Features& p = pair.first == &a ? pa : pg;
@@ -156,14 +168,17 @@ int run_raco(const jkp::Weights& weights, const std::string& backend) {
         if (!f.cov.empty()) p.cov.insert(p.cov.end(), &f.cov[4 * k], &f.cov[4 * k] + 4);
       }
     }
-    if (a.n != g.n || unpaired * 500 > a.n) {  // at most 0.2 % at the cut
-      std::printf("    %-12s FAIL (%d unpaired of %d)\n", "selection", unpaired, a.n);
+    for (int j = 0; j < g.n; ++j) misplaced += !used[j] && (!cut || j < g.n - tail);
+    if (a.n != g.n || misplaced > 0) {
+      std::printf("    %-12s FAIL (%d unpaired of %d, %d not at the cut)\n", "selection", unpaired, a.n, misplaced);
       ++g_failed;
     }
+    // Scores, ranker and covariances are bilinear samples at the refined position, so position differences
+    // of ~1e-4 px move them by more than the maps differ.
     const double dxy = compare("keypoints", pa.xy, pg.xy, 1e-3, false);
-    const double dscore = compare_rel("scores", pa.score, pg.score, 1e-5, false);
-    const double drank = compare_rel("ranker", pa.rank, pg.rank, 1e-5, false);
-    const double dcov = compare_rel("covariances", pa.cov, pg.cov, 1e-5, false);
+    const double dscore = compare_rel("scores", pa.score, pg.score, 1e-4, false);
+    const double drank = compare_rel("ranker", pa.rank, pg.rank, 1e-4, false);
+    const double dcov = compare_rel("covariances", pa.cov, pg.cov, 1e-4, false);
     std::printf("    %s  %d unpaired; stages %.1e, position %.1e px, score %.1e, ranker %.1e, covariance %.1e"
                 " (relative but position)\n",
                 g_failed == before ? "ok  " : "FAIL", unpaired, worst, dxy, dscore, drank, dcov);

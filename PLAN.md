@@ -220,13 +220,9 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
   1.3e-6 (relative); against the CPU backend on generated images (`metal_raco_vs_cpu`) every stage is within
   2.3e-6 and the keypoint sets are identical.
   FP32 only, like the CPU backend (the API refuses `precision = fp16` for RaCo; see the notes from R5).
-  Not tuned. Minimum of 10 warm runs, taken while other jobs loaded the machine (ALIKED top-k 2048 measured
-  alongside: 10.8 ms at 640x470, 35.5 ms at 2522x818, against 8.3 ms at 640x480 in M5):
-
-  | Size | full | no covariance | no covariance, no ranker | + ALIKED descriptors | CPU, full |
-  |---|---|---|---|---|---|
-  | 640x470 | 45 ms | 20 ms | 8.3 ms | 53 ms | 0.72 s |
-  | 2522x818 | 326 ms | 120 ms | 44 ms | 370 ms | 4.5 s |
+  Not tuned, and not yet timed on an idle machine: the only runs so far were taken while other jobs loaded it,
+  so they give proportions, not times. The covariance head took 55-65 % of a run, the ranker head most of
+  the rest; without both heads RaCo took about as long as ALIKED. To re-measure with `tools/bench.py`.
 - [ ] **R6 — RaCo on WebGPU** (with M6); detector switch, covariance ellipses and top-K by ranker score in the M7 demo.
 
 ## Phases
@@ -375,7 +371,8 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
   the result is the same and no per-channel activation is needed.
 - `JKP_EMBED_MODELS` accepted a list but embedded only its first entry; fixed. Since R5 the default is
   `aliked-n16;raco` (about 4.7 MB; `-DJKP_EMBED_MODELS=aliked-n16` leaves RaCo out). The WebAssembly build
-  embeds nothing, so the site is not affected.
+  is configured with `-DJKP_EMBED_WEIGHTS=OFF` (README, docs workflow), so the site is not affected; CMake does
+  not enforce that under Emscripten.
 - R3: RaCo positions go to the ALIKED descriptor head as `2 * xy / (size - 1) - 1`, the formula of
   `ALIKED.describe` in cvg/LightGlue (commit `5a650c4`) once upstream's +0.5 is removed. The head truncates the
   pixel position it recovers, so keep this float32 order on GPU backends. Positions can lie up to one pixel
@@ -393,7 +390,16 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
   for the best `min(top_k, count)`; refinement and sampling run on the kept keypoints only.
 - Metal has no `log1p`; softplus uses `log(y) * u / (y - 1)` with `u = exp(x)`, `y = 1 + u`, accurate to a few ulp.
 - On large images (1024x768, 5000 keypoints) the keypoint sets are identical but the order of near-tied scores
-  differs from the CPU's, so `backend_test` with `raco.jkpw` pairs keypoints by position, as `raco_golden_test` does.
+  differs from the CPU's. So `backend_test` with `raco.jkpw` pairs keypoints by position, one to one: without a
+  top-k cut every keypoint must pair, with one a keypoint may lack a partner only among the last 0.2 % of its list.
+  Exact equality cannot be guaranteed: `exp` and the softmax sum differ by an ulp between the backends, and two
+  distinct logits can round to the same probability on one backend only, which changes the NMS ties.
+  Scores, ranker and covariances are bilinear samples at the refined position; they are compared at 1e-4.
+- Probabilities below FLT_MIN (a logit about 87 or more below the maximum) are not maxima, on the CPU and on
+  Metal: the GPU flushes such denormals to zero. Only matters when top_k exceeds the number of normal-range
+  maxima on a map with that wide a logit range; real images have logits within about +-5.
+- `k_rank_sort` is O(k^2), shared with ALIKED. RaCo has no score threshold, so a very large top_k (1e5 on a
+  large image) would sort ~1e5 keypoints in one dispatch; the default 2048 is fine.
 - `ops_test` checks the RaCo operations on backends that have them and reports "skipped" on the others.
 - FP16: the operations work with half storage (`ops_test metal:fp16` passes), but the logits come from a
   convolution without an activation and are stored as half, so neighbouring logits tie and the set of local

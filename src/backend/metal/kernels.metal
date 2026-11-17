@@ -878,7 +878,8 @@ kernel void k_sddh_sample_pyramid(device const real* p0 [[buffer(0)]], device co
 
 // ---------------------------------------------------------------------------------------------
 // RaCo kernels (normalize, pad_reflect, detect_raco). Same float32 steps as the CPU backend, except
-// that the softmax sum is a compensated float sum in blocks instead of a double sum in raster order.
+// that the softmax sum is a compensated float sum in blocks instead of a double sum in raster order, and
+// softplus is computed without log1p (see softplus below).
 // ---------------------------------------------------------------------------------------------
 
 // (x - mean[c]) / std[c]; ms holds the c means, then the c standard deviations.
@@ -958,11 +959,12 @@ kernel void k_softmax_prob(device const real* l [[buffer(0)]], constant int& n [
 }
 
 // nms = probability where it equals the maximum of its window, zero elsewhere (no border exclusion).
+// Probabilities below FLT_MIN are not maxima, as on the CPU: the GPU may flush them to zero.
 kernel void k_raco_nms(device const float* prob [[buffer(0)]], device const float* pooled [[buffer(1)]],
                        constant int& n [[buffer(2)]], device float* nms [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
   int i = int(gid);
   if (i >= n) return;
-  nms[i] = prob[i] == pooled[i] ? prob[i] : 0.0f;
+  nms[i] = prob[i] == pooled[i] && prob[i] >= FLT_MIN ? prob[i] : 0.0f;
 }
 
 // log(1 + exp(x)), linear above 20 as in PyTorch. Metal has no log1p; this form is accurate to a few ulp.

@@ -24,7 +24,9 @@ python3 -m http.server 8792 --bind 127.0.0.1 --directory docs/_build/html   # th
 
 ## Deploying
 
-The `docs` workflow (`.github/workflows/docs.yml`) is started by hand:
+The `docs` workflow (`.github/workflows/docs.yml`) publishes the site on every merge into `main`, and builds it
+without publishing for every pull request into `main`, so a page that fails `-W` shows up before the merge.
+Changes to only the notes (`PLAN.md`, the READMEs) don't run it. It can also be started by hand:
 
 ```bash
 gh workflow run docs                    # build the module and the site

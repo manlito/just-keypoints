@@ -48,7 +48,7 @@ WebGPU, natively through Dawn on the same M5 Pro:
 | 1920x1080 | 29.7 | 38.0 | 23.2 | 33.3 |
 
 In Chrome on the same machine: 12-13 ms at 640x480 in FP32 and 10 ms in FP16. <a href="bench/index.html">The benchmark
-page</a> measures the same sizes in your browser.
+page</a> measures the same sizes in your browser, for ALIKED or RaCo.
 
 For comparison, the ALIKED paper reports 12.9 ms for `aliked-n16` at 640x480 with 1000 keypoints (PyTorch,
 RTX 2060).

@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Benchmark · just-keypoints</title>
-<meta name="description" content="Time ALIKED keypoint and descriptor extraction in your browser on a fixed set of image sizes.">
+<meta name="description" content="Time ALIKED or RaCo keypoint and descriptor extraction in your browser on a fixed set of image sizes.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -42,12 +42,25 @@
       <section class="panel" aria-labelledby="h-set">
         <h2 id="h-set">Settings</h2>
         <div class="field">
+          <span class="label">Detector</span>
+          <div class="seg" role="radiogroup" aria-label="Detector">
+            <label><input type="radio" name="det" value="aliked" checked>ALIKED</label>
+            <label><input type="radio" name="det" value="raco">RaCo</label>
+          </div>
+          <p class="hint" id="det-hint"></p>
+        </div>
+        <div class="field" id="f-rdesc" hidden>
+          <label class="check"><input type="checkbox" id="rdesc" checked>ALIKED descriptors</label>
+          <p class="hint">RaCo has no descriptors of its own. Checked: ALIKED describes RaCo's keypoints, as in the
+          live demo. Unchecked: keypoints, ranker scores and covariances only.</p>
+        </div>
+        <div class="field">
           <span class="label">Backend</span>
           <div class="seg" role="radiogroup" aria-label="Backend">
             <label><input type="radio" name="backend" value="webgpu" checked>WebGPU</label>
             <label><input type="radio" name="backend" value="cpu">CPU</label>
           </div>
-          <p class="hint">The CPU backend runs on one thread, about a second per 640x480 image; it times 640x480 only.</p>
+          <p class="hint" id="backend-hint"></p>
         </div>
         <div class="field">
           <span class="label">Precision</span>
@@ -71,7 +84,7 @@
         <h2 id="h-res">Milliseconds per image</h2>
         <table class="t" id="results"><thead></thead><tbody></tbody></table>
         <p class="hint">Median of the timed runs; in brackets the fastest and the slowest. Keypoints: the number
-        returned (1000 unless the image has fewer).</p>
+        returned (1000 unless the image has fewer). RaCo runs in FP32 only.</p>
       </section>
       <section class="panel" aria-labelledby="h-env">
         <h2 id="h-env">This machine</h2>
@@ -88,7 +101,7 @@
 
 <footer class="jk-foot">
   <div class="jk-foot-in">
-    <span>just-keypoints · weights from ALIKED (BSD-3-Clause) · test image: TUM RGB-D (CC BY 4.0)</span>
+    <span>just-keypoints · weights from ALIKED (BSD-3-Clause) and RaCo (Apache-2.0) · test image: TUM RGB-D (CC BY 4.0)</span>
     <a href="../references.html">References and acknowledgements</a>
   </div>
 </footer>

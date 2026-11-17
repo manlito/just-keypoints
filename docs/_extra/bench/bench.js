@@ -1,7 +1,8 @@
 // The benchmark page: one image at four sizes, the 1000 best keypoints, median of warm runs. The sizes are the
 // ones of the native benchmark tables; each is a centre crop of the test image to the size's aspect ratio,
-// scaled to the size.
-import { jkp, environment, weights, pixels, loadImage, median, ms, unsupportedMessage } from '../common.js';
+// scaled to the size. ALIKED in FP32 and FP16, or RaCo (FP32 only), with or without ALIKED's descriptors.
+import { jkp, environment, weights, RACO_WEIGHTS_URL, pixels, loadImage, median, ms, unsupportedMessage }
+  from '../common.js';
 
 const $ = (id) => document.getElementById(id);
 const SIZES = [[640, 480], [1241, 376], [1024, 768], [1920, 1080]];
@@ -27,15 +28,32 @@ function renderEnv() {
   $('env').replaceChildren(...kv.flatMap(([k, v]) => [el('dt', k), el('dd', v)]));
 }
 
+const checked = (name) => document.querySelector(`input[name="${name}"]:checked`).value;
+
 function columns() {
-  const backend = document.querySelector('input[name="backend"]:checked').value;
+  const backend = checked('backend'), detector = checked('det');
+  if (detector === 'raco') return [{ detector, backend, precision: 'fp32', desc: $('rdesc').checked }];
   const cols = [];
-  if ($('fp32').checked) cols.push({ backend, precision: 'fp32' });
-  if ($('fp16').checked && backend === 'webgpu' && env.f16) cols.push({ backend, precision: 'fp16' });
+  if ($('fp32').checked) cols.push({ detector, backend, precision: 'fp32' });
+  if ($('fp16').checked && backend === 'webgpu' && env.f16) cols.push({ detector, backend, precision: 'fp16' });
   return cols;
 }
 
 const label = (c) => `${c.backend === 'webgpu' ? 'WebGPU' : 'CPU'} ${c.precision.toUpperCase()}`;
+
+function detectorText(c) {
+  if (c.detector !== 'raco') return 'ALIKED (aliked-n16)';
+  return c.desc ? 'RaCo, ALIKED descriptors' : 'RaCo, no descriptors';
+}
+
+async function extractorOptions(c) {
+  if (c.detector === 'raco') {
+    const options = { weights: await weights(RACO_WEIGHTS_URL), backend: c.backend, precision: 'fp32', topK: TOP_K };
+    if (c.desc) options.descriptorWeights = await weights();
+    return options;
+  }
+  return { weights: await weights(), backend: c.backend, precision: c.precision, topK: TOP_K };
+}
 
 function render(cols, table) {
   const thead = $('results').tHead, tbody = $('results').tBodies[0];
@@ -58,7 +76,8 @@ function render(cols, table) {
 function markdown(cols, table) {
   const lines = [`| Size | ${cols.map(label).join(' | ')} |`, `|---|${cols.map(() => '---|').join('')}`];
   for (const row of table) lines.push(`| ${row.w}x${row.h} | ${row.cells.map((c) => (c ? ms(c.median) : '')).join(' | ')} |`);
-  lines.push('', `ms per image, top-k ${TOP_K}, median of ${$('runs').value} runs after ${$('warmup').value} warm-up runs.`);
+  lines.push('', `${detectorText(cols[0])}; ms per image, top-k ${TOP_K}, median of ${$('runs').value} runs after ` +
+             `${$('warmup').value} warm-up runs.`);
   lines.push(`${browserName()}; GPU: ${env.webgpu ? env.adapter : 'none'}; ${navigator.userAgentData?.platform || navigator.platform}.`);
   return lines.join('\n');
 }
@@ -78,10 +97,9 @@ async function run() {
   const table = sizes.map(([w, h]) => ({ w, h, cells: cols.map(() => null), n: null }));
   render(cols, table);
   try {
-    const bytes = await weights();
     for (let c = 0; c < cols.length && !stopping; c++) {
       $('progress').textContent = `${label(cols[c])}: compiling the shaders…`;
-      const extractor = await jkp.create({ weights: bytes, backend: cols[c].backend, precision: cols[c].precision, topK: TOP_K });
+      const extractor = await jkp.create(await extractorOptions(cols[c]));
       try {
         await extractor.extract(inputs[0]);                       // first run: shader compilation, buffers
         for (let s = 0; s < sizes.length && !stopping; s++) {
@@ -133,18 +151,10 @@ async function main() {
     document.querySelector('input[name="backend"][value="webgpu"]').disabled = true;
     document.querySelector('input[name="backend"][value="cpu"]').checked = true;
   }
-  if (!env.f16) {
-    $('fp16').checked = false;
-    $('fp16').disabled = true;
-    $('fp16-hint').textContent = env.webgpu ? '(this adapter has no shader-f16)' : '';
-  }
-  for (const r of document.querySelectorAll('input[name="backend"]')) {
-    r.addEventListener('change', () => {
-      const cpu = document.querySelector('input[name="backend"]:checked').value === 'cpu';
-      $('fp16').disabled = cpu || !env.f16;
-      if (cpu) { $('runs').value = Math.min(+$('runs').value, 5); $('warmup').value = Math.min(+$('warmup').value, 1); }
-    });
-  }
+  if (!env.f16) $('fp16').checked = false;
+  for (const r of document.querySelectorAll('input[name="backend"], input[name="det"]')) r.addEventListener('change', update);
+  $('rdesc').addEventListener('change', update);
+  update();
   $('start').addEventListener('click', run);
   $('stop').addEventListener('click', () => { stopping = true; });
   $('copy').addEventListener('click', async () => {
@@ -156,6 +166,27 @@ async function main() {
   await Promise.all([jkp.module(), weights()]);
   $('progress').textContent = 'Ready.';
   $('start').disabled = false;
+}
+
+// Controls that depend on the detector and the backend. The CPU backend is slow (RaCo with descriptors about
+// 12 s per 640x480 image), so choosing it lowers the run counts.
+function update() {
+  const raco = checked('det') === 'raco', cpu = checked('backend') === 'cpu';
+  $('f-rdesc').hidden = !raco;
+  $('fp32').disabled = raco;
+  if (raco) $('fp32').checked = true;
+  $('fp16').disabled = raco || cpu || !env.f16;
+  $('fp16-hint').textContent = raco ? '(ALIKED only)' : !env.f16 && env.webgpu ? '(this adapter has no shader-f16)' : '';
+  $('det-hint').textContent = raco
+    ? 'RaCo detects keypoints and adds a ranker score and a covariance to each; FP32 only.'
+    : 'ALIKED detects and describes keypoints in one network.';
+  $('backend-hint').textContent = 'The CPU backend runs on one thread and times 640x480 only: ' +
+    (raco ? ($('rdesc').checked ? 'about 12 s' : 'about 11 s') : 'about a second') + ' per image.';
+  if (cpu) {
+    const [runs, warmup] = raco ? [3, 1] : [5, 1];
+    $('runs').value = Math.min(+$('runs').value, runs);
+    $('warmup').value = Math.min(+$('warmup').value, warmup);
+  }
 }
 
 main().catch((e) => {

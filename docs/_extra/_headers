@@ -1,12 +1,13 @@
-# Cloudflare Pages response headers. The module and the weights change only with a new deployment; they are
-# revalidated after a day.
+# Cloudflare Pages response headers. The module and the weights keep their names across deployments, so the
+# browser revalidates them on every load (a 304 while unchanged): a cached module from an older deployment
+# would otherwise run under newer pages, which then call what it does not have.
 /*
   X-Content-Type-Options: nosniff
   Referrer-Policy: strict-origin-when-cross-origin
   Permissions-Policy: camera=(self), microphone=(), geolocation=()
 
 /lib/*
-  Cache-Control: public, max-age=86400, must-revalidate
+  Cache-Control: public, no-cache
 
 /samples/*
   Cache-Control: public, max-age=604800

@@ -1,7 +1,7 @@
 // Compares every stage of the RaCo graph against golden tensors dumped from the original RaCo.
 //   raco_golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|metal|metal:fp16|...]
 // Generate golden files with: python tools/dump_golden.py --model raco <images>
-// Backends with the RaCo operations: cpu, metal.
+// Backends with the RaCo operations: cpu, cuda, metal, webgpu.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>

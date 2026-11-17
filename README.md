@@ -148,11 +148,12 @@ on WebGPU, published at <https://just-keypoints.pages.dev>. Build and deploy: [d
 ## RaCo detector
 
 [RaCo](https://github.com/cvg/RaCo) is a second model: a detector that returns, per keypoint, a ranker score
-and a 2x2 covariance in pixels², and no descriptors. It runs on the CPU, Metal and WebGPU backends (natively and
-in the browser) and matches the original on each; CUDA is still to come.
+and a 2x2 covariance in pixels², and no descriptors. It runs on the CPU, CUDA, Metal and WebGPU backends (WebGPU
+natively and in the browser) and matches the original on each.
 
 ```sh
 build/release/jkp extract image.png --model raco --out features.jkpt
+build/release/jkp extract image.png --model raco --backend cuda --out features.jkpt
 build/release/jkp extract image.png --model raco --backend metal --out features.jkpt
 build/release/jkp extract image.png --model raco --backend webgpu --out features.jkpt
 python tools/compare.py --model raco image.png --b "cmd:build/release/jkp extract --model raco --backend metal"
@@ -160,7 +161,7 @@ python tools/compare.py --model raco image.png --b "cmd:build/release/jkp extrac
 
 Add `--descriptor aliked-n16` (C API: `config.descriptor`) to get ALIKED descriptors for the RaCo keypoints;
 this runs both networks. `--no-covariance` and `--no-ranker` (`skip_covariance`, `skip_ranker`) leave out a head:
-the covariance head is about three quarters of the run time on the CPU and more than half on Metal.
+the covariance head is about three quarters of the run time on the CPU and more than half on the GPUs.
 
 The default build embeds both models; with `-DJKP_EMBED_MODELS=aliked-n16` (RaCo adds ~2 MB) pass
 `--weights weights/raco.jkpw` instead. RaCo runs in FP32 only.

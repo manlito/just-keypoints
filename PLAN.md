@@ -169,10 +169,13 @@ Each milestone is a state you can run and check. Phases below hold the technical
     browser (one thread) takes about 1.2 s at 640x480.
   - Same keypoint sets, not always the same order: keypoints whose scores nearly tie can swap in top-k mode
     and under the cap. See the notes from M6.
-- [ ] **M7 — Public demo and docs** (phase 6)
+- [x] **M7 — Public demo and docs** (phase 6)
   Cloudflare Pages site (as just-ba's): load two images, see keypoints, matches and timings.
-  Built and checked locally (M5 Pro, Chrome 156 in the desktop app's browser pane); not yet published: the
-  Cloudflare Pages project and the repository secrets are still to be made (docs/README.md, "Deploying").
+  Done: published at <https://just-keypoints.pages.dev> by the `docs` workflow (`deploy=true`), last from `main`
+  at `b82a474` (R4), so the live demo has RaCo (R6). Checked on the live site (M5 Pro, Chromium 156 in the
+  desktop app's browser pane, in front): TUM pair, top-k 1000, WebGPU FP32: ALIKED 229 matches, 10.7 / 12.9 ms;
+  RaCo 318 matches, 55.7 ms per image; benchmark page 11.6 / 15.1 / 19.3 / 40.8 ms FP32 and 10.9 / 12.2 /
+  17.8 / 35.7 ms FP16. The fallback without WebGPU, also on the live site, in the notes from M7.
   - Site: Sphinx + MyST in `docs/`, just-ba's theme with this project's accent; pages: build, quick start, in the
     browser, accuracy and speed, C API, weights format, references. `sphinx-build -W` passes.
   - Live demo (`docs/_extra/demo/`): two sample pairs (TUM RGB-D, KITTI), upload, drop or camera; keypoints and
@@ -689,8 +692,13 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
 - Sample images: two TUM RGB-D frames (CC BY 4.0) and two KITTI frames (CC BY-NC-SA 3.0, non-commercial) from
   the ALIKED repository, as JPEG; credited on the references page and in the demo's footer. The St Paul's and
   San Marco photos there were left out: their source and licence are not stated.
-- Not checked: Edge, Chrome on Windows and Linux, the fallback without WebGPU in a real browser (the CPU
-  backend path itself was run), and the camera (needs a device and a permission prompt).
+- Fallback without WebGPU: checked on the live demo with `navigator.gpu` hidden before the page's scripts run
+  (the page in a same-origin frame; a permissions policy of `webgpu 'none'` on the frame did not hide the
+  adapter in Chromium 156). The page shows its notice, picks the CPU backend, turns FP16 off (no shader-f16)
+  and reports "no WebGPU adapter"; TUM pair, ALIKED top-k 1000: the same 229 matches, 1.2-1.8 s per image at
+  640x480.
+- Not checked: Edge, Safari, Firefox, Chrome on Windows and Linux, a browser without WebGPU at all (only the
+  hidden `navigator.gpu` above), and the camera (needs a device and a permission prompt).
 - RaCo in the demo: added with R6; see the notes from R6.
 
 ## Open questions (decide during implementation)

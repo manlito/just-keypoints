@@ -36,7 +36,8 @@ cmake --build build/release
 
 | Option | Default | Meaning |
 |---|---|---|
-| `JKP_EMBED_WEIGHTS` | `ON` | compile the weights into the library (adds ~2.7 MB); `OFF` = give a path or memory blob at run time |
+| `JKP_EMBED_WEIGHTS` | `ON` | compile the weights into the library (adds ~4.7 MB for both models); `OFF` = give a path or memory blob at run time |
+| `JKP_EMBED_MODELS` | `aliked-n16;raco` | models to embed (names in `weights/`); `aliked-n16` alone adds ~2.7 MB |
 | `JKP_CUDA` | `AUTO` | CUDA backend: `AUTO` = build it when a CUDA compiler is found, `ON` = require it, `OFF` |
 | `JKP_METAL` | `AUTO` | Metal backend: `AUTO` = build it on Apple platforms, `ON` = require it, `OFF` |
 | `JKP_WEBGPU` | `AUTO` | WebGPU backend: `AUTO` = build it when Dawn (or, under Emscripten, emdawnwebgpu) is found, `ON` = require it, `OFF` |
@@ -147,18 +148,21 @@ on WebGPU, published at <https://just-keypoints.pages.dev>. Build and deploy: [d
 ## RaCo detector
 
 [RaCo](https://github.com/cvg/RaCo) is a second model: a detector that returns, per keypoint, a ranker score
-and a 2x2 covariance in pixels², and no descriptors. It runs on the CPU backend for now and matches the original.
+and a 2x2 covariance in pixels², and no descriptors. It runs on the CPU and Metal backends and matches the
+original on both; CUDA and WebGPU are still to come.
 
 ```sh
-build/release/jkp extract image.png --model raco --weights weights/raco.jkpw --out features.jkpt
-python tools/compare.py --model raco image.png --b "cmd:build/release/jkp extract --weights weights/raco.jkpw"
+build/release/jkp extract image.png --model raco --out features.jkpt
+build/release/jkp extract image.png --model raco --backend metal --out features.jkpt
+python tools/compare.py --model raco image.png --b "cmd:build/release/jkp extract --model raco --backend metal"
 ```
 
 Add `--descriptor aliked-n16` (C API: `config.descriptor`) to get ALIKED descriptors for the RaCo keypoints;
 this runs both networks. `--no-covariance` and `--no-ranker` (`skip_covariance`, `skip_ranker`) leave out a head:
-the covariance head is about three quarters of the run time.
+the covariance head is about three quarters of the run time on the CPU and more than half on Metal.
 
-`--weights` is not needed when the build embeds the model: `-DJKP_EMBED_MODELS="aliked-n16;raco"` (adds ~2 MB).
+The default build embeds both models; with `-DJKP_EMBED_MODELS=aliked-n16` (RaCo adds ~2 MB) pass
+`--weights weights/raco.jkpw` instead. RaCo runs in FP32 only.
 In the C API set `config.model = "raco"`; the result then has `rank` and `cov`, and `desc` is `NULL` unless a descriptor model is set.
 `top_k` is the number of keypoints (default 2048); there is no score threshold.
 

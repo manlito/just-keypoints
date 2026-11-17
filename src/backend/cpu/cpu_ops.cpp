@@ -1,6 +1,7 @@
 // Plain C++ reference backend. Written for clarity and exact agreement with tools/folded.py;
 // loops are arranged so the compiler can vectorize them, nothing more.
 #include <algorithm>
+#include <cfloat>
 #include <cmath>
 #include <cstring>
 #include <functional>
@@ -417,6 +418,8 @@ class CpuOps : public Ops {
     const CpuTensor& lm = cpu(logits_p);
     const int w = lm.w, h = lm.h, n = w * h, k = params.window, r = k / 2;
     if (lm.c != 1 || k < 1 || k % 2 == 0 || k > 9) throw std::runtime_error("detect_raco: bad arguments");
+    if ((ranker_map && ranker_map->c != 1) || (cholesky_raw && cholesky_raw->c != 3))
+      throw std::runtime_error("detect_raco: bad arguments");
     for (const TensorPtr& t : {ranker_map, cholesky_raw})
       if (t && (t->w != w || t->h != h)) throw std::runtime_error("detect_raco: map size mismatch");
     const std::vector<float>& logit = lm.d;
@@ -430,8 +433,10 @@ class CpuOps : public Ops {
     for (int i = 0; i < n; ++i) prob[i] /= total;
 
     // Non-maximum suppression: keep pixels equal to the maximum of their window, then the best top_k.
+    // Probabilities below FLT_MIN (a logit about 87 or more below the maximum) do not count as maxima: GPUs
+    // flush such denormals to zero, and the backends must agree.
     max_filter(prob, pooled, w, h, r);
-    for (int i = 0; i < n; ++i) nms[i] = prob[i] == pooled[i] ? prob[i] : 0.0f;
+    for (int i = 0; i < n; ++i) nms[i] = prob[i] == pooled[i] && prob[i] >= FLT_MIN ? prob[i] : 0.0f;
     std::vector<int> idx(n);
     std::iota(idx.begin(), idx.end(), 0);
     int count = std::min(std::max(params.top_k, 0), n);

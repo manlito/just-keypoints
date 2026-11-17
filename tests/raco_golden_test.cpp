@@ -1,7 +1,7 @@
 // Compares every stage of the RaCo graph against golden tensors dumped from the original RaCo.
-//   raco_golden_test WEIGHTS.jkpw GOLDEN.jkpt
+//   raco_golden_test WEIGHTS.jkpw GOLDEN.jkpt [cpu|metal|metal:fp16|...]
 // Generate golden files with: python tools/dump_golden.py --model raco <images>
-// CPU backend only until a GPU backend implements the RaCo operations.
+// Backends with the RaCo operations: cpu, metal.
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -12,6 +12,7 @@
 #include "core/ops.h"
 #include "core/weights.h"
 #include "models/raco/raco.h"
+#include "test_backends.h"
 
 namespace {
 
@@ -39,8 +40,8 @@ void check(const char* name, const float* got, size_t got_n, const jkp::Param* r
 }  // namespace
 
 int main(int argc, char** argv) {
-  if (argc != 3) {
-    std::fprintf(stderr, "usage: raco_golden_test WEIGHTS.jkpw GOLDEN.jkpt\n");
+  if (argc != 3 && argc != 4) {
+    std::fprintf(stderr, "usage: raco_golden_test WEIGHTS.jkpw GOLDEN.jkpt [backend]\n");
     return 2;
   }
   try {
@@ -54,7 +55,7 @@ int main(int argc, char** argv) {
     for (size_t i = 0; i < image.size(); ++i) image[i] = static_cast<uint8_t>(image_f.data[i]);
 
     jkp::Raco model(weights);
-    auto ops = jkp::make_cpu_ops(0);
+    auto ops = make_backend(argc == 4 ? argv[3] : "cpu");
     jkp::RacoOptions options;
     options.top_k = golden.meta_int("top_k");
 

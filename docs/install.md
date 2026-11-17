@@ -26,7 +26,7 @@ next to it.
 | Option | Default | Meaning |
 |---|---|---|
 | `JKP_EMBED_WEIGHTS` | `ON` | compile the weights into the library; `OFF` = give a path or a memory blob at run time |
-| `JKP_EMBED_MODELS` | `aliked-n16` | models to embed, for example `"aliked-n16;raco"` (RaCo adds about 2 MB) |
+| `JKP_EMBED_MODELS` | `aliked-n16;raco` | models to embed; `aliked-n16` alone leaves out RaCo's 2 MB |
 | `JKP_CUDA` | `AUTO` | `AUTO` = build it when a CUDA compiler is found, `ON` = require it, `OFF` |
 | `JKP_METAL` | `AUTO` | `AUTO` = build it on Apple platforms, `ON` = require it, `OFF` |
 | `JKP_WEBGPU` | `AUTO` | `AUTO` = build it when Dawn (or, under Emscripten, emdawnwebgpu) is found, `ON` = require it, `OFF` |

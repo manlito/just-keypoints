@@ -1,5 +1,7 @@
 // Metal backend: host side. The kernels are in kernels.metal, one per operation, CHW layout,
-// same graph and keypoint selection as the CUDA backend (src/backend/cuda/cuda_ops.cu).
+// same graph and keypoint selection as the CUDA backend (src/backend/cuda/cuda_ops.cu). The RaCo
+// operations (normalize, pad_reflect, detect_raco) are ported from the CPU backend; detect_raco reuses
+// the device-side top-k selection of detect.
 //
 // Precision: FP32 by default. In FP16 mode the kernels are compiled with JKP_FP16: feature maps and the
 // weights of the dense network are stored as half, arithmetic stays float. The score map (the output of
@@ -208,7 +210,8 @@ class Context {
 
   bool fp16() const { return fp16_; }
 
-  // Device copy of a weight tensor, made on first use. Weights outlive the backend (see jkp_ctx).
+  // Device copy of a weight tensor, made on first use and cached by its host address, so weights must stay
+  // alive and unchanged for the backend's lifetime (see jkp_ctx).
   // param: in the kernels' storage type (`real`); param_f32: always float.
   View param(const Param& p) { return param(p, fp16_); }
   View param_f32(const Param& p) { return param(p, false); }
@@ -353,6 +356,68 @@ class Buffer {
   ContextPtr ctx_;
   size_t n_;
   id<MTLBuffer> b_;
+};
+
+// Ordered selection on a map of n non-negative floats, on the device. Counting is a round trip to the host,
+// which computes the per-block offsets (exclusive prefix sum) in shared memory.
+class Selection {
+ public:
+  Selection(const ContextPtr& ctx, const View& v, int n)
+      : ctx_(ctx), v_(v), n_(n), blocks_((n + kScanBlock - 1) / kScanBlock), offsets_(ctx, static_cast<size_t>(blocks_) + 1, true) {}
+
+  // Number of {v `mode` th}; leaves the per-block offsets for write().
+  int count(int mode, float th) {
+    ctx_->run("k_select_count", blocks_, v_, n_, mode, th, offsets_.view());
+    ctx_->sync();
+    unsigned* o = offsets_.host();
+    unsigned sum = 0;
+    for (int b = 0; b < blocks_; ++b) {
+      unsigned c = o[b];
+      o[b] = sum;
+      sum += c;
+    }
+    o[blocks_] = sum;
+    return static_cast<int>(sum);
+  }
+  // Writes the first `limit` of that set in raster order; must follow the matching count().
+  void write(int mode, float th, int limit, const View& dst) {
+    ctx_->run("k_select_write", blocks_, v_, n_, mode, th, offsets_.view(), static_cast<unsigned>(limit), dst);
+  }
+  // Indices of the `best` (<= n) highest values, best first, ties in raster order.
+  void top(int best, const View& dst) {
+    // Radix select for the value of the `best`-th highest, 16 bits of the float bits per pass (each pass
+    // is a round trip to the host).
+    const int bins = 65536;
+    Buffer<unsigned> hist(ctx_, bins, true);
+    unsigned prefix = 0, mask = 0;
+    int remaining = best;  // how many are still needed from the values matching the prefix
+    for (int shift = 16; shift >= 0; shift -= 16) {
+      std::memset(hist.host(), 0, bins * sizeof(unsigned));  // idle: the previous pass synced
+      ctx_->run("k_histogram", n_, v_, n_, mask, prefix, shift, hist.view());
+      ctx_->sync();
+      const unsigned* hv = hist.host();
+      int bin = bins - 1;
+      for (; bin > 0 && static_cast<long long>(hv[bin]) < remaining; --bin) remaining -= static_cast<int>(hv[bin]);
+      prefix |= static_cast<unsigned>(bin) << shift;
+      mask |= 65535u << shift;
+    }
+    float kth;
+    std::memcpy(&kth, &prefix, sizeof(kth));
+    // Everything above that value, then the first `remaining` equal to it in raster order.
+    const int above = best - remaining;
+    Buffer<int> unsorted(ctx_, best);
+    if (count(kGreater, kth) != above) fail("top-k selection is inconsistent");
+    write(kGreater, kth, above, unsorted.view());
+    count(kEqual, kth);
+    write(kEqual, kth, remaining, unsorted.view(above));
+    ctx_->run("k_rank_sort", best, v_, unsorted.view(), best, dst);
+  }
+
+ private:
+  ContextPtr ctx_;
+  View v_;
+  int n_, blocks_;
+  Buffer<unsigned> offsets_;
 };
 
 struct MetalTensor;
@@ -521,7 +586,7 @@ class MetalOps : public Ops {
       ctx_->run(format("k_conv1x1_pyramid_t%d", t).c_str(), static_cast<long long>((cout + t - 1) / t) * x.h * x.w,
                 part(0), part(1), part(2), part(3), x.pyramid_args(), ctx_->param_tiled(weight, t), b, bias ? 1 : 0,
                 cout, act_id(act), out->d());
-    } else if (k == 1 || k == 3) {
+    } else if (k == 1 || k == 3 || k == 5) {
       const int t = f32_out ? 4 : tile(cout);
       const long long threads = static_cast<long long>((cout + t - 1) / t) * x.h * x.w;
       const View w = ctx_->param_tiled(weight, t);
@@ -675,40 +740,20 @@ class MetalOps : public Ops {
     }
 
     // Selection, on the device. `idx` receives the pixel indices of the keypoints in output order.
-    const int blocks = (n + kScanBlock - 1) / kScanBlock;
-    Buffer<unsigned> offsets(ctx_, static_cast<size_t>(blocks) + 1, true);
-    // Counts {nms `mode` th} and leaves the per-block offsets (exclusive prefix sum, on the host) in `offsets`.
-    auto select_count = [&](int mode, float th) {
-      ctx_->run("k_select_count", blocks, nms.view(), n, mode, th, offsets.view());
-      ctx_->sync();
-      unsigned* o = offsets.host();
-      unsigned sum = 0;
-      for (int b = 0; b < blocks; ++b) {
-        unsigned c = o[b];
-        o[b] = sum;
-        sum += c;
-      }
-      o[blocks] = sum;
-      return static_cast<int>(sum);
-    };
-    // Writes the first `limit` of that set in raster order; must follow the matching select_count.
-    auto select_write = [&](int mode, float th, int limit, const View& dst) {
-      ctx_->run("k_select_write", blocks, nms.view(), n, mode, th, offsets.view(), static_cast<unsigned>(limit), dst);
-    };
-
+    Selection select(ctx_, nms.view(), n);
     int kept = 0;         // number of keypoints
     int best = -1;        // >= 0: keep the `best` highest scores, best first
     float threshold = 0;  // otherwise: keep nms > threshold, in raster order
     if (params.top_k > 0) {
       best = std::min(params.top_k, n);
     } else {
-      int passing = params.scores_th > 0 ? select_count(kGreater, threshold = params.scores_th) : 0;
+      int passing = params.scores_th > 0 ? select.count(kGreater, threshold = params.scores_th) : 0;
       if (passing == 0) {  // fall back to the mean score, summed in raster order like the CPU backend
         ctx_->sync();
         const float* v = reinterpret_cast<const float*>(sm.host());
         float total = 0;
         for (int i = 0; i < n; ++i) total += v[i];
-        passing = select_count(kGreater, threshold = total / static_cast<float>(n));
+        passing = select.count(kGreater, threshold = total / static_cast<float>(n));
       }
       if (passing > params.n_limit) best = std::max(0, params.n_limit);
       else kept = passing;
@@ -717,36 +762,8 @@ class MetalOps : public Ops {
     if (kept == 0) return;
 
     Buffer<int> idx(ctx_, kept);
-    if (best < 0) {
-      select_write(kGreater, threshold, kept, idx.view());
-    } else {
-      // Radix select for the value of the `best`-th highest score, 16 bits of the float bits per pass
-      // (each pass is a round trip to the host).
-      const int bins = 65536;
-      Buffer<unsigned> hist(ctx_, bins, true);
-      unsigned prefix = 0, mask = 0;
-      int remaining = best;  // how many are still needed from the values matching the prefix
-      for (int shift = 16; shift >= 0; shift -= 16) {
-        std::memset(hist.host(), 0, bins * sizeof(unsigned));  // idle: the previous pass synced
-        ctx_->run("k_histogram", n, nms.view(), n, mask, prefix, shift, hist.view());
-        ctx_->sync();
-        const unsigned* hv = hist.host();
-        int bin = bins - 1;
-        for (; bin > 0 && static_cast<long long>(hv[bin]) < remaining; --bin) remaining -= static_cast<int>(hv[bin]);
-        prefix |= static_cast<unsigned>(bin) << shift;
-        mask |= 65535u << shift;
-      }
-      float kth;
-      std::memcpy(&kth, &prefix, sizeof(kth));
-      // Everything above that value, then the first `remaining` equal to it in raster order.
-      const int above = best - remaining;
-      Buffer<int> unsorted(ctx_, kept);
-      if (select_count(kGreater, kth) != above) fail("top-k selection is inconsistent");
-      select_write(kGreater, kth, above, unsorted.view());
-      select_count(kEqual, kth);
-      select_write(kEqual, kth, remaining, unsorted.view(above));
-      ctx_->run("k_rank_sort", kept, nms.view(), unsorted.view(), kept, idx.view());
-    }
+    if (best < 0) select.write(kGreater, threshold, kept, idx.view());
+    else select.top(best, idx.view());
 
     // Refinement and readback of the kept keypoints only.
     Buffer<float> xy(ctx_, 2 * static_cast<size_t>(kept)), score(ctx_, kept);
@@ -754,6 +771,82 @@ class MetalOps : public Ops {
     ctx_->sync();
     out->xy_norm.assign(xy.host(), xy.host() + 2 * static_cast<size_t>(kept));
     out->score.assign(score.host(), score.host() + kept);
+  }
+
+  TensorPtr normalize(const TensorPtr& xp, const float* mean, const float* std) override {
+    const MetalTensor& x = dev(xp);
+    real_only(x);
+    MetalPtr out = make(x.c, x.h, x.w);
+    Buffer<float> ms(ctx_, 2 * static_cast<size_t>(x.c), true);
+    for (int c = 0; c < x.c; ++c) ms.host()[c] = mean[c], ms.host()[x.c + c] = std[c];
+    ctx_->tag(format("normalize c%d %dx%d", x.c, x.w, x.h));
+    ctx_->run("k_normalize", out->size(), x.d(), x.c, x.h * x.w, ms.view(), out->d());
+    return out;
+  }
+
+  TensorPtr pad_reflect(const TensorPtr& xp, int p) override {
+    const MetalTensor& x = dev(xp);
+    real_only(x);
+    if (p < 0 || p >= x.h || p >= x.w) throw std::runtime_error("pad_reflect: padding does not fit the tensor");
+    MetalPtr out = make(x.c, x.h + 2 * p, x.w + 2 * p);
+    ctx_->tag(format("pad_reflect c%d %dx%d", x.c, out->w, out->h));
+    ctx_->run("k_pad_reflect", out->size(), x.d(), x.c, x.h, x.w, p, out->d());
+    return out;
+  }
+
+  void detect_raco(const TensorPtr& logits_p, const TensorPtr& ranker_map, const TensorPtr& cholesky_raw,
+                   const RacoDetectParams& params, RacoKeypoints* out) override {
+    const MetalTensor& lm = dev(logits_p);
+    const int w = lm.w, h = lm.h, n = w * h, k = params.window, r = k / 2;
+    if (lm.c != 1 || k < 1 || k % 2 == 0 || k > 9) throw std::runtime_error("detect_raco: bad arguments");
+    if ((ranker_map && ranker_map->c != 1) || (cholesky_raw && cholesky_raw->c != 3))
+      throw std::runtime_error("detect_raco: bad arguments");
+    for (const TensorPtr& t : {ranker_map, cholesky_raw})
+      if (t && (t->w != w || t->h != h)) throw std::runtime_error("detect_raco: map size mismatch");
+    real_only(lm);
+    if (ranker_map) real_only(dev(ranker_map));
+    if (cholesky_raw) real_only(dev(cholesky_raw));
+    out->xy.clear(), out->score.clear(), out->rank.clear(), out->cholesky.clear();
+    if (n == 0) return;
+    ctx_->tag(format("detect_raco %dx%d", w, h));
+
+    // Probabilities: softmax over the whole image (stats: maximum logit, sum of the exponentials).
+    const int blocks = (n + kScanBlock - 1) / kScanBlock;
+    Buffer<float> partial(ctx_, blocks), stats(ctx_, 2), prob(ctx_, n), nms(ctx_, n);
+    ctx_->run("k_softmax_block_max", blocks, lm.d(), n, partial.view());
+    ctx_->run("k_softmax_max", 1, partial.view(), blocks, stats.view());
+    ctx_->run("k_softmax_block_sum", blocks, lm.d(), n, stats.view(), partial.view());
+    ctx_->run("k_softmax_sum", 1, partial.view(), blocks, stats.view());
+    ctx_->run("k_softmax_prob", n, lm.d(), n, stats.view(), prob.view());
+
+    // Non-maximum suppression: keep pixels equal to the maximum of their window.
+    {
+      Buffer<float> tmp(ctx_, n), pooled(ctx_, n);
+      ctx_->run("k_max_filter", n, prob.view(), w, h, r, 0, tmp.view());
+      ctx_->run("k_max_filter", n, tmp.view(), w, h, r, 1, pooled.view());
+      ctx_->run("k_raco_nms", n, prob.view(), pooled.view(), n, nms.view());
+    }
+
+    // The best top_k of the maxima; suppressed pixels (zero) are not keypoints.
+    Selection select(ctx_, nms.view(), n);
+    const int kept = std::min(std::max(params.top_k, 0), select.count(kGreater, 0.0f));
+    if (kept == 0) return;
+    Buffer<int> idx(ctx_, kept);
+    select.top(kept, idx.view());
+
+    // Refinement and sampling of the kept keypoints only. A missing map binds the logits as a dummy input
+    // and a one-element dummy output.
+    Buffer<float> xy(ctx_, 2 * static_cast<size_t>(kept)), score(ctx_, kept), rank(ctx_, ranker_map ? kept : 1),
+        chol(ctx_, cholesky_raw ? 3 * static_cast<size_t>(kept) : 1);
+    const View ranker = ranker_map ? dev(ranker_map).d() : lm.d();
+    const View cholesky = cholesky_raw ? dev(cholesky_raw).d() : lm.d();
+    ctx_->run("k_raco_refine", kept, lm.d(), prob.view(), ranker, cholesky, ranker_map ? 1 : 0, cholesky_raw ? 1 : 0, w, h,
+              idx.view(), kept, k, params.temperature, xy.view(), score.view(), rank.view(), chol.view());
+    ctx_->sync();
+    out->xy.assign(xy.host(), xy.host() + 2 * static_cast<size_t>(kept));
+    out->score.assign(score.host(), score.host() + kept);
+    if (ranker_map) out->rank.assign(rank.host(), rank.host() + kept);
+    if (cholesky_raw) out->cholesky.assign(chol.host(), chol.host() + 3 * static_cast<size_t>(kept));
   }
 
   void describe(const TensorPtr& feature_map, const Keypoints& kpts, const SddhParams& p,

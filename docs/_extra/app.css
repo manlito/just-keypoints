@@ -1,0 +1,91 @@
+/* The demo and benchmark pages, on top of the documentation's stylesheet (_static/jkp.css): its colours, type
+   and top bar, with a wide layout of controls and results. */
+
+:root { --accent: #0b7a68; --ok: #1a7f37; --bad: #b42318; }
+@media (prefers-color-scheme: dark) { :root { --accent: #4fd1b5; --ok: #4ac26b; --bad: #ff7b72; } }
+
+.app { max-width: 1280px; margin: 0 auto; padding: 24px 28px 56px; }
+.app h1 { font-size: 26px; font-weight: 700; letter-spacing: -0.02em; margin: 0 0 6px; color: var(--text); }
+.app .lede { color: var(--body); margin: 0 0 20px; max-width: 80ch; }
+.app .lede a { white-space: nowrap; }
+
+.banner { border-radius: 10px; padding: 12px 16px; margin: 0 0 20px; font-size: 14px; background: var(--tint); color: var(--note-text); }
+.banner.warn { background: var(--warn-bg); color: var(--warn-text); }
+.banner[hidden] { display: none; }
+
+.layout { display: grid; grid-template-columns: 300px minmax(0, 1fr); gap: 28px; align-items: start; }
+@media (max-width: 900px) { .layout { grid-template-columns: minmax(0, 1fr); } }
+
+.panel { border: 1px solid var(--line); border-radius: 12px; padding: 16px; background: var(--page); }
+.panel + .panel { margin-top: 16px; }
+.panel h2 { font-size: 12px; font-weight: 600; letter-spacing: 0.06em; text-transform: uppercase; color: var(--muted); margin: 0 0 12px; }
+.field { margin: 0 0 14px; }
+.field:last-child { margin-bottom: 0; }
+.field > label, .field > .label { display: flex; justify-content: space-between; gap: 8px; font-size: 13px; font-weight: 500; color: var(--text); margin-bottom: 6px; }
+.field output, .field .value { font-family: var(--mono); font-size: 12.5px; color: var(--muted); font-weight: 400; }
+.hint { font-size: 12.5px; color: var(--muted); margin: 6px 0 0; line-height: 1.45; }
+
+select, input[type="number"] {
+  font: inherit; font-size: 14px; width: 100%; box-sizing: border-box; padding: 6px 10px;
+  border: 1px solid var(--field); border-radius: 8px; background: var(--soft); color: var(--text);
+}
+input[type="range"] { width: 100%; accent-color: var(--accent); margin: 0; }
+input[type="checkbox"] { accent-color: var(--accent); }
+.check { display: flex; align-items: center; gap: 8px; font-size: 14px; color: var(--text); margin: 0 0 6px; }
+.field > label.check { justify-content: flex-start; font-weight: 400; font-size: 14px; }
+
+.seg { display: flex; border: 1px solid var(--field); border-radius: 8px; overflow: hidden; }
+.seg label { flex: 1; text-align: center; font-size: 13px; padding: 6px 4px; cursor: pointer; color: var(--body); background: var(--soft); border-left: 1px solid var(--field); }
+.seg label:first-child { border-left: 0; }
+.seg input { position: absolute; opacity: 0; pointer-events: none; }
+.seg label:has(input:checked) { background: var(--accent); color: var(--on-accent); font-weight: 600; }
+.seg label:has(input:disabled) { opacity: 0.45; cursor: not-allowed; }
+.seg label:has(input:focus-visible) { outline: 2px solid var(--accent); outline-offset: -2px; }
+
+button {
+  font: inherit; font-size: 13.5px; font-weight: 500; padding: 7px 12px; border-radius: 8px; cursor: pointer;
+  border: 1px solid var(--field); background: var(--page); color: var(--text);
+}
+button:hover:not(:disabled) { border-color: var(--muted); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.primary { background: var(--accent); color: var(--on-accent); border-color: var(--accent); font-weight: 600; }
+button.primary:hover:not(:disabled) { filter: brightness(1.08); }
+.row { display: flex; gap: 8px; flex-wrap: wrap; }
+.row > * { flex: 1 1 auto; }
+
+.slots { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.slot { border: 1px solid var(--line); border-radius: 10px; padding: 8px; }
+.slot .thumb { display: block; width: 100%; aspect-ratio: 4 / 3; border-radius: 6px; background: var(--soft); margin-bottom: 8px; }
+.slot .name { font-size: 12px; color: var(--muted); margin-bottom: 6px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.slot .row { gap: 6px; }
+.slot .row button { flex: 1 1 0; min-width: 0; padding: 5px 4px; font-size: 12.5px; }
+
+.stage { position: relative; border: 1px solid var(--line); border-radius: 12px; background: var(--soft); overflow: hidden; min-height: 240px; }
+.stage canvas { display: block; width: 100%; height: auto; }
+.stage .busy { position: absolute; top: 12px; right: 12px; font-size: 12.5px; padding: 4px 10px; border-radius: 999px; background: var(--page); color: var(--muted); border: 1px solid var(--line); }
+.stage .busy[hidden] { display: none; }
+.legend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; color: var(--muted); margin: 10px 2px 0; }
+.legend b { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+.stats { margin-top: 18px; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 280px), 1fr)); gap: 16px; }
+.stats .panel + .panel { margin-top: 0; }
+table.t { border-collapse: collapse; width: 100%; font-size: 13.5px; font-variant-numeric: tabular-nums; }
+table.t th, table.t td { text-align: right; padding: 6px 8px; border-bottom: 1px solid var(--line-soft); white-space: nowrap; }
+table.t th:first-child, table.t td:first-child { text-align: left; }
+table.t th { color: var(--muted); font-weight: 500; border-bottom: 1px solid var(--line); }
+table.t td:first-child { white-space: normal; }
+table.t tr.total td { font-weight: 600; color: var(--text); border-bottom: 0; }
+dl.kv { display: grid; grid-template-columns: auto 1fr; gap: 6px 14px; margin: 0; font-size: 13.5px; }
+dl.kv dt { color: var(--muted); }
+dl.kv dd { margin: 0; color: var(--text); overflow-wrap: anywhere; }
+
+.camera { position: fixed; inset: 0; background: rgba(0, 0, 0, 0.72); display: grid; place-items: center; z-index: 20; }
+.camera[hidden] { display: none; }
+.camera .box { background: var(--page); border-radius: 14px; padding: 14px; width: min(720px, 92vw); }
+.camera video { width: 100%; border-radius: 8px; background: #000; display: block; margin-bottom: 12px; }
+
+.ok { color: var(--ok); } .bad { color: var(--bad); }
+.mono { font-family: var(--mono); font-size: 12.5px; }
+pre.out { font-family: var(--mono); font-size: 12.5px; background: var(--code-bg); border: 1px solid var(--line); border-radius: 10px; padding: 12px 14px; overflow-x: auto; color: var(--text); }
+
+@media (max-width: 760px) { .app { padding: 16px 18px 40px; } }

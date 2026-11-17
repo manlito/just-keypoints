@@ -1,0 +1,197 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Live demo · just-keypoints</title>
+<meta name="description" content="ALIKED or RaCo keypoints, descriptors and matches computed in your browser on WebGPU.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
+<link rel="stylesheet" href="../_static/jkp.css">
+<link rel="stylesheet" href="../app.css">
+<link rel="modulepreload" href="../lib/jkp.js">
+<link rel="modulepreload" href="../lib/jkp_wasm.js">
+</head>
+<body>
+<a class="jk-skip" href="#content">Skip to content</a>
+<header class="jk-top">
+  <div class="jk-top-in">
+    <a class="jk-brand" href="../index.html">
+      <svg width="22" height="22" viewBox="0 0 22 22" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="5" cy="6" r="2.2"></circle><circle cx="16.5" cy="4.5" r="2.2"></circle><circle cx="12" cy="16.5" r="2.2"></circle><path d="M2 19.5h4M4 17.5v4M15.5 11h4M17.5 9v4"></path></svg>
+      <span>just-keypoints</span>
+    </a>
+    <span class="jk-grow"></span>
+    <a class="jk-toplink" href="../index.html">Documentation</a>
+    <a class="jk-toplink" href="../demo/index.html" aria-current="page"><strong>Live demo</strong></a>
+    <a class="jk-toplink" href="../bench/index.html">Benchmark</a>
+  </div>
+</header>
+
+<main class="app" id="content">
+  <h1>Live demo</h1>
+  <p class="lede">ALIKED or RaCo keypoints and descriptors for two images, computed in this page on your GPU through
+  WebGPU, and the matches between them. Nothing is uploaded: your images stay in the browser.
+  The matcher (mutual nearest neighbours with a ratio test) is part of this demo, not of the library.
+  <a href="../browser.html">Use the library in your page</a>.</p>
+
+  <div class="banner warn" id="banner" hidden></div>
+
+  <div class="layout">
+    <div>
+      <section class="panel" aria-labelledby="h-images">
+        <h2 id="h-images">Images</h2>
+        <div class="field">
+          <label for="pair">Sample pair</label>
+          <select id="pair">
+            <option value="tum">Indoor, hand-held camera (TUM RGB-D)</option>
+            <option value="kitti">Street, car-mounted camera (KITTI)</option>
+            <option value="custom" hidden>Your images</option>
+          </select>
+        </div>
+        <div class="slots">
+          <div class="slot" data-slot="0">
+            <canvas class="thumb" width="240" height="180" aria-hidden="true"></canvas>
+            <div class="name">A</div>
+            <div class="row"><button type="button" data-act="file">Open…</button><button type="button" data-act="camera">Camera</button></div>
+          </div>
+          <div class="slot" data-slot="1">
+            <canvas class="thumb" width="240" height="180" aria-hidden="true"></canvas>
+            <div class="name">B</div>
+            <div class="row"><button type="button" data-act="file">Open…</button><button type="button" data-act="camera">Camera</button></div>
+          </div>
+        </div>
+        <input type="file" id="file" accept="image/*" hidden>
+        <p class="hint">Or drop an image on either side of the picture.</p>
+      </section>
+
+      <section class="panel" aria-labelledby="h-kp">
+        <h2 id="h-kp">Keypoints</h2>
+        <div class="field">
+          <span class="label">Detector</span>
+          <div class="seg" role="radiogroup" aria-label="Detector">
+            <label><input type="radio" name="det" value="aliked" checked>ALIKED</label>
+            <label><input type="radio" name="det" value="raco">RaCo</label>
+          </div>
+          <p class="hint" id="det-hint">ALIKED detects and describes keypoints in one network.</p>
+        </div>
+        <div class="field" id="f-mode">
+          <span class="label">Selection</span>
+          <div class="seg" role="radiogroup" aria-label="Selection">
+            <label><input type="radio" name="mode" value="topk" checked>Best K</label>
+            <label><input type="radio" name="mode" value="threshold">Score threshold</label>
+          </div>
+        </div>
+        <div class="field" id="f-topk">
+          <label for="topk"><span id="topk-l">Keypoints per image</span> <output id="topk-v">1000</output></label>
+          <input type="range" id="topk" min="100" max="8000" step="100" value="1000">
+        </div>
+        <div class="field" id="f-rank" hidden>
+          <label for="rank">Keep the best by ranker score <output id="rank-v">all</output></label>
+          <input type="range" id="rank" min="0" max="8000" step="100" value="0">
+          <p class="hint">RaCo's ranker scores which keypoints are worth keeping when you need fewer; its authors
+          subsample by them rather than by detection score. All: keep every detected keypoint.</p>
+        </div>
+        <div class="field" id="f-th" hidden>
+          <label for="th">Score threshold <output id="th-v">0.20</output></label>
+          <input type="range" id="th" min="0.01" max="0.9" step="0.01" value="0.2">
+          <label for="cap" style="margin-top:10px">At most <output id="cap-v">5000</output></label>
+          <input type="range" id="cap" min="500" max="20000" step="500" value="5000">
+        </div>
+        <div class="field">
+          <label for="res">Resolution (longer side)</label>
+          <select id="res">
+            <option value="0">As loaded</option>
+            <option value="1920">1920 px</option>
+            <option value="1280">1280 px</option>
+            <option value="1024">1024 px</option>
+            <option value="640">640 px</option>
+            <option value="480">480 px</option>
+          </select>
+        </div>
+        <div class="field">
+          <span class="label">Precision</span>
+          <div class="seg" role="radiogroup" aria-label="Precision">
+            <label><input type="radio" name="prec" value="fp32" checked>FP32</label>
+            <label><input type="radio" name="prec" value="fp16">FP16</label>
+          </div>
+          <p class="hint" id="prec-hint">FP32 matches the original network; FP16 is faster, with about 99.8 % of the keypoints the same.</p>
+        </div>
+        <div class="field">
+          <span class="label">Backend</span>
+          <div class="seg" role="radiogroup" aria-label="Backend">
+            <label><input type="radio" name="backend" value="webgpu" checked>WebGPU</label>
+            <label><input type="radio" name="backend" value="cpu">CPU</label>
+          </div>
+          <p class="hint" id="backend-hint">The CPU backend runs in WebAssembly on one thread: about a second per 640x480 image.</p>
+        </div>
+      </section>
+
+      <section class="panel" aria-labelledby="h-match">
+        <h2 id="h-match">Matches and display</h2>
+        <div class="field">
+          <label for="ratio">Ratio test <output id="ratio-v">0.90</output></label>
+          <input type="range" id="ratio" min="0.5" max="1" step="0.01" value="0.9">
+          <p class="hint">Keep a match when its distance is below this fraction of the second best. 1 keeps every mutual nearest neighbour.</p>
+        </div>
+        <label class="check"><input type="checkbox" id="show-kp" checked>Keypoints</label>
+        <label class="check"><input type="checkbox" id="show-m" checked>Match lines</label>
+        <div class="field" style="margin-top:12px">
+          <label for="cov">Covariance ellipses (RaCo)</label>
+          <select id="cov" disabled>
+            <option value="0">Off</option>
+            <option value="3">3σ, true size</option>
+            <option value="10" selected>10σ</option>
+            <option value="30">30σ</option>
+          </select>
+          <p class="hint">RaCo's keypoint uncertainty is typically about a pixel, too small to see at true size;
+          larger multiples show which keypoints are the uncertain ones.</p>
+        </div>
+        <div class="row" style="margin-top:12px"><button type="button" class="primary" id="run" disabled>Run again</button></div>
+        <p class="hint">Run again for warm timings: the first run on a new setting compiles the GPU shaders.</p>
+      </section>
+    </div>
+
+    <div>
+      <div class="stage" id="stage">
+        <canvas id="view" aria-label="The two images with keypoints and match lines"></canvas>
+        <div class="busy" id="busy">Loading the module…</div>
+      </div>
+      <div class="legend" id="legend"></div>
+
+      <div class="stats">
+        <section class="panel" aria-labelledby="h-time">
+          <h2 id="h-time">Time per step, ms</h2>
+          <table class="t" id="times">
+            <thead><tr><th>Step</th><th>A</th><th>B</th></tr></thead>
+            <tbody></tbody>
+          </table>
+          <p class="hint">Prepare: scaling the image and reading its pixels. Extract: the whole call into the library,
+          from copying the pixels in to reading keypoints and descriptors back. Match: both images, in a worker.</p>
+        </section>
+        <section class="panel" aria-labelledby="h-dev">
+          <h2 id="h-dev">Run</h2>
+          <dl class="kv" id="device"></dl>
+        </section>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div class="camera" id="camera" hidden>
+  <div class="box">
+    <video id="video" playsinline muted></video>
+    <div class="row"><button type="button" class="primary" id="cam-take">Take picture</button><button type="button" id="cam-cancel">Cancel</button></div>
+  </div>
+</div>
+
+<footer class="jk-foot">
+  <div class="jk-foot-in">
+    <span>just-keypoints · weights from ALIKED (BSD-3-Clause) and RaCo (Apache-2.0) · sample images: TUM RGB-D (CC BY 4.0), KITTI (CC BY-NC-SA 3.0)</span>
+    <a href="../references.html">References and acknowledgements</a>
+  </div>
+</footer>
+<script type="module" src="demo.js"></script>
+</body>
+</html>

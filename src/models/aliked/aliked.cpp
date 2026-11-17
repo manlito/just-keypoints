@@ -46,8 +46,8 @@ TensorPtr Aliked::block(Ops& ops, const TensorPtr& x, int i) const {
   return ops.add(y, apply(ops, x, down_[i], Act::None), Act::Selu);
 }
 
-void Aliked::extract(Ops& ops, const uint8_t* data, int width, int height, int stride, int channels,
-                     const DetectParams& detect, Features* out, const StageSink& sink) const {
+void Aliked::dense(Ops& ops, const uint8_t* data, int width, int height, int stride, int channels,
+                   const StageSink& sink, TensorPtr* feature_map_out, TensorPtr* score_map_out) const {
   if (width < 1 || height < 1) throw std::runtime_error("image is empty");
   auto emit = [&](const char* name, const TensorPtr& t) {
     if (sink) sink(name, t);
@@ -71,16 +71,38 @@ void Aliked::extract(Ops& ops, const uint8_t* data, int width, int height, int s
   TensorPtr a3 = apply(ops, x3, agg_[2], Act::Selu);
   TensorPtr a4 = apply(ops, x4, agg_[3], Act::Selu);
   emit("a1", a1), emit("a2", a2), emit("a3", a3), emit("a4", a4);
-  TensorPtr x1234 = ops.concat({a1, ops.upsample(a2, 2), ops.upsample(a3, 8), ops.upsample(a4, 32)});
+  TensorPtr x1234 = ops.upsample_concat({a1, a2, a3, a4}, {1, 2, 8, 32});
   emit("x1234", x1234);
 
   // Score head.
-  TensorPtr s = apply(ops, x1234, score_[0], Act::Selu);
-  s = apply(ops, s, score_[1], Act::Selu);
-  s = apply(ops, s, score_[2], Act::Selu);
-  TensorPtr score_map = ops.crop(apply(ops, s, score_[3], Act::Sigmoid), left, top, width, height);
-  TensorPtr feature_map = ops.crop(ops.l2_normalize(x1234), left, top, width, height);
-  emit("score_map", score_map), emit("feature_map", feature_map);
+  if (score_map_out) {
+    TensorPtr s = apply(ops, x1234, score_[0], Act::Selu);
+    s = apply(ops, s, score_[1], Act::Selu);
+    s = apply(ops, s, score_[2], Act::Selu);
+    *score_map_out = ops.crop(apply(ops, s, score_[3], Act::Sigmoid), left, top, width, height);
+    emit("score_map", *score_map_out);
+  }
+  *feature_map_out = ops.l2_normalize_crop(x1234, left, top, width, height);
+  emit("feature_map", *feature_map_out);
+}
+
+void Aliked::describe_at(Ops& ops, const uint8_t* data, int width, int height, int stride, int channels,
+                         const float* xy, int n, std::vector<float>* desc) const {
+  TensorPtr feature_map;
+  dense(ops, data, width, height, stride, channels, nullptr, &feature_map, nullptr);
+  // Same normalization as ALIKED.describe in cvg/LightGlue; the descriptor head maps it back to pixels.
+  Keypoints kpts;
+  kpts.xy_norm.resize(2 * static_cast<size_t>(n));
+  kpts.score.assign(n, 0.0f);
+  const float wh[2] = {static_cast<float>(width - 1), static_cast<float>(height - 1)};
+  for (int i = 0; i < 2 * n; ++i) kpts.xy_norm[i] = 2.0f * xy[i] / wh[i % 2] - 1.0f;
+  ops.describe(feature_map, kpts, sddh_, desc);
+}
+
+void Aliked::extract(Ops& ops, const uint8_t* data, int width, int height, int stride, int channels,
+                     const DetectParams& detect, Features* out, const StageSink& sink) const {
+  TensorPtr feature_map, score_map;
+  dense(ops, data, width, height, stride, channels, sink, &feature_map, &score_map);
 
   Keypoints kpts;
   ops.detect(score_map, detect, &kpts);
@@ -89,6 +111,8 @@ void Aliked::extract(Ops& ops, const uint8_t* data, int width, int height, int s
   out->n = kpts.n();
   out->dim = dim_;
   out->score = kpts.score;
+  out->rank.clear();
+  out->cov.clear();
   out->xy.resize(2 * static_cast<size_t>(out->n));
   const float wh[2] = {static_cast<float>(width - 1), static_cast<float>(height - 1)};
   for (int i = 0; i < 2 * out->n; ++i) out->xy[i] = wh[i % 2] * (kpts.xy_norm[i] + 1.0f) / 2.0f;

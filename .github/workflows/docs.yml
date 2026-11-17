@@ -1,7 +1,11 @@
-# The documentation site with the live demo (docs/README.md). Started by hand only, like just-ba's:
+# The documentation site with the live demo (docs/README.md).
 #
-#   gh workflow run docs                    # build the WebAssembly module and the site
-#   gh workflow run docs -f deploy=true     # the same, then publish to Cloudflare Pages
+#   merge into main                         # build the WebAssembly module and the site, publish it
+#   pull request into main                  # build only, so a broken site fails before the merge
+#   gh workflow run docs                    # by hand: build only
+#   gh workflow run docs -f deploy=true     # by hand: build, then publish to Cloudflare Pages
+#
+# Changes to only the notes (PLAN.md, the READMEs) don't run it: none of them is part of the site.
 #
 # Free hosted runner. Deploying needs the repository secrets CLOUDFLARE_API_TOKEN (permission
 # "Cloudflare Pages: Edit") and CLOUDFLARE_ACCOUNT_ID, and a Pages project made for direct upload, named by
@@ -9,6 +13,18 @@
 name: docs
 
 on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - "tools/*.md"
+      - "docs/README.md"
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "*.md"
+      - "tools/*.md"
+      - "docs/README.md"
   workflow_dispatch:
     inputs:
       deploy:
@@ -16,8 +32,10 @@ on:
         type: boolean
         default: false
 
+# One run per branch or pull request; a newer push replaces a run still going, so main always publishes
+# its latest commit.
 concurrency:
-  group: docs
+  group: docs-${{ github.ref }}
   cancel-in-progress: true
 
 permissions:
@@ -58,7 +76,7 @@ jobs:
           name: docs-html
           path: docs/_build/html
       - name: Deploy to Cloudflare Pages
-        if: inputs.deploy
+        if: github.event_name == 'push' || inputs.deploy
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

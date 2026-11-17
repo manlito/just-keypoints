@@ -23,18 +23,29 @@ EMSCRIPTEN_KEEPALIVE int jkpw_backend_available(int backend) {
   return jkp_backend_available(static_cast<jkp_backend>(backend));
 }
 
-// weights: a .jkpw file in module memory, copied by jkp_create. Returns null on failure (jkpw_error).
-EMSCRIPTEN_KEEPALIVE Handle* jkpw_create(int backend, int precision, const void* weights, int weights_size, int top_k,
-                                         float score_threshold, int max_keypoints) {
+// weights: a .jkpw file in module memory, copied by jkp_create; its metadata names the model (aliked-n16 or
+// raco). descriptor_weights (may be null): an aliked-n16 file that describes the keypoints of raco.
+// Returns null on failure (jkpw_error).
+EMSCRIPTEN_KEEPALIVE Handle* jkpw_create(int backend, int precision, const void* weights, int weights_size,
+                                         const void* descriptor_weights, int descriptor_weights_size, int top_k,
+                                         float score_threshold, int max_keypoints, int skip_ranker,
+                                         int skip_covariance) {
   jkp_config config;
   jkp_config_default(&config);
   config.backend = static_cast<jkp_backend>(backend);
   config.precision = static_cast<jkp_precision>(precision);
   config.weights_data = weights;
   config.weights_size = static_cast<size_t>(weights_size);
+  if (descriptor_weights && descriptor_weights_size > 0) {
+    config.descriptor = "aliked-n16";
+    config.descriptor_weights_data = descriptor_weights;
+    config.descriptor_weights_size = static_cast<size_t>(descriptor_weights_size);
+  }
   config.top_k = top_k;
   config.score_threshold = score_threshold;
   config.max_keypoints = max_keypoints;
+  config.skip_ranker = skip_ranker;
+  config.skip_covariance = skip_covariance;
   jkp_ctx* ctx = jkp_create(&config);
   if (!ctx) return nullptr;
   Handle* h = new (std::nothrow) Handle;
@@ -57,6 +68,8 @@ EMSCRIPTEN_KEEPALIVE int jkpw_dim(Handle* h) { return h->result.dim; }
 EMSCRIPTEN_KEEPALIVE const float* jkpw_xy(Handle* h) { return h->result.xy; }
 EMSCRIPTEN_KEEPALIVE const float* jkpw_score(Handle* h) { return h->result.score; }
 EMSCRIPTEN_KEEPALIVE const float* jkpw_desc(Handle* h) { return h->result.desc; }
+EMSCRIPTEN_KEEPALIVE const float* jkpw_rank(Handle* h) { return h->result.rank; }
+EMSCRIPTEN_KEEPALIVE const float* jkpw_cov(Handle* h) { return h->result.cov; }
 EMSCRIPTEN_KEEPALIVE const char* jkpw_error() { return jkp_last_error(); }
 
 EMSCRIPTEN_KEEPALIVE void jkpw_destroy(Handle* h) {

@@ -148,12 +148,13 @@ on WebGPU, published at <https://just-keypoints.pages.dev>. Build and deploy: [d
 ## RaCo detector
 
 [RaCo](https://github.com/cvg/RaCo) is a second model: a detector that returns, per keypoint, a ranker score
-and a 2x2 covariance in pixels², and no descriptors. It runs on the CPU and Metal backends and matches the
-original on both; CUDA and WebGPU are still to come.
+and a 2x2 covariance in pixels², and no descriptors. It runs on the CPU, Metal and WebGPU backends (natively and
+in the browser) and matches the original on each; CUDA is still to come.
 
 ```sh
 build/release/jkp extract image.png --model raco --out features.jkpt
 build/release/jkp extract image.png --model raco --backend metal --out features.jkpt
+build/release/jkp extract image.png --model raco --backend webgpu --out features.jkpt
 python tools/compare.py --model raco image.png --b "cmd:build/release/jkp extract --model raco --backend metal"
 ```
 
@@ -164,6 +165,7 @@ the covariance head is about three quarters of the run time on the CPU and more 
 The default build embeds both models; with `-DJKP_EMBED_MODELS=aliked-n16` (RaCo adds ~2 MB) pass
 `--weights weights/raco.jkpw` instead. RaCo runs in FP32 only.
 In the C API set `config.model = "raco"`; the result then has `rank` and `cov`, and `desc` is `NULL` unless a descriptor model is set.
+In the browser: `jkp.create({ weightsUrl: 'raco.jkpw', descriptorWeightsUrl: 'aliked-n16.jkpw' })`; results add `rank` and `cov`.
 `top_k` is the number of keypoints (default 2048); there is no score threshold.
 
 ## Licenses

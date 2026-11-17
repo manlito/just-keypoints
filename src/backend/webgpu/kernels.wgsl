@@ -1137,3 +1137,228 @@ fn run(t: i32) {
   let out = t * c;
   for (var ch = 0; ch < c; ch++) { sampled[out + ch] = acc[ch]; }
 }
+
+// ---------------------------------------------------------------------------------------------
+// RaCo kernels (normalize, pad_reflect, detect_raco), ported from the Metal backend. Same float32 steps
+// as the CPU backend, except that the softmax sum is a compensated float sum in blocks instead of a double
+// sum in raster order, and softplus is computed without log1p (WGSL has none).
+// ---------------------------------------------------------------------------------------------
+
+//@kernel k_normalize
+// (x - mean[c]) / std[c]; ms holds the c means, then the c standard deviations.
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read> ms: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<real>;
+fn run(i: i32) {
+  let c = pi(0u);
+  let hw = pi(1u);
+  if (i >= c * hw) { return; }
+  let ch = i / hw;
+  out[i] = real((f32(x[i]) - ms[ch]) / ms[c + ch]);
+}
+
+//@kernel k_pad_reflect
+// Mirror padding by p on every side, without repeating the border pixel (PyTorch "reflect").
+@group(0) @binding(1) var<storage, read> src: array<real>;
+@group(0) @binding(2) var<storage, read_write> dst: array<real>;
+fn mirror(i: i32, n: i32) -> i32 {
+  if (i < 0) { return -i; }
+  if (i >= n) { return 2 * (n - 1) - i; }
+  return i;
+}
+fn run(i: i32) {
+  let c = pi(0u);
+  let h = pi(1u);
+  let w = pi(2u);
+  let p = pi(3u);
+  let oh = h + 2 * p;
+  let ow = w + 2 * p;
+  let ohw = oh * ow;
+  if (i >= c * ohw) { return; }
+  let ch = i / ohw;
+  let y = (i % ohw) / ow;
+  let x = i % ow;
+  dst[i] = src[(ch * h + mirror(y - p, h)) * w + mirror(x - p, w)];
+}
+
+//@kernel k_softmax_block_max
+// Softmax over the whole map, in five steps: block maxima, the maximum (stats[0]), block sums of
+// exp(l - max), the sum (stats[1]); then the probabilities. One thread per block of kScanBlock elements
+// for the block steps, one thread for the reductions.
+@group(0) @binding(1) var<storage, read> l: array<real>;
+@group(0) @binding(2) var<storage, read_write> partial: array<f32>;
+fn run(b: i32) {
+  let n = pi(0u);
+  let begin = b * kScanBlock;
+  if (begin >= n) { return; }
+  let end = min(n, begin + kScanBlock);
+  var m = f32(l[begin]);
+  for (var i = begin + 1; i < end; i++) { m = max(m, f32(l[i])); }
+  partial[b] = m;
+}
+
+//@kernel k_softmax_max
+@group(0) @binding(1) var<storage, read> partial: array<f32>;
+@group(0) @binding(2) var<storage, read_write> stats: array<f32>;
+fn run(i: i32) {
+  let blocks = pi(0u);
+  if (i != 0) { return; }
+  var m = partial[0];
+  for (var b = 1; b < blocks; b++) { m = max(m, partial[b]); }
+  stats[0] = m;
+}
+
+//@kernel k_softmax_block_sum
+// Kahan summation, so the result stays close to the CPU backend's double sum.
+@group(0) @binding(1) var<storage, read> l: array<real>;
+@group(0) @binding(2) var<storage, read> stats: array<f32>;
+@group(0) @binding(3) var<storage, read_write> partial: array<f32>;
+fn run(b: i32) {
+  let n = pi(0u);
+  let begin = b * kScanBlock;
+  if (begin >= n) { return; }
+  let end = min(n, begin + kScanBlock);
+  let m = stats[0];
+  var sum = 0.0;
+  var comp = 0.0;
+  for (var i = begin; i < end; i++) {
+    let y = exp(f32(l[i]) - m) - comp;
+    let t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  partial[b] = sum;
+}
+
+//@kernel k_softmax_sum
+@group(0) @binding(1) var<storage, read> partial: array<f32>;
+@group(0) @binding(2) var<storage, read_write> stats: array<f32>;
+fn run(i: i32) {
+  let blocks = pi(0u);
+  if (i != 0) { return; }
+  var sum = 0.0;
+  var comp = 0.0;
+  for (var b = 0; b < blocks; b++) {
+    let y = partial[b] - comp;
+    let t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  stats[1] = sum;
+}
+
+//@kernel k_softmax_prob
+@group(0) @binding(1) var<storage, read> l: array<real>;
+@group(0) @binding(2) var<storage, read> stats: array<f32>;
+@group(0) @binding(3) var<storage, read_write> prob: array<f32>;
+fn run(i: i32) {
+  let n = pi(0u);
+  if (i >= n) { return; }
+  prob[i] = exp(f32(l[i]) - stats[0]) / stats[1];
+}
+
+//@kernel k_raco_nms
+// nms = probability where it equals the maximum of its window, zero elsewhere (no border exclusion).
+// Probabilities below the smallest normal float are not maxima, as on the CPU: the GPU may flush them to zero.
+@group(0) @binding(1) var<storage, read> prob: array<f32>;
+@group(0) @binding(2) var<storage, read> pooled: array<f32>;
+@group(0) @binding(3) var<storage, read_write> nms: array<f32>;
+fn run(i: i32) {
+  let n = pi(0u);
+  if (i >= n) { return; }
+  let p = prob[i];
+  nms[i] = select(0.0, p, p == pooled[i] && p >= 1.17549435e-38);
+}
+
+//@kernel k_raco_refine
+// Subpixel refinement and sampling, one thread per keypoint: softmax of logit / temperature in the k x k
+// window (outside the map counts as logit 0), expected offset; then bilinear samples at the refined
+// position, clamped to the map, of the probabilities, the ranker map and the Cholesky map (softplus on
+// channels 0 and 2 at each of the four neighbours).
+// One output buffer (WebGPU guarantees only eight storage buffers per kernel): xy [2n], score [n], then
+// rank [n] with a ranker map, then the Cholesky elements [3n] with a Cholesky map.
+@group(0) @binding(1) var<storage, read> logits: array<real>;
+@group(0) @binding(2) var<storage, read> prob: array<f32>;
+@group(0) @binding(3) var<storage, read> ranker: array<real>;
+@group(0) @binding(4) var<storage, read> chol: array<real>;
+@group(0) @binding(5) var<storage, read> idx: array<i32>;
+@group(0) @binding(6) var<storage, read_write> res: array<f32>;
+// log(1 + exp(x)), linear above 20 as in PyTorch; accurate to a few ulp without log1p.
+fn softplus(x: f32) -> f32 {
+  if (x > 20.0) { return x; }
+  let u = exp(x);
+  let y = 1.0 + u;
+  let z = y - 1.0;
+  if (z == 0.0) { return u; }
+  return log(y) * (u / z);
+}
+fn run(i: i32) {
+  let has_ranker = pi(0u);
+  let has_chol = pi(1u);
+  let w = pi(2u);
+  let h = pi(3u);
+  let n = pi(4u);
+  let k = pi(5u);
+  let temperature = pf(6u);
+  if (i >= n) { return; }
+  let r = k / 2;
+  let x = idx[i] % w;
+  let y = idx[i] / w;
+  var win: array<f32, 81>;
+  var max_v = kLowest;
+  for (var dy = -r; dy <= r; dy++) {
+    for (var dx = -r; dx <= r; dx++) {
+      let px = x + dx;
+      let py = y + dy;
+      var v = 0.0;
+      if (px >= 0 && px < w && py >= 0 && py < h) { v = f32(logits[py * w + px]); }
+      v = v / temperature;
+      win[(dy + r) * k + dx + r] = v;
+      max_v = max(max_v, v);
+    }
+  }
+  var psum = 0.0;
+  var sx = 0.0;
+  var sy = 0.0;
+  for (var j = 0; j < k * k; j++) {
+    win[j] = exp(win[j] - max_v);
+    psum += win[j];
+  }
+  for (var j = 0; j < k * k; j++) {
+    let p = win[j] / psum;
+    sx += p * f32(j % k - r);
+    sy += p * f32(j / k - r);
+  }
+  let xy = array<f32, 2>(f32(x) + sx, f32(y) + sy);
+  res[2 * i] = xy[0];
+  res[2 * i + 1] = xy[1];
+
+  // grid_sample, padding_mode = border, align_corners = true: normalize to [-1, 1], map back, clamp.
+  let wh = array<f32, 2>(f32(w - 1), f32(h - 1));
+  var g: array<f32, 2>;
+  for (var a = 0; a < 2; a++) {
+    var v = 0.0;
+    if (wh[a] > 0.0) { v = ((2.0 * xy[a] / wh[a] - 1.0) + 1.0) / 2.0 * wh[a]; }
+    g[a] = min(wh[a], max(v, 0.0));
+  }
+  let b = bilinear_setup(g[0], g[1], w, h);
+  res[2 * n + i] = b.wt[0] * prob[b.idx[0]] + b.wt[1] * prob[b.idx[1]] + b.wt[2] * prob[b.idx[2]] +
+                   b.wt[3] * prob[b.idx[3]];
+  var at = 3 * n;
+  if (has_ranker != 0) {
+    res[at + i] = b.wt[0] * f32(ranker[b.idx[0]]) + b.wt[1] * f32(ranker[b.idx[1]]) +
+                  b.wt[2] * f32(ranker[b.idx[2]]) + b.wt[3] * f32(ranker[b.idx[3]]);
+    at += n;
+  }
+  if (has_chol != 0) {
+    let hw = w * h;
+    for (var c = 0; c < 3; c++) {
+      var v: array<f32, 4>;
+      for (var j = 0; j < 4; j++) {
+        let raw = f32(chol[c * hw + b.idx[j]]);
+        v[j] = select(softplus(raw), raw, c == 1);
+      }
+      res[at + 3 * i + c] = b.wt[0] * v[0] + b.wt[1] * v[1] + b.wt[2] * v[2] + b.wt[3] * v[3];
+    }
+  }
+}

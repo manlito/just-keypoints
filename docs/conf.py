@@ -32,7 +32,7 @@ html_show_sourcelink = False
 
 # The module's files and the weights, served from lib/.
 LIB_FILES = {"jkp.js": "jkp.js", "jkp_wasm.js": "jkp_wasm.js", "jkp_wasm.wasm": "jkp_wasm.wasm",
-             "aliked-n16.jkpw": "aliked-n16.jkpw"}
+             "aliked-n16.jkpw": "aliked-n16.jkpw", "raco.jkpw": "raco.jkpw"}
 
 
 def copy_module(app, exception):

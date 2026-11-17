@@ -220,10 +220,54 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
   1.3e-6 (relative); against the CPU backend on generated images (`metal_raco_vs_cpu`) every stage is within
   2.3e-6 and the keypoint sets are identical.
   FP32 only, like the CPU backend (the API refuses `precision = fp16` for RaCo; see the notes from R5).
-  Not tuned, and not yet timed on an idle machine: the only runs so far were taken while other jobs loaded it,
-  so they give proportions, not times. The covariance head took 55-65 % of a run, the ranker head most of
-  the rest; without both heads RaCo took about as long as ALIKED. To re-measure with `tools/bench.py`.
-- [ ] **R6 — RaCo on WebGPU** (with M6); detector switch, covariance ellipses and top-K by ranker score in the M7 demo.
+  Not tuned. Timed with `tools/bench.py` in R6 (table there): 44.6 ms at 640x480 and 286 ms at 1920x1080 on
+  Metal, 5-10 times ALIKED. The covariance head is about 60 % of a run, the ranker head most of the rest;
+  without both heads RaCo takes about as long as ALIKED.
+- [x] **R6 — RaCo on WebGPU** (with M6); detector switch, covariance ellipses and top-K by ranker score in the M7 demo.
+  `jkp extract image.png --model raco --backend webgpu`, with `--descriptor aliked-n16` and the head switches;
+  in the browser `jkp.create({ weightsUrl: 'raco.jkpw', descriptorWeightsUrl: 'aliked-n16.jkpw' })`.
+  Done (M5 Pro, macOS 26, Dawn v20261113.214538 natively, Chrome 156 in the desktop app's browser pane):
+  - Natively, on the R1 image set (53 images), against the original: keypoint overlap >= 99.95 %, position error
+    <= 1.2e-4 px, score error <= 9.0e-5 of the best score, ranker error <= 1.2e-5 of the largest score, covariance
+    error <= 1.6e-4 (relative); with ALIKED descriptors, descriptor cosine >= 1 - 1.7e-9 and the other bounds
+    unchanged (Metal in R5: 4.3e-5, 7.5e-6, 1.4e-4, 1 - 1.3e-9). Every intermediate tensor of the three RaCo
+    golden files matches within 1.3e-6 (relative); `webgpu_raco_vs_cpu` pairs every keypoint one to one on all
+    12 cases (24,646 keypoints on the largest); `ops_test` passes the RaCo operations in FP32 and FP16 storage.
+  - In Chrome (`web/test.html`, the 10 images of M6, top 2048 with ALIKED descriptors, against the native CPU
+    backend): WebGPU pairs 2048 / 2048 keypoints on every image, position <= 6.8e-5 px, score <= 6.6e-5,
+    ranker <= 1.1e-5, covariance <= 1.5e-4, descriptor cosine >= 1 - 5.0e-7. The module's CPU backend
+    agrees as closely (9 images; the 3-megapixel one does not fit its memory).
+  - Speed, ms per image, same method as M5 (`tools/bench.py`: top-k 1000, FP32, median of 30 warm runs, median
+    over 3 rounds, columns timed in turn; load average below 2, and ALIKED on Metal reproduces M5's numbers). CPU
+    backend: 3 runs, one round, all threads. CUDA has no RaCo yet (R4); its ALIKED column is M5's (RTX 2070).
+
+    | Size | Model | CPU | Metal | WebGPU | CUDA |
+    |---|---|---|---|---|---|
+    | 640x480 | ALIKED | 68 | 8.3 | 9.7 | 15.2 |
+    | | RaCo | 410 | 44.6 | 45.8 | |
+    | | RaCo + ALIKED descriptors | 465 | 51.2 | 52.7 | |
+    | | RaCo without covariance | 109 | 18.3 | 19.0 | |
+    | 1241x376 | ALIKED | 101 | 10.3 | 12.4 | 19.6 |
+    | | RaCo | 649 | 67.4 | 69.6 | |
+    | | RaCo + ALIKED descriptors | 730 | 75.4 | 78.4 | |
+    | | RaCo without covariance | 167 | 26.0 | 27.6 | |
+    | 1024x768 | ALIKED | 164 | 13.7 | 17.2 | 26.8 |
+    | | RaCo | 1080 | 109.0 | 112.7 | |
+    | | RaCo + ALIKED descriptors | 1211 | 119.7 | 124.6 | |
+    | | RaCo without covariance | 287 | 41.9 | 43.3 | |
+    | 1920x1080 | ALIKED | 376 | 29.5 | 37.7 | 59.1 |
+    | | RaCo | 2732 | 286.1 | 295.2 | |
+    | | RaCo + ALIKED descriptors | 3050 | 308.9 | 319.0 | |
+    | | RaCo without covariance | 750 | 107.6 | 111.0 | |
+
+    RaCo costs about 5 times ALIKED at 640x480 on the GPUs and 8-10 times at 1920x1080: its heads run at full
+    resolution. WebGPU is within 2-4 % of Metal on RaCo (15-28 % slower on ALIKED). An earlier run at 640x480
+    with 2048 keypoints, under load: without both heads 8.3 ms on WebGPU and 8.1 ms on Metal. In Chrome with
+    descriptors, top 2048, pane hidden: 56 ms at 640x480, 81 ms at 1241x376, 0.47 s at 2075x1491. The module's
+    CPU backend (one thread) takes about 12 s at 640x480, against 1.1 s for ALIKED.
+  - Demo: detector switch (ALIKED, or RaCo described by ALIKED), best K by ranker score, covariance ellipses at
+    3, 10 or 30 sigma. TUM pair, WebGPU: RaCo top 1000 gives 318 matches at ratio 0.9 (ALIKED: 229); 2000
+    detected and the 500 best by ranker kept give 224 matches.
 
 ## Phases
 
@@ -322,6 +366,8 @@ one app. just-ba already ships a WebGPU backend built this way (its document 16,
   Fusing reflect padding into the convolution and running the covariance head in FP16 belong to M5.
 - Done (R5): Metal. The 5x5 ranker convolution got tiled instantiations (`k_conv2d_t*_k5`); the top-k
   selection of `detect` is shared with `detect_raco` (`Selection` in `metal_ops.mm`).
+- Done (R6): WebGPU, the same port (`Selection` in `webgpu_ops.cpp`, `k_conv2d_tile` with K = 5); the browser
+  module takes RaCo weights and descriptor weights, the demo has the detector switch.
 - **Exit:** RaCo keypoints, ranker scores and covariances match the original on every backend; RaCo + ALIKED
   descriptors selectable in the demo.
 
@@ -407,6 +453,28 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
   logits in float (as ALIKED's score map) and measure the result against FP32.
 - Speed is dominated by the full-resolution heads: the covariance head is 55-65 % of the run time and the
   ranker (nine residual blocks at full resolution, 5x5 output) most of the rest; neither is tiled or fused yet.
+
+### Notes from R6
+
+- The WebGPU kernels are the Metal ones (R5) in WGSL: softmax in five dispatches with compensated float sums,
+  NMS on the probabilities with the FLT_MIN rule, softplus without `log1p`.
+- `k_raco_refine` writes xy, scores, ranker scores and Cholesky elements into one buffer: WebGPU guarantees only
+  eight storage buffers per kernel, and separate outputs would need nine.
+- WGSL reserves `patch` as a keyword (a shader compile error names it); the refinement window is `win`.
+- WebGPU differs from the CPU about three times as much as Metal does (against the CPU on `imw.png`: score
+  6.4e-5 against 1.9e-5, ranker 1.2e-5 against 3.5e-6, covariance 1.2e-4 against 3.4e-5). The ranker and
+  covariance heads do not go through the softmax, so the difference comes from the dense network: WGSL cannot
+  turn off contraction into fused multiply-add (M6). The keypoint sets are unaffected.
+- Speed is the covariance head's, as on Metal: about 27 of the 46 ms at 640x480 (59 %), 184 of 295 ms at
+  1920x1080 (62 %); the ranker head most of the rest. WebGPU is level with Metal here because both spend that
+  time in the same untuned full-resolution convolutions.
+- Demo: RaCo's covariances are about a pixel (mean largest sigma 0.9 px on the TUM frames), so at 3 sigma an
+  ellipse is about one screen pixel when a 640 px image is shown 250 px wide; the default is 10 sigma, and the
+  page says so. Subsampling by ranker score runs in the page on the returned keypoints (sort by `rank`, keep
+  K), as RaCo's README describes; the library still returns the best `top_k` by detection score.
+- The browser module's `jkpw_create` takes the descriptor weights and the head switches; results add `rank` and
+  `cov` (null when absent). `web/test.html` has a RaCo run per backend (FP32 only), with test data from
+  `tools/web_testdata.py` (`--raco-weights`, on by default).
 
 ## Development machines
 
@@ -588,8 +656,7 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
   San Marco photos there were left out: their source and licence are not stated.
 - Not checked: Edge, Chrome on Windows and Linux, the fallback without WebGPU in a real browser (the CPU
   backend path itself was run), and the camera (needs a device and a permission prompt).
-- RaCo in the demo (detector switch, covariance ellipses) waits for R6: the browser module has no model
-  option yet.
+- RaCo in the demo: added with R6; see the notes from R6.
 
 ## Open questions (decide during implementation)
 

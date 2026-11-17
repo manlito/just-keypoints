@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Live demo · just-keypoints</title>
-<meta name="description" content="ALIKED keypoints, descriptors and matches computed in your browser on WebGPU.">
+<meta name="description" content="ALIKED or RaCo keypoints, descriptors and matches computed in your browser on WebGPU.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -31,8 +31,8 @@
 
 <main class="app" id="content">
   <h1>Live demo</h1>
-  <p class="lede">ALIKED keypoints and descriptors for two images, computed in this page on your GPU through WebGPU,
-  and the matches between them. Nothing is uploaded: your images stay in the browser.
+  <p class="lede">ALIKED or RaCo keypoints and descriptors for two images, computed in this page on your GPU through
+  WebGPU, and the matches between them. Nothing is uploaded: your images stay in the browser.
   The matcher (mutual nearest neighbours with a ratio test) is part of this demo, not of the library.
   <a href="../browser.html">Use the library in your page</a>.</p>
 
@@ -69,6 +69,14 @@
       <section class="panel" aria-labelledby="h-kp">
         <h2 id="h-kp">Keypoints</h2>
         <div class="field">
+          <span class="label">Detector</span>
+          <div class="seg" role="radiogroup" aria-label="Detector">
+            <label><input type="radio" name="det" value="aliked" checked>ALIKED</label>
+            <label><input type="radio" name="det" value="raco">RaCo</label>
+          </div>
+          <p class="hint" id="det-hint">ALIKED detects and describes keypoints in one network.</p>
+        </div>
+        <div class="field" id="f-mode">
           <span class="label">Selection</span>
           <div class="seg" role="radiogroup" aria-label="Selection">
             <label><input type="radio" name="mode" value="topk" checked>Best K</label>
@@ -76,8 +84,14 @@
           </div>
         </div>
         <div class="field" id="f-topk">
-          <label for="topk">Keypoints per image <output id="topk-v">1000</output></label>
+          <label for="topk"><span id="topk-l">Keypoints per image</span> <output id="topk-v">1000</output></label>
           <input type="range" id="topk" min="100" max="8000" step="100" value="1000">
+        </div>
+        <div class="field" id="f-rank" hidden>
+          <label for="rank">Keep the best by ranker score <output id="rank-v">all</output></label>
+          <input type="range" id="rank" min="0" max="8000" step="100" value="0">
+          <p class="hint">RaCo's ranker scores which keypoints are worth keeping when you need fewer; its authors
+          subsample by them rather than by detection score. All: keep every detected keypoint.</p>
         </div>
         <div class="field" id="f-th" hidden>
           <label for="th">Score threshold <output id="th-v">0.20</output></label>
@@ -123,6 +137,17 @@
         </div>
         <label class="check"><input type="checkbox" id="show-kp" checked>Keypoints</label>
         <label class="check"><input type="checkbox" id="show-m" checked>Match lines</label>
+        <div class="field" style="margin-top:12px">
+          <label for="cov">Covariance ellipses (RaCo)</label>
+          <select id="cov" disabled>
+            <option value="0">Off</option>
+            <option value="3">3σ, true size</option>
+            <option value="10" selected>10σ</option>
+            <option value="30">30σ</option>
+          </select>
+          <p class="hint">RaCo's keypoint uncertainty is typically about a pixel, too small to see at true size;
+          larger multiples show which keypoints are the uncertain ones.</p>
+        </div>
         <div class="row" style="margin-top:12px"><button type="button" class="primary" id="run" disabled>Run again</button></div>
         <p class="hint">Run again for warm timings: the first run on a new setting compiles the GPU shaders.</p>
       </section>
@@ -163,7 +188,7 @@
 
 <footer class="jk-foot">
   <div class="jk-foot-in">
-    <span>just-keypoints · weights from ALIKED (BSD-3-Clause) · sample images: TUM RGB-D (CC BY 4.0), KITTI (CC BY-NC-SA 3.0)</span>
+    <span>just-keypoints · weights from ALIKED (BSD-3-Clause) and RaCo (Apache-2.0) · sample images: TUM RGB-D (CC BY 4.0), KITTI (CC BY-NC-SA 3.0)</span>
     <a href="../references.html">References and acknowledgements</a>
   </div>
 </footer>

@@ -3,6 +3,13 @@
 Keypoint and descriptor extraction (ALIKED) with minimal dependencies, for feature matching and bundle adjustment.
 No PyTorch, no ONNX Runtime. Plan and status: [PLAN.md](PLAN.md).
 
+> [!IMPORTANT]
+> **Use [ALIKED](https://github.com/Shiaoming/ALIKED) and [RaCo](https://github.com/cvg/RaCo).** This repository
+> is a test bed for dependency-free inference and GPU kernels, not a replacement for them. It adds nothing to
+> either except speed and fewer dependencies: no new networks, training or features, and only a subset of what
+> they offer (one ALIKED variant, `aliked-n16`; RaCo is planned). The methods, the weights, and the credit for
+> them are their authors'. For real work, ALIKED and RaCo are the projects to depend on.
+
 Status: the CPU reference backend and the CUDA backend work and match the original ALIKED. The CUDA backend is
 not optimized yet. Metal and WebGPU backends are planned.
 

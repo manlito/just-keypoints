@@ -197,6 +197,81 @@ int main(int argc, char** argv) {
       check_vec("describe " + mode + " (stored map)", desc[0], desc[1]);
       check_vec("describe " + mode + " (pyramid)", desc_lazy[0], desc_lazy[1]);
     }
+
+    // RaCo operations, on the backends that have them (the others throw from Ops::normalize).
+    const float mean[3] = {0.485f, 0.456f, 0.406f}, stdev[3] = {0.229f, 0.224f, 0.225f};
+    bool raco = true;
+    try {
+      gpu->normalize(img[1], mean, stdev);
+    } catch (const std::runtime_error& e) {
+      if (std::string(e.what()).find("RaCo is not implemented") == std::string::npos) throw;
+      raco = false;
+      std::printf("%-44s skipped (not on this backend yet)\n", "raco operations");
+    }
+    if (raco) {
+      both("normalize", [&](jkp::Ops& o, int b) { return o.normalize(img[b], mean, stdev); });
+      for (int p : {1, 2})
+        both("pad_reflect " + std::to_string(p), [&](jkp::Ops& o, int b) { return o.pad_reflect(f16[b], p); });
+      for (int cout : {1, 12}) {
+        const jkp::Param& w5 = rp.make({cout, 16, 5, 5}, 0.2f);
+        const jkp::Param& b5 = rp.make({cout}, 0.2f);
+        both("conv5x5 16->" + std::to_string(cout) + " bias",
+             [&](jkp::Ops& o, int b) { return o.conv2d(f16[b], w5, &b5, jkp::Act::None); });
+        both("conv5x5 16->" + std::to_string(cout) + " leaky_relu",
+             [&](jkp::Ops& o, int b) { return o.conv2d(f16[b], w5, nullptr, jkp::Act::LeakyRelu); });
+      }
+      const jkp::Param& wl = rp.make({32, 16, 3, 3}, 0.3f);
+      const jkp::Param& bl = rp.make({32}, 0.2f);
+      both("conv3x3 16->32 leaky_relu", [&](jkp::Ops& o, int b) { return o.conv2d(f16[b], wl, &bl, jkp::Act::LeakyRelu); });
+
+      // Logits with a few peaks, a ranker map, raw Cholesky elements; and a flat map where every pixel ties.
+      const jkp::Param& wlog = rp.make({1, 16, 3, 3}, 1.5f);
+      const jkp::Param& wzero = rp.make({1, 16, 3, 3}, 0.0f);
+      const jkp::Param& wrank = rp.make({1, 16, 3, 3}, 0.5f);
+      const jkp::Param& wchol = rp.make({3, 16, 1, 1}, 2.0f);
+      jkp::TensorPtr logits[2], flat[2], ranker[2], chol[2];
+      for (int b = 0; b < 2; ++b) {
+        logits[b] = ops[b]->conv2d(f16[b], wlog, &bs, jkp::Act::None);
+        flat[b] = ops[b]->conv2d(f16[b], wzero, &bs, jkp::Act::None);
+        ranker[b] = ops[b]->conv2d(f16[b], wrank, &bs, jkp::Act::None);
+        chol[b] = ops[b]->conv2d(f16[b], wchol, nullptr, jkp::Act::None);
+      }
+      check("raco logits", logits[0], logits[1]);
+      // Scores are probabilities over the whole map: compared relative to the best one.
+      auto relative = [](std::vector<float> v) {
+        float m = 0;
+        for (float x : v) m = std::fmax(m, x);
+        for (float& x : v) x /= m > 0 ? m : 1.0f;
+        return v;
+      };
+      for (int flat_map : {0, 1})
+        for (int top_k : {40, 100000})
+          for (int window : {3, 5})
+            for (bool maps : {true, false}) {
+              if (flat_map && (window == 5 || !maps)) continue;
+              // FP16 logits tie where float32 ones do not, so the set of all local maxima differs; only
+              // the clear peaks of the top-40 cases are comparable.
+              if (g_tol > 1e-3 && top_k > 40) continue;
+              jkp::RacoDetectParams dp;
+              dp.top_k = top_k, dp.window = window;
+              jkp::RacoKeypoints kp[2];
+              for (int b = 0; b < 2; ++b)
+                ops[b]->detect_raco(flat_map ? flat[b] : logits[b], maps ? ranker[b] : nullptr, maps ? chol[b] : nullptr,
+                                    dp, &kp[b]);
+              const std::string mode = std::string("detect_raco ") + (flat_map ? "flat " : "") + "top-" +
+                                       std::to_string(top_k) + " " + std::to_string(window) + "x" +
+                                       std::to_string(window) + (maps ? "" : " no maps");
+              check_vec(mode + " positions", kp[0].xy, kp[1].xy);
+              check_vec(mode + " scores", relative(kp[0].score), relative(kp[1].score));
+              if (maps) {
+                check_vec(mode + " ranker", kp[0].rank, kp[1].rank);
+                check_vec(mode + " cholesky", kp[0].cholesky, kp[1].cholesky);
+              } else if (!kp[1].rank.empty() || !kp[1].cholesky.empty()) {
+                std::printf("%-44s FAIL (maps returned without inputs)\n", mode.c_str());
+                ++g_failed;
+              }
+            }
+    }
   } catch (const std::exception& e) {
     std::fprintf(stderr, "error: %s\n", e.what());
     return 1;

@@ -196,6 +196,10 @@ JKP_CONV_TILE("k_conv2d_t4_k3", 4, 3, real)
 JKP_CONV_TILE("k_conv2d_t8_k3", 8, 3, real)
 JKP_CONV_TILE("k_conv2d_t16_k3", 16, 3, real)
 JKP_CONV_TILE("k_conv2d_t32_k3", 32, 3, real)
+JKP_CONV_TILE("k_conv2d_t4_k5", 4, 5, real)  // RaCo's ranker output
+JKP_CONV_TILE("k_conv2d_t8_k5", 8, 5, real)
+JKP_CONV_TILE("k_conv2d_t16_k5", 16, 5, real)
+JKP_CONV_TILE("k_conv2d_t32_k5", 32, 5, real)
 #ifdef JKP_FP16
 JKP_CONV_TILE("k_conv2d_t4_k1_f32", 4, 1, float)  // the score map
 JKP_CONV_TILE("k_conv2d_t4_k3_f32", 4, 3, float)
@@ -870,4 +874,160 @@ kernel void k_sddh_sample_pyramid(device const real* p0 [[buffer(0)]], device co
   }
   device float* out = sampled + size_t(t) * c;
   for (int ch = 0; ch < c; ++ch) out[ch] = acc[ch];
+}
+
+// ---------------------------------------------------------------------------------------------
+// RaCo kernels (normalize, pad_reflect, detect_raco). Same float32 steps as the CPU backend, except
+// that the softmax sum is a compensated float sum in blocks instead of a double sum in raster order.
+// ---------------------------------------------------------------------------------------------
+
+// (x - mean[c]) / std[c]; ms holds the c means, then the c standard deviations.
+kernel void k_normalize(device const real* x [[buffer(0)]], constant int& c [[buffer(1)]], constant int& hw [[buffer(2)]],
+                        device const float* ms [[buffer(3)]], device real* out [[buffer(4)]],
+                        uint gid [[thread_position_in_grid]]) {
+  int i = int(gid);
+  if (i >= c * hw) return;
+  int ch = i / hw;
+  out[i] = real((float(x[i]) - ms[ch]) / ms[c + ch]);
+}
+
+// Mirror padding by p on every side, without repeating the border pixel (PyTorch "reflect").
+inline int mirror(int i, int n) { return i < 0 ? -i : (i >= n ? 2 * (n - 1) - i : i); }
+kernel void k_pad_reflect(device const real* src [[buffer(0)]], constant int& c [[buffer(1)]], constant int& h [[buffer(2)]],
+                          constant int& w [[buffer(3)]], constant int& p [[buffer(4)]], device real* dst [[buffer(5)]],
+                          uint gid [[thread_position_in_grid]]) {
+  const int oh = h + 2 * p, ow = w + 2 * p, ohw = oh * ow;
+  int i = int(gid);
+  if (i >= c * ohw) return;
+  int ch = i / ohw, y = (i % ohw) / ow, x = i % ow;
+  dst[i] = src[(size_t(ch) * h + mirror(y - p, h)) * w + mirror(x - p, w)];
+}
+
+// Softmax over the whole map, in four steps: block maxima, the maximum (stats[0]), block sums of
+// exp(l - max), the sum (stats[1]); then the probabilities. One thread per block of kScanBlock elements
+// for the block steps, one thread for the reductions.
+kernel void k_softmax_block_max(device const real* l [[buffer(0)]], constant int& n [[buffer(1)]],
+                                device float* partial [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  int b = int(gid), begin = b * kScanBlock;
+  if (begin >= n) return;
+  int end = min(n, begin + kScanBlock);
+  float m = float(l[begin]);
+  for (int i = begin + 1; i < end; ++i) m = fmax(m, float(l[i]));
+  partial[b] = m;
+}
+kernel void k_softmax_max(device const float* partial [[buffer(0)]], constant int& blocks [[buffer(1)]],
+                          device float* stats [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0) return;
+  float m = partial[0];
+  for (int b = 1; b < blocks; ++b) m = fmax(m, partial[b]);
+  stats[0] = m;
+}
+// Kahan summation, so the result stays close to the CPU backend's double sum.
+kernel void k_softmax_block_sum(device const real* l [[buffer(0)]], constant int& n [[buffer(1)]],
+                                device const float* stats [[buffer(2)]], device float* partial [[buffer(3)]],
+                                uint gid [[thread_position_in_grid]]) {
+  int b = int(gid), begin = b * kScanBlock;
+  if (begin >= n) return;
+  int end = min(n, begin + kScanBlock);
+  const float m = stats[0];
+  float sum = 0, comp = 0;
+  for (int i = begin; i < end; ++i) {
+    float y = precise::exp(float(l[i]) - m) - comp, t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  partial[b] = sum;
+}
+kernel void k_softmax_sum(device const float* partial [[buffer(0)]], constant int& blocks [[buffer(1)]],
+                          device float* stats [[buffer(2)]], uint gid [[thread_position_in_grid]]) {
+  if (gid != 0) return;
+  float sum = 0, comp = 0;
+  for (int b = 0; b < blocks; ++b) {
+    float y = partial[b] - comp, t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  stats[1] = sum;
+}
+kernel void k_softmax_prob(device const real* l [[buffer(0)]], constant int& n [[buffer(1)]],
+                           device const float* stats [[buffer(2)]], device float* prob [[buffer(3)]],
+                           uint gid [[thread_position_in_grid]]) {
+  int i = int(gid);
+  if (i >= n) return;
+  prob[i] = precise::exp(float(l[i]) - stats[0]) / stats[1];
+}
+
+// nms = probability where it equals the maximum of its window, zero elsewhere (no border exclusion).
+kernel void k_raco_nms(device const float* prob [[buffer(0)]], device const float* pooled [[buffer(1)]],
+                       constant int& n [[buffer(2)]], device float* nms [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  int i = int(gid);
+  if (i >= n) return;
+  nms[i] = prob[i] == pooled[i] ? prob[i] : 0.0f;
+}
+
+// log(1 + exp(x)), linear above 20 as in PyTorch. Metal has no log1p; this form is accurate to a few ulp.
+inline float softplus(float x) {
+  if (x > 20.0f) return x;
+  const float u = precise::exp(x), y = 1.0f + u, z = y - 1.0f;
+  return z == 0.0f ? u : precise::log(y) * (u / z);
+}
+
+// Subpixel refinement and sampling, one thread per keypoint: softmax of logit / temperature in the k x k
+// window (outside the map counts as logit 0), expected offset; then bilinear samples at the refined
+// position, clamped to the map, of the probabilities, the ranker map and the Cholesky map (softplus on
+// channels 0 and 2 at each of the four neighbours).
+kernel void k_raco_refine(device const real* logits [[buffer(0)]], device const float* prob [[buffer(1)]],
+                          device const real* ranker [[buffer(2)]], device const real* chol [[buffer(3)]],
+                          constant int& has_ranker [[buffer(4)]], constant int& has_chol [[buffer(5)]],
+                          constant int& w [[buffer(6)]], constant int& h [[buffer(7)]], device const int* idx [[buffer(8)]],
+                          constant int& n [[buffer(9)]], constant int& k [[buffer(10)]], constant float& temperature [[buffer(11)]],
+                          device float* xy_out [[buffer(12)]], device float* score [[buffer(13)]],
+                          device float* rank [[buffer(14)]], device float* chol_out [[buffer(15)]],
+                          uint gid [[thread_position_in_grid]]) {
+  int i = int(gid);
+  if (i >= n) return;
+  const int r = k / 2, x = idx[i] % w, y = idx[i] / w;
+  float patch[81], max_v = -INFINITY;
+  for (int dy = -r; dy <= r; ++dy)
+    for (int dx = -r; dx <= r; ++dx) {
+      int px = x + dx, py = y + dy;
+      float v = ((px >= 0 && px < w && py >= 0 && py < h) ? float(logits[py * w + px]) : 0.0f) / temperature;
+      patch[(dy + r) * k + dx + r] = v;
+      max_v = fmax(max_v, v);
+    }
+  float psum = 0, sx = 0, sy = 0;
+  for (int j = 0; j < k * k; ++j) {
+    patch[j] = precise::exp(patch[j] - max_v);
+    psum += patch[j];
+  }
+  for (int j = 0; j < k * k; ++j) {
+    const float p = patch[j] / psum;
+    sx += p * float(j % k - r);
+    sy += p * float(j / k - r);
+  }
+  const float xy[2] = {float(x) + sx, float(y) + sy};
+  xy_out[2 * i] = xy[0];
+  xy_out[2 * i + 1] = xy[1];
+
+  // grid_sample, padding_mode = border, align_corners = true: normalize to [-1, 1], map back, clamp.
+  const float wh[2] = {float(w - 1), float(h - 1)};
+  float g[2];
+  for (int a = 0; a < 2; ++a) {
+    g[a] = wh[a] > 0 ? ((2.0f * xy[a] / wh[a] - 1.0f) + 1.0f) / 2.0f * wh[a] : 0.0f;
+    g[a] = fmin(wh[a], fmax(g[a], 0.0f));
+  }
+  int bi[4];
+  float bw[4];
+  bilinear_setup(g[0], g[1], w, h, bi, bw);
+  score[i] = bilinear_apply(prob, bi, bw);
+  if (has_ranker) rank[i] = bilinear_apply(ranker, bi, bw);
+  if (has_chol) {
+    const int hw = w * h;
+    for (int c = 0; c < 3; ++c) {
+      device const real* plane = chol + size_t(c) * hw;
+      float v[4];
+      for (int j = 0; j < 4; ++j) v[j] = c == 1 ? float(plane[bi[j]]) : softplus(float(plane[bi[j]]));
+      chol_out[3 * i + c] = bw[0] * v[0] + bw[1] * v[1] + bw[2] * v[2] + bw[3] * v[3];
+    }
+  }
 }

@@ -210,7 +210,23 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
   the other bounds unchanged. CPU times for 640x470: 0.46 s RaCo alone, 0.53 s with descriptors,
   0.125 s without the covariance head, 0.055 s without covariance and ranker heads.
 - [ ] **R4 — RaCo on CUDA** (NVIDIA machine)
-- [ ] **R5 — RaCo on Metal** (after M3)
+- [x] **R5 — RaCo on Metal** (after M3)
+  `jkp extract image.png --model raco --backend metal`, with `--descriptor aliked-n16` and the head switches.
+  Done (M5 Pro, macOS 26), on the R1 image set (53 images, 501x380 to 2522x818), against the original:
+  keypoint overlap >= 99.95 %, position error <= 1.2e-4 px, score error <= 4.3e-5 of the best score, ranker
+  error <= 7.5e-6 of the largest score, covariance error <= 1.4e-4 (relative); with ALIKED descriptors,
+  descriptor cosine >= 1 - 1.3e-9 and the other bounds unchanged. The CPU backend in R2/R3: 2.7e-5 score,
+  6.1e-6 ranker, 1 - 3.4e-9 cosine. Every intermediate tensor of the three RaCo golden files matches within
+  1.3e-6 (relative); against the CPU backend on generated images (`metal_raco_vs_cpu`) every stage is within
+  2.3e-6 and the keypoint sets are identical.
+  FP32 only, like the CPU backend (the API refuses `precision = fp16` for RaCo; see the notes from R5).
+  Not tuned. Minimum of 10 warm runs, taken while other jobs loaded the machine (ALIKED top-k 2048 measured
+  alongside: 10.8 ms at 640x470, 35.5 ms at 2522x818, against 8.3 ms at 640x480 in M5):
+
+  | Size | full | no covariance | no covariance, no ranker | + ALIKED descriptors | CPU, full |
+  |---|---|---|---|---|---|
+  | 640x470 | 45 ms | 20 ms | 8.3 ms | 53 ms | 0.72 s |
+  | 2522x818 | 326 ms | 120 ms | 44 ms | 370 ms | 4.5 s |
 - [ ] **R6 — RaCo on WebGPU** (with M6); detector switch, covariance ellipses and top-K by ranker score in the M7 demo.
 
 ## Phases
@@ -308,6 +324,8 @@ one app. just-ba already ships a WebGPU backend built this way (its document 16,
 - R4-R6, per GPU backend: three operations (`normalize`, `pad_reflect`, `detect_raco`) and the LeakyReLU
   activation; everything else is already there for ALIKED. Then `raco_golden_test` and `compare.py` as on the CPU.
   Fusing reflect padding into the convolution and running the covariance head in FP16 belong to M5.
+- Done (R5): Metal. The 5x5 ranker convolution got tiled instantiations (`k_conv2d_t*_k5`); the top-k
+  selection of `detect` is shared with `detect_raco` (`Selection` in `metal_ops.mm`).
 - **Exit:** RaCo keypoints, ranker scores and covariances match the original on every backend; RaCo + ALIKED
   descriptors selectable in the demo.
 
@@ -355,14 +373,34 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
   with the un-padding crop where both follow each other. Simple and exact, one extra copy per convolution.
 - Softplus is applied to the four neighbours of each keypoint inside `detect_raco`, not to the whole map;
   the result is the same and no per-channel activation is needed.
-- `JKP_EMBED_MODELS` accepted a list but embedded only its first entry; fixed. The default is still
-  `aliked-n16` only (build with `-DJKP_EMBED_MODELS="aliked-n16;raco"` or pass `--weights weights/raco.jkpw`).
-  Make `raco` part of the default once M3 has landed; that line of `CMakeLists.txt` sits next to the Metal options.
+- `JKP_EMBED_MODELS` accepted a list but embedded only its first entry; fixed. Since R5 the default is
+  `aliked-n16;raco` (about 4.7 MB; `-DJKP_EMBED_MODELS=aliked-n16` leaves RaCo out). The WebAssembly build
+  embeds nothing, so the site is not affected.
 - R3: RaCo positions go to the ALIKED descriptor head as `2 * xy / (size - 1) - 1`, the formula of
   `ALIKED.describe` in cvg/LightGlue (commit `5a650c4`) once upstream's +0.5 is removed. The head truncates the
   pixel position it recovers, so keep this float32 order on GPU backends. Positions can lie up to one pixel
   outside the image; the head already treats everything outside as zeros.
 - Golden files: `python tools/dump_golden.py --model raco <images>` writes `build/golden/raco/`; `ctest` picks them up.
+
+### Notes from R5
+
+- The softmax over the image takes five dispatches: block maxima and their maximum, block sums of
+  `exp(l - max)` and their sum, then the probabilities. The CPU backend sums in double in raster order; Metal
+  uses compensated (Kahan) float sums in blocks of 256, so probabilities agree to about 1e-7 (relative).
+- NMS keeps a pixel when its probability equals the maximum of its window, computed on the probabilities
+  rather than the logits, as on the CPU: two different logits can round to the same probability.
+- Selection: count the nonzero NMS values (one round trip), then the radix select and rank sort of `detect`
+  for the best `min(top_k, count)`; refinement and sampling run on the kept keypoints only.
+- Metal has no `log1p`; softplus uses `log(y) * u / (y - 1)` with `u = exp(x)`, `y = 1 + u`, accurate to a few ulp.
+- On large images (1024x768, 5000 keypoints) the keypoint sets are identical but the order of near-tied scores
+  differs from the CPU's, so `backend_test` with `raco.jkpw` pairs keypoints by position, as `raco_golden_test` does.
+- `ops_test` checks the RaCo operations on backends that have them and reports "skipped" on the others.
+- FP16: the operations work with half storage (`ops_test metal:fp16` passes), but the logits come from a
+  convolution without an activation and are stored as half, so neighbouring logits tie and the set of local
+  maxima changes (290 against 295 on the test map). Before lifting the API's FP32-only rule for RaCo, keep the
+  logits in float (as ALIKED's score map) and measure the result against FP32.
+- Speed is dominated by the full-resolution heads: the covariance head is 55-65 % of the run time and the
+  ranker (nine residual blocks at full resolution, 5x5 output) most of the rest; neither is tiled or fused yet.
 
 ## Development machines
 
@@ -554,3 +592,4 @@ Source: https://github.com/cvg/RaCo (3DV 2026, Apache-2.0), reviewed at commit `
   buffer limits and no kernel binds more than seven buffers. Past 4 GB per tensor it would need tiling.
 - Whether to add `aliked-t16` as a second, faster web-friendly variant (same op set, different widths).
 - Descriptor output quantization for the downstream matcher.
+- RaCo in FP16 (see the notes from R5).

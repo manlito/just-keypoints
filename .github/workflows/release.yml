@@ -19,7 +19,7 @@ name: release
 
 on:
   push:
-    branches: [main, wt/pypi-release]  # TEMPORARY: test the build on the branch
+    branches: [main]
     paths-ignore:
       - "*.md"
       - "docs/**"

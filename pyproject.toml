@@ -1,0 +1,80 @@
+# The Python package (bindings/python). pip and the wheel builds use scikit-build-core, which runs the CMake
+# build with the options below. The CUDA packages (just-keypoints-cu12, just-keypoints-cu13) are built from
+# this file after packaging/variant.py has rewritten their name and CMake options.
+
+[build-system]
+requires = ["scikit-build-core>=0.11", "nanobind==3.1.0", "numpy>=1.26"]  # numpy: the stub generation imports just_keypoints
+build-backend = "scikit_build_core.build"
+
+[project]
+name = "just-keypoints"
+dynamic = ["version"]
+description = "ALIKED and RaCo keypoints with minimal dependencies: CPU, Metal and CUDA backends, no PyTorch"
+readme = "bindings/python/README.md"
+requires-python = ">=3.12"
+# The code is Apache-2.0; the built-in weights are ALIKED's (BSD-3-Clause) and RaCo's (Apache-2.0).
+license = "Apache-2.0 AND BSD-3-Clause"
+license-files = ["LICENSE", "weights/LICENSE-ALIKED", "weights/LICENSE-RACO"]
+dependencies = ["numpy>=1.26"]
+keywords = ["keypoints", "local features", "ALIKED", "RaCo", "structure from motion", "feature matching"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Science/Research",
+  "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3",
+  "Topic :: Scientific/Engineering :: Image Recognition",
+]
+
+[project.urls]
+Documentation = "https://just-keypoints.pages.dev"
+Source = "https://github.com/manlito/just-keypoints"
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[tool.scikit-build]
+minimum-version = "build-system.requires"
+cmake.version = ">=3.24"
+build-dir = "build/wheel/{wheel_tag}"
+# One wheel per platform for every Python from 3.12 (stable ABI).
+wheel.py-api = "cp312"
+wheel.packages = ["bindings/python/just_keypoints"]
+sdist.exclude = ["build", "third_party", "wheelhouse", "dist", ".github", ".claude", "docs", "tools", "web",
+                 "bindings/python/.venv"]
+
+[tool.scikit-build.metadata.version]
+provider = "scikit_build_core.metadata.regex"
+input = "CMakeLists.txt"
+regex = 'project\(just_keypoints VERSION (?P<value>[0-9.]+)'
+
+# The weights of both models are built in (JKP_EMBED_WEIGHTS, on by default). The base package has the CPU
+# backend, and Metal on macOS; WebGPU is in no package.
+[tool.scikit-build.cmake.define]
+JKP_BUILD_PYTHON = "ON"
+JKP_BUILD_TESTS = "OFF"
+JKP_BUILD_CLI = "OFF"
+JKP_WEBGPU = "OFF"
+JKP_PACKAGE_VARIANT = "cpu"
+JKP_CUDA = "OFF"
+
+# Wheels: built by .github/workflows/release.yml. One abi3 wheel per platform, tested with the Python tests.
+# The CUDA packages add their settings in the workflow (CIBW_* variables).
+[tool.cibuildwheel]
+build = "cp312-*"
+skip = ["*-musllinux_*", "*-win32", "*_i686"]
+build-verbosity = 1
+test-requires = ["pytest"]
+test-command = "pytest -q {project}/bindings/python/tests"
+
+[tool.cibuildwheel.linux]
+archs = ["x86_64"]
+
+[tool.cibuildwheel.macos]
+archs = ["arm64"]
+environment = { MACOSX_DEPLOYMENT_TARGET = "13.0" }
+
+[tool.cibuildwheel.windows]
+archs = ["AMD64"]

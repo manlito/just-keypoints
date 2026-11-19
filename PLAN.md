@@ -50,9 +50,12 @@ tools/compare.py         dev-only: run the original (ALIKED or RaCo) and jkp on 
 tests/                   golden comparison tests per backend
 web/                     WebAssembly entry points, JS wrapper (npm package in M8), browser test page
 docs/                    documentation site + live demo (static, Cloudflare Pages)
+bindings/python/         the Python package just_keypoints (nanobind over the C API), its PyPI README and tests
+packaging/               release scripts: the version, the CUDA package variants, the CUDA toolkit download
 ```
 
-Python/PyTorch is used only in `tools/` to produce weights and test vectors. It is never a runtime dependency.
+PyTorch is used only in `tools/` to produce weights and test vectors. It is never a runtime dependency. The
+Python package (`bindings/python`) is a thin binding of the C API and needs only NumPy.
 
 ## Public API (C, plain buffers)
 
@@ -368,7 +371,38 @@ one app. just-ba already ships a WebGPU backend built this way (its document 16,
 ### 7 — Packaging
 - CMake install target + `find_package` config; single header.
 - npm package (wasm + js + weights).
-- Optional thin Python binding (ctypes over the C API) for use in SfM scripts.
+- Done: Python package on PyPI, built as just-ba's. nanobind (stable ABI, one wheel per platform for Python
+  3.12 and later) rather than the ctypes binding first planned: the same build as the sibling libraries, and
+  the type stubs come from the module. `just_keypoints.Extractor(**config).extract(image)` returns a
+  `Features` with NumPy copies of `xy`, `score`, `desc`, `rank` and `cov`; errors raise `RuntimeError` with
+  `jkp_last_error()`. Both models' weights are built in (ALIKED BSD-3-Clause, RaCo Apache-2.0; both licence
+  files ship in the wheel). Three packages provide the one module:
+
+  | Package | Wheels | Backends |
+  |---|---|---|
+  | `just-keypoints` | Linux x86_64, macOS arm64 (13+), Windows x86_64, and the sdist | CPU; Metal on macOS |
+  | `just-keypoints-cu12` | Linux x86_64, Windows x86_64 | CPU and CUDA 12.9 (sm_60 to sm_120, PTX for newer) |
+  | `just-keypoints-cu13` | Linux x86_64, Windows x86_64 | CPU and CUDA 13.4 (sm_75 to sm_120, PTX for newer) |
+
+  The CUDA runtime is linked statically (CMake's default), so the CUDA wheels depend on nothing from NVIDIA but
+  the driver. WebGPU is in no wheel. The toolkit comes from NVIDIA's redistributable archives
+  (`packaging/fetch_cuda.py`) and `packaging/variant.py` turns `pyproject.toml` into a CUDA package.
+- **Release**: `.github/workflows/release.yml` runs on every push to main (a merge included) and publishes;
+  pushes that change only the notes, `docs/`, `tools/` or `web/` release nothing. By hand,
+  `gh workflow run release` builds and tests every wheel without publishing (`-f publish=true` publishes).
+  The workflow chooses the version (`packaging/version.py`): the highest of the tags `vX.Y.Z` and the three
+  packages' versions on PyPI with its patch bumped, or `project(VERSION)` in CMakeLists.txt when that is higher,
+  so a minor or major release is an edit there in the change that warrants it; with nothing released yet,
+  `project(VERSION)` itself (0.1.0). It is written into the checkout before each build and never committed; the
+  tag `vX.Y.Z` is pushed once every package is up. Publishing is PyPI trusted publishing, with no GitHub
+  environment and no token. A GPU change: run the GPU tests by hand before merging (`ctest` on the Mac and
+  the CUDA machine, or `pytest bindings/python/tests` against a wheel from a by-hand run).
+- **First release**: PyPI takes one pending publisher per repository and workflow at a time (as just-ba found),
+  so the packages go up one at a time. Before merging, add the pending publisher for `just-keypoints` on PyPI
+  (owner `manlito`, repository `just-keypoints`, workflow `release.yml`, no environment). The merge publishes it
+  and the cu12 upload fails; add the pending publisher for `just-keypoints-cu12`, re-run the failed publish job
+  (`gh run rerun <run> --failed`; uploaded files are skipped), then the same for `just-keypoints-cu13`. After
+  that all three are ordinary trusted publishers and each release publishes them in one run.
 
 ### 8 — RaCo detector (RaCo track, R1-R6)
 - Done (R1, R2): export `raco.pth` to `.jkpw`, reference pass, `compare.py --model raco`, `src/models/raco/` graph,

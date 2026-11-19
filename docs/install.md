@@ -1,4 +1,30 @@
-# Build
+# Install
+
+## Python
+
+```bash
+pip install just-keypoints          # CPU; Metal on macOS (arm64, 13 or later)
+pip install just-keypoints-cu12     # or: CPU and CUDA 12 (Linux, Windows x86_64)
+pip install just-keypoints-cu13     # or: CPU and CUDA 13 (Linux, Windows x86_64)
+```
+
+Install one of them: all three provide the `just_keypoints` module, for Python 3.12 and later. Both models'
+weights are built in. The CUDA packages link the CUDA runtime statically and need only an NVIDIA driver;
+CUDA 12 runs on Pascal GPUs and later, CUDA 13 on Turing and later.
+
+```python
+import just_keypoints as jkp
+
+extractor = jkp.Extractor(backend="cuda" if jkp.backend_available("cuda") else "cpu", top_k=2000)
+features = extractor.extract(image)                  # uint8, (h, w), (h, w, 3) RGB or (h, w, 4) RGBA
+features.xy, features.score, features.desc           # (n, 2), (n,), (n, 128) float32
+```
+
+The keyword arguments of `Extractor` are the fields of the C API's `jkp_config`: `model="raco"` with
+`descriptor="aliked-n16"`, `precision="fp16"`, `score_threshold`, `max_keypoints`, `device`, and `weights`
+(a `.jkpw` path or its bytes). RaCo's results add `rank` and `cov`.
+
+## From source
 
 just-keypoints is built from source with CMake 3.16 or later and a C++17 compiler. The CPU backend needs
 nothing else. Each GPU backend is built when its toolkit is found, and uses no library beyond it.

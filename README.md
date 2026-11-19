@@ -51,6 +51,28 @@ cmake --build build/release
 | `JKP_BUILD_WASM` | `ON` | under Emscripten: build the WebAssembly module, `web/jkp.js` and the test page |
 | `JKP_BUILD_CLI` | `ON` | build the `jkp` tool |
 | `JKP_BUILD_TESTS` | `ON` | build tests |
+| `JKP_BUILD_PYTHON` | `OFF` | build the Python package `just_keypoints` (needs nanobind; see [Python](#python)) |
+
+## Python
+
+```sh
+pip install just-keypoints          # CPU; Metal on macOS (arm64, 13 or later)
+pip install just-keypoints-cu12     # or: CPU and CUDA 12 (Linux, Windows x86_64; Pascal and later)
+pip install just-keypoints-cu13     # or: CPU and CUDA 13 (Turing and later)
+```
+
+```python
+import just_keypoints as jkp
+extractor = jkp.Extractor(backend="cuda" if jkp.backend_available("cuda") else "cpu", top_k=2000)
+f = extractor.extract(image)        # uint8 (h, w), (h, w, 3) or (h, w, 4)
+f.xy, f.score, f.desc                # NumPy float32 copies: (n, 2), (n,), (n, 128)
+```
+
+The keyword arguments of `Extractor` are the fields of `jkp_config` (`model="raco"`, `descriptor="aliked-n16"`,
+`precision="fp16"`, ...). Both models' weights are built in, and the CUDA packages need only an NVIDIA driver.
+From a checkout: `pip install .`, or with CMake `-DJKP_BUILD_PYTHON=ON -DPython_EXECUTABLE=<python with
+nanobind>` and `ctest -R python`. Every merge to main is published to PyPI with the next patch version
+([PLAN.md](PLAN.md), phase 7).
 
 ## Command line
 
@@ -178,5 +200,5 @@ In the browser: `jkp.create({ weightsUrl: 'raco.jkpw', descriptorWeightsUrl: 'al
 
 ## Licenses
 
-Code in this repository: to be decided. Weights in `weights/` come from ALIKED (BSD-3-Clause, see
+Code in this repository: Apache-2.0 (`LICENSE`). Weights in `weights/` come from ALIKED (BSD-3-Clause, see
 `weights/LICENSE-ALIKED`) and RaCo (Apache-2.0, see `weights/LICENSE-RACO`). `cli/stb_image.h` is public domain / MIT and is used only by the CLI.

@@ -30,6 +30,16 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <windows.h>
+#endif
+
 #include <algorithm>
 #include <cfloat>
 #include <chrono>
@@ -883,6 +893,18 @@ __global__ void k_raco_refine(const R* logits, const float* prob, const R* ranke
 // Host side
 // ---------------------------------------------------------------------------------------------
 
+// Whether the NVIDIA driver is installed. On Windows without it, CUDA 13.4's static runtime crashes in its
+// first call instead of returning an error (the release workflow's runners have no GPU; CUDA 12.9 returns
+// cudaErrorInsufficientDriver), so the driver is looked for first.
+bool driver_present() {
+#ifdef _WIN32
+  HMODULE h = LoadLibraryA("nvcuda.dll");
+  if (!h) return false;
+  FreeLibrary(h);
+#endif
+  return true;
+}
+
 void check(cudaError_t status, const char* what) {
   if (status != cudaSuccess) throw std::runtime_error(std::string("cuda: ") + what + ": " + cudaGetErrorString(status));
 }
@@ -1178,6 +1200,7 @@ class CudaOps : public Ops {
 
  public:
   explicit CudaOps(int device) {
+    if (!driver_present()) throw std::runtime_error("cuda: no NVIDIA driver found");
     int devices = 0;
     JKP_CUDA_CHECK(cudaGetDeviceCount(&devices));
     if (device < 0 || device >= devices)

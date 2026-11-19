@@ -200,5 +200,5 @@ In the browser: `jkp.create({ weightsUrl: 'raco.jkpw', descriptorWeightsUrl: 'al
 
 ## Licenses
 
-Code in this repository: to be decided. Weights in `weights/` come from ALIKED (BSD-3-Clause, see
+Code in this repository: Apache-2.0 (`LICENSE`). Weights in `weights/` come from ALIKED (BSD-3-Clause, see
 `weights/LICENSE-ALIKED`) and RaCo (Apache-2.0, see `weights/LICENSE-RACO`). `cli/stb_image.h` is public domain / MIT and is used only by the CLI.

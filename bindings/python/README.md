@@ -48,5 +48,5 @@ used for many images; calls from several threads are serialized. Errors (no such
 
 Documentation: <https://just-keypoints.pages.dev>.
 
-Licences: the built-in weights are ALIKED's (BSD-3-Clause) and RaCo's (Apache-2.0); both licence files are in
+Licences: the code is Apache-2.0; the built-in weights are ALIKED's (BSD-3-Clause) and RaCo's (Apache-2.0); both licence files are in
 the package.

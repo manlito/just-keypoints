@@ -22,7 +22,8 @@ typedef enum { JKP_PRECISION_FP32 = 0, JKP_PRECISION_FP16 = 1 } jkp_precision;
 typedef struct {
   jkp_backend backend;
   /* Model to run; selects the embedded weights when no weights are given. Default "aliked-n16".
-     "raco" is a detector without descriptors: it returns ranker scores and covariances instead. */
+     "raco" is a detector without descriptors: it returns ranker scores and covariances instead.
+     "xfeat" is a light detector with 64-dim descriptors (about a third of aliked-n16's time on the CPU). */
   const char* model;
   /* Weights source, first that is set wins: memory blob, file path, weights embedded at build time. */
   const void* weights_data;
@@ -30,7 +31,9 @@ typedef struct {
   const char* weights_path;
   /* Selection. top_k > 0: keep the top_k best keypoints. Otherwise keep every keypoint with
      score > score_threshold, capped at max_keypoints (best first when over the cap).
-     raco: always the top_k best (2048 when top_k <= 0); score_threshold and max_keypoints are not used. */
+     raco: always the top_k best (2048 when top_k <= 0); score_threshold and max_keypoints are not used.
+     xfeat: the top_k best above XFeat's own detection threshold (4096 when top_k <= 0); score_threshold and
+     max_keypoints are not used. The network sees the image resized down to a multiple of 32 (at least 32 x 32). */
   int top_k;
   float score_threshold;
   int max_keypoints;
@@ -70,9 +73,9 @@ typedef struct {
 /* Arrays are owned by the context and stay valid until the next jkp_extract or jkp_destroy on it. */
 typedef struct {
   int n;              /* number of keypoints */
-  int dim;            /* descriptor size (128 for aliked-n16, 0 for raco without a descriptor model) */
+  int dim;            /* descriptor size (128 for aliked-n16, 64 for xfeat, 0 for raco without a descriptor model) */
   const float* xy;    /* [n][2] pixel coordinates, x right / y down, (0,0) = centre of the top-left pixel */
-  const float* score; /* [n]; aliked: in [0, 1]. raco: probability, sums to 1 over the image */
+  const float* score; /* [n]; aliked: in [0, 1]. raco: probability, sums to 1 over the image. xfeat: in (0, 1) */
   const float* desc;  /* [n][dim], L2-normalized; NULL when dim is 0 */
   const float* rank;  /* [n] ranker score, higher is better (raco); NULL for other models */
   const float* cov;   /* [n][2][2] keypoint covariance in pixels^2 (raco); NULL for other models */

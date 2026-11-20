@@ -11,6 +11,11 @@ Files are large (feature maps at full resolution); they are generated locally, n
 
 Writes build/golden/raco/<image>.jkpt from the original RaCo. Tensors: image, pad, x, x1..x4, a1..a4, x1234,
 logits, probs, nms_probs, ranker_map, cholesky_map, keypoints, scores, ranker, cholesky, covariances.
+
+    python tools/dump_golden.py third_party/accelerated_features/assets/*.png --model xfeat
+
+Writes build/golden/xfeat/<image>.jkpt from the original XFeat. Tensors: image, resized, gray, norm, x1, skip,
+x2..x5, x4u, x5u, feats, heatmap, unfolded, logits, feats_n, kpts_heat, keypoints, scores, descriptors.
 """
 import argparse
 import os
@@ -31,15 +36,21 @@ def main():
     ap.add_argument("--out-dir", default=None, help="default build/golden, or build/golden/raco for --model raco")
     args = ap.parse_args()
 
-    raco = args.model == "raco"
+    raco, xfeat = args.model == "raco", args.model == "xfeat"
     if args.out_dir is None:
-        args.out_dir = os.path.join(upstream.ROOT, "build", "golden", *(["raco"] if raco else []))
+        sub = ["raco"] if raco else ["xfeat"] if xfeat else []
+        args.out_dir = os.path.join(upstream.ROOT, "build", "golden", *sub)
     os.makedirs(args.out_dir, exist_ok=True)
     if raco:
         import raco_upstream
         args.top_k = args.top_k if args.top_k > 0 else raco_upstream.DEFAULT_TOP_K
         model = raco_upstream.load_model(args.device, args.top_k)
         run, commit = raco_upstream.run, raco_upstream.PINNED_COMMIT
+    elif xfeat:
+        import xfeat_upstream
+        args.top_k = args.top_k if args.top_k > 0 else xfeat_upstream.DEFAULT_TOP_K
+        model = xfeat_upstream.load_model(args.device, args.top_k)
+        run, commit = xfeat_upstream.run, xfeat_upstream.PINNED_COMMIT
     else:
         model = upstream.load_model(args.model, args.device, args.top_k, args.scores_th, args.n_limit)
         run, commit = upstream.run, upstream.PINNED_COMMIT

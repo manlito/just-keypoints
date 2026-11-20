@@ -8,12 +8,14 @@
 #include "jkp/jkp.h"
 #include "models/aliked/aliked.h"
 #include "models/raco/raco.h"
+#include "models/xfeat/xfeat.h"
 
 struct jkp_ctx {
   jkp::Weights weights, descriptor_weights;
   std::unique_ptr<jkp::Aliked> model;  // one of model / raco is set
   std::unique_ptr<jkp::Aliked> descriptor;  // optional, describes the keypoints of raco
   std::unique_ptr<jkp::Raco> raco;
+  std::unique_ptr<jkp::Xfeat> xfeat;
   jkp::RacoOptions raco_options;
   std::unique_ptr<jkp::Ops> ops;
   jkp::DetectParams detect;
@@ -66,12 +68,13 @@ jkp_ctx* jkp_create(const jkp_config* config) {
     }
     const std::string& kind = ctx->weights.meta("model");
     if (kind == "raco") ctx->raco = std::make_unique<jkp::Raco>(ctx->weights);
+    else if (kind == "xfeat") ctx->xfeat = std::make_unique<jkp::Xfeat>(ctx->weights);
     else if (kind.rfind("aliked-", 0) == 0) ctx->model = std::make_unique<jkp::Aliked>(ctx->weights);
     else throw std::runtime_error("unsupported model '" + kind + "'");
     ctx->raco_options.top_k = config->top_k;
     ctx->raco_options.ranker = !config->skip_ranker;
     ctx->raco_options.covariance = !config->skip_covariance;
-    if (config->descriptor && *config->descriptor && !(ctx->model && kind == config->descriptor)) {
+    if (config->descriptor && *config->descriptor && !((ctx->model || ctx->xfeat) && kind == config->descriptor)) {
       std::string name = config->descriptor;
       if (!ctx->raco) throw std::runtime_error("'" + kind + "' has its own descriptors; a descriptor model needs raco");
       if (config->descriptor_weights_data && config->descriptor_weights_size) {
@@ -130,7 +133,10 @@ int jkp_extract(jkp_ctx* ctx, const jkp_image* image, jkp_result* result) {
                                    ctx->features.xy.data(), ctx->features.n, &ctx->features.desc);
       ctx->features.dim = ctx->descriptor->descriptor_dim();
     }
-    if (!ctx->raco)
+    if (ctx->xfeat)
+      ctx->xfeat->extract(*ctx->ops, image->data, image->width, image->height, image->stride, channels,
+                          ctx->detect.top_k, &ctx->features);
+    else if (!ctx->raco)
       ctx->model->extract(*ctx->ops, image->data, image->width, image->height, image->stride, channels, ctx->detect,
                           &ctx->features);
     result->n = ctx->features.n;

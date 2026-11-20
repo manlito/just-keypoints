@@ -11,7 +11,7 @@ and the RaCo detector (keypoints with ranker scores and covariances).
 | Scope | Keypoints + descriptors only. No matcher. |
 | Precision | FP32 "reference" mode on every backend, matching the original ALIKED repo; it is the default. FP16 is an opt-in fast mode (`config.precision`). |
 | Weights embedding | User's choice at build time (`JKP_EMBED_WEIGHTS=ON/OFF`, per model). Loading from a path, memory blob or URL always works. |
-| Second detector | RaCo (cvg/RaCo, Apache-2.0), developed alongside the backends instead of after them: it runs on the CPU backend now and reaches each GPU backend once that backend passes ALIKED. See "RaCo track" and "RaCo" below. No further detectors planned. |
+| Second detector | RaCo (cvg/RaCo, Apache-2.0), developed alongside the backends instead of after them: it runs on the CPU backend now and reaches each GPU backend once that backend passes ALIKED. See "RaCo track" and "RaCo" below. A third, XFeat (verlab/accelerated_features, Apache-2.0), for light and mobile use: see "XFeat track". |
 | Extensibility | Model id in config and weights file, per-model graph under `src/models/`, shared op kernels. Detector and descriptor are separate stages so they can be combined. |
 | Native backend | Hand-written CUDA kernels. No PyTorch, ONNX Runtime, cuDNN or TensorRT. |
 | Apple backend | Hand-written Metal compute shaders (MSL). No Core ML or MPSGraph. |
@@ -286,6 +286,61 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
   - Demo: detector switch (ALIKED, or RaCo described by ALIKED), best K by ranker score, covariance ellipses at
     3, 10 or 30 sigma. TUM pair, WebGPU: RaCo top 1000 gives 318 matches at ratio 0.9 (ALIKED: 229); 2000
     detected and the 500 best by ranker kept give 224 matches.
+
+### XFeat track
+
+XFeat (CVPR 2024, verlab/accelerated_features, Apache-2.0): a detector and 64-dim descriptor at about a third of
+ALIKED's time on a CPU and half on a GPU, for the mobile demo of like-recon and for quick tests. Sparse mode only (`detectAndCompute`);
+the semi-dense XFeat* matches per pair, so it has no per-image keypoints and does not fit a feature library.
+"Both versions" are the two precisions: FP32 (reference, default) and FP16 on the GPU backends, as for ALIKED;
+upstream ships one FP32 checkpoint (`weights/xfeat.pt`), FP16 converts at load time.
+
+- [x] **X1 — Reference locked:** upstream pinned at `e92685f` (`weights/xfeat.pt`, sha256 in
+  `tools/fetch_upstream.sh`); `weights/xfeat.jkpw` is 54 tensors, 659,282 values, 2.64 MB (BatchNorm folded, the
+  fine matcher left out). `tools/xfeat_folded.py` matches the original on 59 images (ALIKED's and XFeat's assets,
+  320 px to 2522x818): identical keypoint sets and positions, score error <= 4.5e-6, descriptor cosine
+  >= 1 - 3.2e-10, also at a top-k cut of 1000. `compare.py --model xfeat`, `dump_golden.py --model xfeat`.
+- [x] **X2 — CPU backend:** `jkp extract --model xfeat`. On the same 59 images: identical keypoint sets and
+  positions, score error <= 2.7e-5, descriptor cosine >= 1 - 5.4e-11; every intermediate tensor of the golden
+  files within 2.2e-6 (relative). 22 ms at 640x480 (ALIKED: 68 ms).
+- [x] **X3 — Metal**, FP32 and FP16. FP32 against the original: identical sets and positions, score <= 2.7e-5,
+  cosine >= 1 - 1.9e-10. FP16: overlap >= 99.0 % (mean 99.4 %), cosine >= 1 - 2.9e-4.
+- [x] **X4 — WebGPU**, natively and in the browser. Natively: identical sets and positions, score <= 5.3e-6,
+  cosine >= 1 - 1.1e-10; FP16 as Metal. In Chrome (the demo, TUM pair, top 1000): 244 matches at ratio 0.9
+  (ALIKED: 229), 12-17 ms per image; the module's CPU backend 0.36-0.42 s.
+- [x] **X5 — CUDA**, FP32 and FP16 (RTX 2070 Max-Q, CUDA 13.4): the six operations, as on Metal; the instance-norm
+  statistics are summed in double as on the CPU. FP32 against the original on the 59 images: identical sets and
+  positions, score <= 5.5e-6, cosine >= 1 - 5.3e-11. FP16: overlap >= 98.97 % (mean 99.4 %), cosine >= 1 - 2.9e-4.
+  10.3 ms at 640x480 in FP32, 5.7 ms in FP16 (PyTorch CUDA 10.1); 23.7 / 22.2 ms at 1920x1080 (PyTorch 17.5).
+- [x] **X6 — Bindings and docs:** Python (`model="xfeat"`, tests), browser module (`xfeat.jkpw` is copied
+  beside it), demo detector switch, README, references, accuracy and speed.
+
+Speed, ms per image, top-k 1000, median of 20 warm runs over 3 rounds (`tools/bench.py --model xfeat`, M5 Pro):
+
+| Size | CPU | Metal FP32 | Metal FP16 | WebGPU FP32 | WebGPU FP16 | PyTorch MPS | PyTorch CPU |
+|---|---|---|---|---|---|---|---|
+| 640x480 | 21.9 | 3.9 | 3.3 | 4.0 | 3.9 | 4.3 | 23.8 |
+| 1241x376 | 28.2 | 4.3 | 3.6 | 4.4 | 4.2 | 4.3 | 30.2 |
+| 1024x768 | 46.0 | 5.5 | 4.4 | 5.8 | 5.4 | 5.5 | 57.0 |
+| 1920x1080 | 98.4 | 10.6 | 8.2 | 12.1 | 11.2 | 9.9 | 149.7 |
+
+Not tuned: the 64-channel 3x3 convolutions at 1/8 resolution are a third of the GPU time.
+
+New operations (everything else is ALIKED's): ReLU, 3x3 convolution with stride 2, instance norm over the image,
+bilinear resize with `align_corners = false` to a given size, space-to-depth by 8, and `detect_xfeat`: softmax
+over 65 channels, depth-to-space, 5x5 NMS above 0.05, score = heatmap x bilinear reliability, best `top_k`
+(default 4096), descriptors by bicubic sampling of the L2-normalized 64-channel map, normalized again.
+
+Conventions fixed (the reference pass and the C++ code agree on them):
+- the image is in [0, 1] and is resized (not padded) to a multiple of 32, as upstream;
+- keypoints mean what ALIKED's mean, `(0, 0)` the centre of the top-left pixel: `(i + 0.5) * r - 0.5` for the
+  resized image's pixel `i`, where upstream returns `i * r` (at most 0.5 (r - 1) px apart);
+- equal scores are ordered in raster order;
+- kept from the original, because they decide which keypoints survive: positions are normalized by
+  `W - 1` and sampled with `align_corners = false`, so the nearest-neighbour read of the heatmap falls outside the
+  map on the last row and column (score 0, dropped), and a keypoint at pixel (0, 0) is dropped (upstream marks
+  its padding that way). WGSL divides exactly there (`div_rn`): an approximate 1 would keep them.
+- FP16 keeps the 65 keypoint logits in float, like ALIKED's score map, so the softmax does not tie neighbours.
 
 ## Phases
 

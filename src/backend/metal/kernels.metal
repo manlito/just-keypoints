@@ -37,6 +37,7 @@ constant int kActNone = 0;
 constant int kActSelu = 1;
 constant int kActSigmoid = 2;
 constant int kActLeakyRelu = 3;  // slope 0.01
+constant int kActRelu = 4;
 constant int kGreater = 0;
 constant int kRadius = 2;       // NMS and soft-argmax window radius
 constant int kScanBlock = 256;  // elements handled by one thread in the compaction kernels
@@ -54,6 +55,7 @@ inline float activate(float v, int act) {
   if (act == kActSelu) return selu(v);
   if (act == kActSigmoid) return 1.0f / (1.0f + precise::exp(-v));
   if (act == kActLeakyRelu) return v > 0 ? v : 0.01f * v;
+  if (act == kActRelu) return fmax(v, 0.0f);
   return v;
 }
 
@@ -1032,4 +1034,219 @@ kernel void k_raco_refine(device const real* logits [[buffer(0)]], device const 
       chol_out[3 * i + c] = bw[0] * v[0] + bw[1] * v[1] + bw[2] * v[2] + bw[3] * v[3];
     }
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// XFeat (ported from the CPU backend; see tools/xfeat_folded.py)
+// ---------------------------------------------------------------------------------------------
+
+// Bilinear resize, align_corners = false: source = max((dst + 0.5) * scale - 0.5, 0), scale = in / out.
+kernel void k_resize(device const real* x [[buffer(0)]], constant int& c [[buffer(1)]], constant int& h [[buffer(2)]],
+                     constant int& w [[buffer(3)]], constant int& oh [[buffer(4)]], constant int& ow [[buffer(5)]],
+                     constant float& sx [[buffer(6)]], constant float& sy [[buffer(7)]], device real* out [[buffer(8)]],
+                     uint gid [[thread_position_in_grid]]) {
+  int i = int(gid), ohw = oh * ow;
+  if (i >= c * ohw) return;
+  int ch = i / ohw, y = (i % ohw) / ow, xo = i % ow;
+  float src_x = fmax(sx * (float(xo) + 0.5f) - 0.5f, 0.0f), src_y = fmax(sy * (float(y) + 0.5f) - 0.5f, 0.0f);
+  int x0 = min(int(src_x), w - 1), y0 = min(int(src_y), h - 1);
+  int x1 = x0 + (x0 < w - 1 ? 1 : 0), y1 = y0 + (y0 < h - 1 ? 1 : 0);
+  float w1 = clampf(src_x - float(x0), 0.0f, 1.0f), w0 = 1.0f - w1;
+  float h1 = clampf(src_y - float(y0), 0.0f, 1.0f), h0 = 1.0f - h1;
+  device const real* r0 = x + (size_t(ch) * h + y0) * w;
+  device const real* r1 = x + (size_t(ch) * h + y1) * w;
+  out[i] = real(h0 * (w0 * float(r0[x0]) + w1 * float(r0[x1])) + h1 * (w0 * float(r1[x0]) + w1 * float(r1[x1])));
+}
+
+// Mean of the channels (sum, then times 1 / c).
+kernel void k_gray(device const real* x [[buffer(0)]], constant int& c [[buffer(1)]], constant int& hw [[buffer(2)]],
+                   device float* g [[buffer(3)]], uint gid [[thread_position_in_grid]]) {
+  int i = int(gid);
+  if (i >= hw) return;
+  float sum = 0;
+  for (int ch = 0; ch < c; ++ch) sum += float(x[size_t(ch) * hw + i]);
+  g[i] = sum * (1.0f / float(c));
+}
+
+// Instance norm statistics in blocks of kScanBlock, Kahan sums: mode 0 sums v, mode 1 sums (v - mean)^2 with
+// mean = stats[0] / n. Then k_moments_total puts the sum of the blocks in stats[slot].
+kernel void k_moments_block(device const float* v [[buffer(0)]], constant int& n [[buffer(1)]],
+                            device const float* stats [[buffer(2)]], constant int& mode [[buffer(3)]],
+                            device float* partial [[buffer(4)]], uint gid [[thread_position_in_grid]]) {
+  int b = int(gid), begin = b * kScanBlock;
+  if (begin >= n) return;
+  int end = min(n, begin + kScanBlock);
+  const float mean = mode ? stats[0] / float(n) : 0.0f;
+  float sum = 0, comp = 0;
+  for (int i = begin; i < end; ++i) {
+    float d = v[i] - mean;
+    float y = (mode ? d * d : v[i]) - comp, t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  partial[b] = sum;
+}
+kernel void k_moments_total(device const float* partial [[buffer(0)]], constant int& blocks [[buffer(1)]],
+                            constant int& slot [[buffer(2)]], device float* stats [[buffer(3)]],
+                            uint gid [[thread_position_in_grid]]) {
+  if (gid != 0) return;
+  float sum = 0, comp = 0;
+  for (int b = 0; b < blocks; ++b) {
+    float y = partial[b] - comp, t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  stats[slot] = sum;
+}
+// g * invstd - mean * invstd, invstd = 1 / sqrt(var + 1e-5) (biased variance), as PyTorch's batch norm.
+kernel void k_instance_norm(device const float* g [[buffer(0)]], constant int& n [[buffer(1)]],
+                            device const float* stats [[buffer(2)]], device real* out [[buffer(3)]],
+                            uint gid [[thread_position_in_grid]]) {
+  int i = int(gid);
+  if (i >= n) return;
+  const float mean = stats[0] / float(n), invstd = 1.0f / precise::sqrt(stats[1] / float(n) + 1e-5f);
+  out[i] = real(g[i] * invstd + (-mean * invstd));
+}
+
+// Stride-2 convolution, T output channels per thread for one output pixel, zero padding K / 2. Same order of
+// accumulation as the CPU backend. Grid: ceil(cout / T) * oh * ow.
+template <int T, int K>
+kernel void k_conv2d_s2_tile(device const real* x [[buffer(0)]], constant real4* weight [[buffer(1)]],
+                             constant real* bias [[buffer(2)]], constant int& has_bias [[buffer(3)]],
+                             constant int& cin [[buffer(4)]], constant int& cout [[buffer(5)]],
+                             constant int& h [[buffer(6)]], constant int& w [[buffer(7)]],
+                             constant int& oh [[buffer(8)]], constant int& ow [[buffer(9)]],
+                             constant int& act [[buffer(10)]], device real* out [[buffer(11)]],
+                             uint gid [[thread_position_in_grid]]) {
+  const int ohw = oh * ow, blocks = (cout + T - 1) / T;
+  const int i = int(gid);
+  if (i >= blocks * ohw) return;
+  const int ob = i / ohw, pix = i % ohw, y = pix / ow, xo = pix % ow, pad = K / 2, oc0 = ob * T;
+  float4 acc[T / 4];
+  for (int t = 0; t < T; ++t) acc[t / 4][t % 4] = has_bias && oc0 + t < cout ? float(bias[oc0 + t]) : 0.0f;
+  for (int ic = 0; ic < cin; ++ic) {
+    device const real* in = x + size_t(ic) * h * w;
+    const int wic = ic * K * K;
+    for (int ky = 0; ky < K; ++ky) {
+      const int sy = 2 * y + ky - pad;
+      if (sy < 0 || sy >= h) continue;
+      for (int kx = 0; kx < K; ++kx) {
+        const int sx = 2 * xo + kx - pad;
+        if (sx < 0 || sx >= w) continue;
+        const float4 v = float4(float(in[sy * w + sx]));
+        constant real4* wp = weight + ((wic + ky * K + kx) * blocks + ob) * (T / 4);
+        for (int q = 0; q < T / 4; ++q) JKP_MAC(acc[q], float4(wp[q]), v);
+      }
+    }
+  }
+  for (int t = 0; t < T; ++t)
+    if (oc0 + t < cout) out[size_t(oc0 + t) * ohw + pix] = real(activate(acc[t / 4][t % 4], act));
+}
+#define JKP_CONV_S2(T, K)                                                                                  \
+  template [[host_name("k_conv2d_s2_t" #T "_k" #K)]] kernel void k_conv2d_s2_tile<T, K>(                  \
+      device const real*, constant real4*, constant real*, constant int&, constant int&, constant int&,    \
+      constant int&, constant int&, constant int&, constant int&, constant int&, device real*, uint);
+JKP_CONV_S2(4, 3)
+JKP_CONV_S2(8, 3)
+JKP_CONV_S2(16, 3)
+JKP_CONV_S2(32, 3)
+
+// 1xHxW -> (b*b)x(H/b)x(W/b); channel ky * b + kx holds pixel (b y + ky, b x + kx).
+kernel void k_space_to_depth(device const real* x [[buffer(0)]], constant int& h [[buffer(1)]],
+                             constant int& w [[buffer(2)]], constant int& b [[buffer(3)]], device real* out [[buffer(4)]],
+                             uint gid [[thread_position_in_grid]]) {
+  int i = int(gid), oh = h / b, ow = w / b, ohw = oh * ow;
+  if (i >= h * w) return;
+  int ch = i / ohw, y = (i % ohw) / ow, xo = i % ow, ky = ch / b, kx = ch % b;
+  out[i] = x[size_t(y * b + ky) * w + xo * b + kx];
+}
+
+// Softmax over the 65 logits of each cell; the first 64 go to their pixels of the full-resolution heatmap.
+kernel void k_xfeat_heat(device const float* logits [[buffer(0)]], constant int& h8 [[buffer(1)]],
+                         constant int& w8 [[buffer(2)]], device float* heat [[buffer(3)]],
+                         uint gid [[thread_position_in_grid]]) {
+  int i = int(gid), plane = h8 * w8;
+  if (i >= plane) return;
+  int y = i / w8, x = i % w8, W = 8 * w8;
+  float m = -INFINITY;
+  for (int c = 0; c < 65; ++c) m = fmax(m, logits[size_t(c) * plane + i]);
+  float e[65], sum = 0;
+  for (int c = 0; c < 65; ++c) sum += e[c] = precise::exp(logits[size_t(c) * plane + i] - m);
+  for (int c = 0; c < 64; ++c) heat[size_t(8 * y + c / 8) * W + 8 * x + c % 8] = e[c] / sum;
+}
+
+// XFeat's sampling positions: pixel p of a `full`-wide image, normalized as 2 * (p / (full - 1)) - 1 and read
+// with align_corners = false from a map `size` wide.
+inline float xfeat_source(int p, int full, int size) {
+  const float g = 2.0f * (float(p) / float(full - 1)) - 1.0f;
+  return ((g + 1.0f) * float(size) - 1.0f) / 2.0f;
+}
+
+// Score map: for each local maximum above the threshold, the nearest heatmap value (round half to even, 0
+// outside) times the bilinear reliability; 0 elsewhere and at pixel (0, 0).
+kernel void k_xfeat_score(device const float* heat [[buffer(0)]], device const float* pooled [[buffer(1)]],
+                          device const float* rel [[buffer(2)]], constant int& H [[buffer(3)]],
+                          constant int& W [[buffer(4)]], constant float& th [[buffer(5)]],
+                          device float* score [[buffer(6)]], uint gid [[thread_position_in_grid]]) {
+  int i = int(gid);
+  if (i >= H * W) return;
+  int px = i % W, py = i / W, h8 = H / 8, w8 = W / 8;
+  float s = 0;
+  if (heat[i] == pooled[i] && heat[i] > th && (px != 0 || py != 0)) {
+    int nx = int(rint(xfeat_source(px, W, W))), ny = int(rint(xfeat_source(py, H, H)));
+    float hv = nx >= 0 && nx < W && ny >= 0 && ny < H ? heat[size_t(ny) * W + nx] : 0.0f;
+    int bi[4];
+    float bw[4];
+    bilinear_setup(xfeat_source(px, W, w8), xfeat_source(py, H, h8), w8, h8, bi, bw);
+    s = hv * bilinear_apply(rel, bi, bw);
+  }
+  score[i] = s;
+}
+
+inline void cubic_coeffs(float t, thread float* c) {
+  const float a = -0.75f;
+  float x = t + 1.0f;
+  c[0] = ((a * x - 5 * a) * x + 8 * a) * x - 4 * a;
+  c[1] = ((a + 2) * t - (a + 3)) * t * t + 1;
+  x = 1.0f - t;
+  c[2] = ((a + 2) * x - (a + 3)) * x * x + 1;
+  x = 2.0f - t;
+  c[3] = ((a * x - 5 * a) * x + 8 * a) * x - 4 * a;
+}
+
+// Descriptors (before row normalization), scores and pixels of the selected keypoints. One thread per
+// (keypoint, channel); bicubic sample of the normalized features, zeros outside.
+kernel void k_xfeat_describe(device const real* f [[buffer(0)]], constant int& dim [[buffer(1)]],
+                             constant int& h8 [[buffer(2)]], constant int& w8 [[buffer(3)]],
+                             device const float* score [[buffer(4)]], device const int* idx [[buffer(5)]],
+                             constant int& n [[buffer(6)]], device float* desc [[buffer(7)]],
+                             device float* score_out [[buffer(8)]], device int* pix [[buffer(9)]],
+                             uint gid [[thread_position_in_grid]]) {
+  int t = int(gid);
+  if (t >= n * dim) return;
+  int i = t / dim, ch = t % dim, H = 8 * h8, W = 8 * w8;
+  int px = idx[i] % W, py = idx[i] / W;
+  if (ch == 0) {
+    score_out[i] = score[idx[i]];
+    pix[2 * i] = px, pix[2 * i + 1] = py;
+  }
+  const float sx = xfeat_source(px, W, w8), sy = xfeat_source(py, H, h8);
+  const float fx = precise::floor(sx), fy = precise::floor(sy);
+  const int x0 = int(fx) - 1, y0 = int(fy) - 1;
+  float cx[4], cy[4];
+  cubic_coeffs(sx - fx, cx);
+  cubic_coeffs(sy - fy, cy);
+  device const real* plane = f + size_t(ch) * h8 * w8;
+  float v = 0;
+  for (int a = 0; a < 4; ++a) {
+    const int yy = y0 + a;
+    float tap[4];
+    for (int b = 0; b < 4; ++b) {
+      const int xx = x0 + b;
+      tap[b] = xx >= 0 && xx < w8 && yy >= 0 && yy < h8 ? float(plane[yy * w8 + xx]) : 0.0f;
+    }
+    const float row = tap[0] * cx[0] + tap[1] * cx[1] + tap[2] * cx[2] + tap[3] * cx[3];
+    v += row * cy[a];
+  }
+  desc[size_t(i) * dim + ch] = v;
 }

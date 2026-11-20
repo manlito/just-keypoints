@@ -19,7 +19,7 @@ struct Tensor {
 };
 using TensorPtr = std::shared_ptr<Tensor>;
 
-enum class Act { None, Selu, Sigmoid, LeakyRelu };  // LeakyRelu: slope 0.01
+enum class Act { None, Selu, Sigmoid, LeakyRelu, Relu };  // LeakyRelu: slope 0.01
 
 struct DetectParams {
   int top_k = -1;          // > 0: top-k mode, otherwise threshold mode
@@ -55,6 +55,20 @@ struct RacoKeypoints {
   std::vector<float> score;     // [n] probability (softmax over the whole image)
   std::vector<float> rank;      // [n], empty without a ranker map
   std::vector<float> cholesky;  // [n][3] as (L11, L21, L22), empty without a Cholesky map
+};
+
+// XFeat detector (see tools/xfeat_folded.py).
+struct XfeatDetectParams {
+  int top_k = 4096;          // number of keypoints, best first; fewer when fewer pass the threshold
+  float threshold = 0.05f;   // keypoint heatmap value a local maximum must exceed
+  int window = 5;            // NMS window (5 = 5x5)
+};
+
+struct XfeatKeypoints {
+  std::vector<int> pix;      // [n][2] pixel (x, y) of the network's (resized) image
+  std::vector<float> score;  // [n] heatmap x reliability
+  std::vector<float> desc;   // [n][dim], L2-normalized
+  int dim = 0;
 };
 
 class Ops {
@@ -102,6 +116,22 @@ class Ops {
   // are sampled at the keypoints, with softplus applied to the first and third Cholesky channel.
   virtual void detect_raco(const TensorPtr& logits, const TensorPtr& ranker_map, const TensorPtr& cholesky_raw,
                            const RacoDetectParams& params, RacoKeypoints* out);
+
+  // The operations below are used by XFeat only. A backend that has not implemented them yet inherits
+  // these, which throw, so `resize` (the first operation of the XFeat graph) reports it.
+  // Bilinear resize to height x width, align_corners = false (PyTorch F.interpolate).
+  virtual TensorPtr resize(const TensorPtr& x, int height, int width);
+  // Mean of the channels, then instance norm over the image: (g - mean) / sqrt(var + 1e-5), biased variance.
+  virtual TensorPtr gray_instance_norm(const TensorPtr& x);
+  // Stride 2, zero padding k / 2 (output ceil(h / 2) x ceil(w / 2)). weight: [Cout, Cin, k, k], k odd.
+  virtual TensorPtr conv2d_stride2(const TensorPtr& x, const Param& weight, const Param* bias, Act act);
+  // 1xHxW -> (b*b)x(H/b)x(W/b); channel ky * b + kx holds pixel (b y + ky, b x + kx) (PyTorch pixel_unshuffle).
+  virtual TensorPtr space_to_depth(const TensorPtr& x, int block);
+  // XFeat keypoints from 65x(H/8)x(W/8) logits: softmax over the channels, the first 64 back to pixels,
+  // NMS above the threshold, score = heatmap x bilinear reliability (1x(H/8)x(W/8)), best top_k (ties in
+  // raster order), descriptors by bicubic sampling of feats_n (Dx(H/8)x(W/8), already L2-normalized).
+  virtual void detect_xfeat(const TensorPtr& logits, const TensorPtr& reliability, const TensorPtr& feats_n,
+                            const XfeatDetectParams& params, XfeatKeypoints* out);
 
   // Keypoint detection on a 1xHxW score map: NMS, selection, soft-argmax refinement.
   virtual void detect(const TensorPtr& score_map, const DetectParams& params, Keypoints* out) = 0;

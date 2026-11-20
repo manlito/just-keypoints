@@ -14,7 +14,7 @@ readme = "bindings/python/README.md"
 requires-python = ">=3.12"
 # The code is Apache-2.0; the built-in weights are ALIKED's (BSD-3-Clause) and RaCo's (Apache-2.0).
 license = "Apache-2.0 AND BSD-3-Clause"
-license-files = ["LICENSE", "weights/LICENSE-ALIKED", "weights/LICENSE-RACO"]
+license-files = ["LICENSE", "weights/LICENSE-ALIKED", "weights/LICENSE-RACO", "weights/LICENSE-XFEAT"]
 dependencies = ["numpy>=1.26"]
 keywords = ["keypoints", "local features", "ALIKED", "RaCo", "structure from motion", "feature matching"]
 classifiers = [

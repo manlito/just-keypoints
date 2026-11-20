@@ -5,6 +5,7 @@ export { jkp };
 
 export const WEIGHTS_URL = new URL('./lib/aliked-n16.jkpw', import.meta.url).href;
 export const RACO_WEIGHTS_URL = new URL('./lib/raco.jkpw', import.meta.url).href;
+export const XFEAT_WEIGHTS_URL = new URL('./lib/xfeat.jkpw', import.meta.url).href;
 
 // What this browser can run. The module waits for the GPU through JSPI (WebAssembly.Suspending); without
 // it the module cannot run at all. Without WebGPU the module's CPU backend still runs, slowly.

@@ -4,6 +4,7 @@
     python tools/export_weights.py                       # aliked-n16 -> weights/aliked-n16.jkpw
     python tools/export_weights.py --model aliked-t16
     python tools/export_weights.py --model raco          # original RaCo -> weights/raco.jkpw
+    python tools/export_weights.py --model xfeat         # original XFeat -> weights/xfeat.jkpw
 """
 import argparse
 import os
@@ -118,6 +119,55 @@ def export_raco():
     return meta, {k: (v.numpy() if hasattr(v, "numpy") else v) for k, v in out.items()}
 
 
+def export_xfeat():
+    """XFeat's BasicLayer is conv (no bias) + BatchNorm(affine=False) + ReLU: folded with gamma 1, beta 0.
+    The fine matcher (XFeat* semi-dense refinement) is left out: sparse mode does not use it."""
+    import xfeat_upstream
+
+    model = xfeat_upstream.load_model()
+    sd = {k: v.detach().cpu() for k, v in model.net.state_dict().items()}
+    out, used = {}, set()
+
+    def take(key):
+        used.add(key)
+        return sd[key]
+
+    def basic(src, dst):
+        w = take(f"{src}.layer.0.weight")
+        mean, var = take(f"{src}.layer.1.running_mean"), take(f"{src}.layer.1.running_var")
+        used.add(f"{src}.layer.1.num_batches_tracked")
+        scale = 1.0 / torch.sqrt(var.double() + 1e-5)  # nn.BatchNorm2d default eps
+        out[f"{dst}.weight"] = (w.double() * scale[:, None, None, None]).float()
+        out[f"{dst}.bias"] = (-mean.double() * scale).float()
+
+    def plain(src, dst):
+        out[f"{dst}.weight"], out[f"{dst}.bias"] = take(f"{src}.weight"), take(f"{src}.bias")
+
+    plain("skip1.1", "skip")
+    for block, n in (("block1", 4), ("block2", 2), ("block3", 3), ("block4", 3), ("block5", 4)):
+        for i in range(n):
+            basic(f"{block}.{i}", f"{block}.{i}")
+    for i in range(2):
+        basic(f"block_fusion.{i}", f"fusion.{i}")
+    plain("block_fusion.2", "fusion.2")
+    for i in range(2):
+        basic(f"heatmap_head.{i}", f"heatmap.{i}")
+    plain("heatmap_head.2", "heatmap.2")
+    for i in range(3):
+        basic(f"keypoint_head.{i}", f"keypoint.{i}")
+    plain("keypoint_head.3", "keypoint.3")
+    missing = {k for k in set(sd) - used if not k.startswith("fine_matcher.")}
+    assert not missing, f"checkpoint tensors not exported: {sorted(missing)}"
+
+    commit = subprocess.run(["git", "-C", xfeat_upstream.XFEAT_DIR, "rev-parse", "HEAD"],
+                            capture_output=True, text=True).stdout.strip() or "unknown"
+    meta = {"kind": "weights", "model": "xfeat", "dim": 64, "top_k": xfeat_upstream.DEFAULT_TOP_K,
+            "detection_threshold": xfeat_upstream.DETECTION_THRESHOLD, "nms": 5,
+            "source": "https://github.com/verlab/accelerated_features", "source_commit": commit,
+            "source_weights": "weights/xfeat.pt", "license": "Apache-2.0"}
+    return meta, {k: v.numpy() for k, v in out.items()}
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model", default="aliked-n16")
@@ -125,7 +175,8 @@ def main():
     args = ap.parse_args()
     path = args.out or os.path.join(upstream.ROOT, "weights", f"{args.model}.jkpw")
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    meta, tensors = export_raco() if args.model == "raco" else export(args.model)
+    exporters = {"raco": export_raco, "xfeat": export_xfeat}
+    meta, tensors = exporters[args.model]() if args.model in exporters else export(args.model)
     jkpfile.write(path, meta, tensors)
 
     # Round-trip check.

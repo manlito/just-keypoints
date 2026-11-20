@@ -1,14 +1,15 @@
 # just-keypoints
 
-Keypoint and descriptor extraction (ALIKED) with minimal dependencies, for feature matching and bundle adjustment.
+Keypoint and descriptor extraction (ALIKED, RaCo, XFeat) with minimal dependencies, for feature matching and bundle adjustment.
 No PyTorch, no ONNX Runtime. Plan and status: [PLAN.md](PLAN.md).
 
 > [!IMPORTANT]
-> **Use [ALIKED](https://github.com/Shiaoming/ALIKED) and [RaCo](https://github.com/cvg/RaCo).** This repository
-> is a test bed for dependency-free inference and GPU kernels, not a replacement for them. It adds nothing to
-> either except speed and fewer dependencies: no new networks, training or features, and only a subset of what
-> they offer (inference only, and one ALIKED variant, `aliked-n16`). The methods, the weights, and the credit
-> for them are their authors'. For real work, ALIKED and RaCo are the projects to depend on.
+> **Use [ALIKED](https://github.com/Shiaoming/ALIKED), [RaCo](https://github.com/cvg/RaCo) and
+> [XFeat](https://github.com/verlab/accelerated_features).** This repository is a test bed for dependency-free
+> inference and GPU kernels, not a replacement for them. It adds nothing to them except speed and fewer
+> dependencies: no new networks, training or features, and only a subset of what they offer (inference only, one
+> ALIKED variant, `aliked-n16`, and XFeat's sparse mode). The methods, the weights, and the credit for them are
+> their authors'. For real work, ALIKED, RaCo and XFeat are the projects to depend on.
 
 Documentation: <https://just-keypoints.pages.dev> ([live demo](https://just-keypoints.pages.dev/demo/),
 [benchmark](https://just-keypoints.pages.dev/bench/)).
@@ -43,8 +44,8 @@ cmake --build build/release
 
 | Option | Default | Meaning |
 |---|---|---|
-| `JKP_EMBED_WEIGHTS` | `ON` | compile the weights into the library (adds ~4.7 MB for both models); `OFF` = give a path or memory blob at run time |
-| `JKP_EMBED_MODELS` | `aliked-n16;raco` | models to embed (names in `weights/`); `aliked-n16` alone adds ~2.7 MB |
+| `JKP_EMBED_WEIGHTS` | `ON` | compile the weights into the library (adds ~7.3 MB for the three models); `OFF` = give a path or memory blob at run time |
+| `JKP_EMBED_MODELS` | `aliked-n16;raco;xfeat` | models to embed (names in `weights/`); `aliked-n16` alone adds ~2.7 MB, `xfeat` ~2.6 MB |
 | `JKP_CUDA` | `AUTO` | CUDA backend: `AUTO` = build it when a CUDA compiler is found, `ON` = require it, `OFF` |
 | `JKP_METAL` | `AUTO` | Metal backend: `AUTO` = build it on Apple platforms, `ON` = require it, `OFF` |
 | `JKP_WEBGPU` | `AUTO` | WebGPU backend: `AUTO` = build it when Dawn (or, under Emscripten, emdawnwebgpu) is found, `ON` = require it, `OFF` |
@@ -198,7 +199,34 @@ In the C API set `config.model = "raco"`; the result then has `rank` and `cov`, 
 In the browser: `jkp.create({ weightsUrl: 'raco.jkpw', descriptorWeightsUrl: 'aliked-n16.jkpw' })`; results add `rank` and `cov`.
 `top_k` is the number of keypoints (default 2048); there is no score threshold.
 
+## XFeat detector
+
+[XFeat](https://github.com/verlab/accelerated_features) (CVPR 2024) is a third model: a light detector with
+64-dim descriptors, for mobile use and quick tests. Sparse mode only (upstream's `detectAndCompute`; the
+semi-dense XFeat* matches per pair). It runs on the CPU, CUDA, Metal and WebGPU backends, in FP32 and in FP16 on
+the GPUs, and matches the original on each (PLAN.md, XFeat track).
+
+```sh
+build/release/jkp extract image.png --model xfeat --out features.jkpt
+build/release/jkp extract image.png --model xfeat --backend metal --precision fp16 --out features.jkpt
+python tools/compare.py --model xfeat image.png --b "cmd:build/release/jkp extract --model xfeat --backend metal"
+```
+
+`top_k` is the number of keypoints (default 4096), best first above XFeat's detection threshold (0.05); there is
+no other threshold. The network sees the image resized down to a multiple of 32, as upstream; keypoints are
+pixel centres of that image, given in the original image's pixels. Milliseconds per image, top-k 1000 (M5 Pro):
+
+| Size | CPU | Metal FP32 | Metal FP16 | WebGPU FP32 | PyTorch MPS |
+|---|---|---|---|---|---|
+| 640x480 | 21.9 | 3.9 | 3.3 | 4.0 | 4.3 |
+| 1024x768 | 46.0 | 5.5 | 4.4 | 5.8 | 5.5 |
+| 1920x1080 | 98.4 | 10.6 | 8.2 | 12.1 | 9.9 |
+
+In the C API set `config.model = "xfeat"` (`dim` is 64); in Python `Extractor(model="xfeat")`; in the browser
+`jkp.create({ weightsUrl: 'xfeat.jkpw' })`.
+
 ## Licenses
 
 Code in this repository: Apache-2.0 (`LICENSE`). Weights in `weights/` come from ALIKED (BSD-3-Clause, see
-`weights/LICENSE-ALIKED`) and RaCo (Apache-2.0, see `weights/LICENSE-RACO`). `cli/stb_image.h` is public domain / MIT and is used only by the CLI.
+`weights/LICENSE-ALIKED`), RaCo (Apache-2.0, see `weights/LICENSE-RACO`) and XFeat (Apache-2.0, see
+`weights/LICENSE-XFEAT`; the original repository states one license for code and weights). `cli/stb_image.h` is public domain / MIT and is used only by the CLI.

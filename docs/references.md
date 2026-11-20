@@ -24,6 +24,16 @@ Practical Learned Keypoints." 3DV 2026. <https://github.com/cvg/RaCo>. Apache 2.
 - Describing RaCo keypoints with ALIKED follows `ALIKED.describe` in LightGlue
   (<https://github.com/cvg/LightGlue>, Apache 2.0).
 
+### XFeat
+
+Guilherme Potje, Felipe Cadar, André Araujo, Renato Martins and Erickson R. Nascimento. "XFeat: Accelerated
+Features for Lightweight Image Matching." CVPR 2024. <https://github.com/verlab/accelerated_features>. Apache 2.0
+licence.
+
+- The XFeat weights are the repository's `weights/xfeat.pt`, with BatchNorm folded; the fine matcher of the
+  semi-dense mode is left out.
+- Detection and description follow `XFeat.detectAndCompute`, and every backend is checked against it.
+
 ## Images in the demo
 
 - The indoor pair: two frames of the TUM RGB-D benchmark. Jürgen Sturm, Nikolas Engelhard, Felix Endres, Wolfram

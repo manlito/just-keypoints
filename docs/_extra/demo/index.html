@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Live demo · just-keypoints</title>
-<meta name="description" content="ALIKED or RaCo keypoints, descriptors and matches computed in your browser on WebGPU.">
+<meta name="description" content="ALIKED, RaCo or XFeat keypoints, descriptors and matches computed in your browser on WebGPU.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -31,7 +31,7 @@
 
 <main class="app" id="content">
   <h1>Live demo</h1>
-  <p class="lede">ALIKED or RaCo keypoints and descriptors for two images, computed in this page on your GPU through
+  <p class="lede">ALIKED, RaCo or XFeat keypoints and descriptors for two images, computed in this page on your GPU through
   WebGPU, and the matches between them. Nothing is uploaded: your images stay in the browser.
   The matcher (mutual nearest neighbours with a ratio test) is part of this demo, not of the library.
   <a href="../browser.html">Use the library in your page</a>.</p>
@@ -73,6 +73,7 @@
           <div class="seg" role="radiogroup" aria-label="Detector">
             <label><input type="radio" name="det" value="aliked" checked>ALIKED</label>
             <label><input type="radio" name="det" value="raco">RaCo</label>
+            <label><input type="radio" name="det" value="xfeat">XFeat</label>
           </div>
           <p class="hint" id="det-hint">ALIKED detects and describes keypoints in one network.</p>
         </div>
@@ -188,7 +189,7 @@
 
 <footer class="jk-foot">
   <div class="jk-foot-in">
-    <span>just-keypoints · weights from ALIKED (BSD-3-Clause) and RaCo (Apache-2.0) · sample images: TUM RGB-D (CC BY 4.0), KITTI (CC BY-NC-SA 3.0)</span>
+    <span>just-keypoints · weights from ALIKED (BSD-3-Clause), RaCo and XFeat (Apache-2.0) · sample images: TUM RGB-D (CC BY 4.0), KITTI (CC BY-NC-SA 3.0)</span>
     <a href="../references.html">References and acknowledgements</a>
   </div>
 </footer>

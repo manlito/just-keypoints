@@ -1,8 +1,8 @@
 // The benchmark page: one image at four sizes, the 1000 best keypoints, median of warm runs. The sizes are the
 // ones of the native benchmark tables; each is a centre crop of the test image to the size's aspect ratio,
-// scaled to the size. ALIKED in FP32 and FP16, or RaCo (FP32 only), with or without ALIKED's descriptors.
-import { jkp, environment, weights, RACO_WEIGHTS_URL, pixels, loadImage, median, ms, unsupportedMessage }
-  from '../common.js';
+// scaled to the size. ALIKED or XFeat in FP32 and FP16, or RaCo (FP32 only), with or without ALIKED's descriptors.
+import { jkp, environment, weights, RACO_WEIGHTS_URL, XFEAT_WEIGHTS_URL, pixels, loadImage, median, ms,
+  unsupportedMessage } from '../common.js';
 
 const $ = (id) => document.getElementById(id);
 const SIZES = [[640, 480], [1241, 376], [1024, 768], [1920, 1080]];
@@ -42,6 +42,7 @@ function columns() {
 const label = (c) => `${c.backend === 'webgpu' ? 'WebGPU' : 'CPU'} ${c.precision.toUpperCase()}`;
 
 function detectorText(c) {
+  if (c.detector === 'xfeat') return 'XFeat';
   if (c.detector !== 'raco') return 'ALIKED (aliked-n16)';
   return c.desc ? 'RaCo, ALIKED descriptors' : 'RaCo, no descriptors';
 }
@@ -52,6 +53,8 @@ async function extractorOptions(c) {
     if (c.desc) options.descriptorWeights = await weights();
     return options;
   }
+  // XFeat keeps the best TOP_K above its own detection threshold (0.05).
+  if (c.detector === 'xfeat') return { weights: await weights(XFEAT_WEIGHTS_URL), backend: c.backend, precision: c.precision, topK: TOP_K };
   return { weights: await weights(), backend: c.backend, precision: c.precision, topK: TOP_K };
 }
 
@@ -171,17 +174,19 @@ async function main() {
 // Controls that depend on the detector and the backend. The CPU backend is slow (RaCo with descriptors about
 // 12 s per 640x480 image), so choosing it lowers the run counts.
 function update() {
-  const raco = checked('det') === 'raco', cpu = checked('backend') === 'cpu';
+  const det = checked('det'), raco = det === 'raco', xfeat = det === 'xfeat', cpu = checked('backend') === 'cpu';
   $('f-rdesc').hidden = !raco;
   $('fp32').disabled = raco;
   if (raco) $('fp32').checked = true;
   $('fp16').disabled = raco || cpu || !env.f16;
-  $('fp16-hint').textContent = raco ? '(ALIKED only)' : !env.f16 && env.webgpu ? '(this adapter has no shader-f16)' : '';
+  $('fp16-hint').textContent = raco ? '(ALIKED and XFeat only)' : !env.f16 && env.webgpu ? '(this adapter has no shader-f16)' : '';
   $('det-hint').textContent = raco
     ? 'RaCo detects keypoints and adds a ranker score and a covariance to each; FP32 only.'
+    : xfeat
+    ? 'XFeat detects and describes keypoints (64 floats) in one light network.'
     : 'ALIKED detects and describes keypoints in one network.';
   $('backend-hint').textContent = 'The CPU backend runs on one thread and times 640x480 only: ' +
-    (raco ? ($('rdesc').checked ? 'about 12 s' : 'about 11 s') : 'about a second') + ' per image.';
+    (raco ? ($('rdesc').checked ? 'about 12 s' : 'about 11 s') : xfeat ? 'about 0.4 s' : 'about a second') + ' per image.';
   if (cpu) {
     const [runs, warmup] = raco ? [3, 1] : [5, 1];
     $('runs').value = Math.min(+$('runs').value, runs);

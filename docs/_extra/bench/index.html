@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Benchmark · just-keypoints</title>
-<meta name="description" content="Time ALIKED or RaCo keypoint and descriptor extraction in your browser on a fixed set of image sizes.">
+<meta name="description" content="Time ALIKED, RaCo or XFeat keypoint and descriptor extraction in your browser on a fixed set of image sizes.">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&amp;family=IBM+Plex+Mono:wght@400;500&amp;display=swap">
@@ -46,6 +46,7 @@
           <div class="seg" role="radiogroup" aria-label="Detector">
             <label><input type="radio" name="det" value="aliked" checked>ALIKED</label>
             <label><input type="radio" name="det" value="raco">RaCo</label>
+            <label><input type="radio" name="det" value="xfeat">XFeat</label>
           </div>
           <p class="hint" id="det-hint"></p>
         </div>
@@ -101,7 +102,7 @@
 
 <footer class="jk-foot">
   <div class="jk-foot-in">
-    <span>just-keypoints · weights from ALIKED (BSD-3-Clause) and RaCo (Apache-2.0) · test image: TUM RGB-D (CC BY 4.0)</span>
+    <span>just-keypoints · weights from ALIKED (BSD-3-Clause), RaCo and XFeat (Apache-2.0) · test image: TUM RGB-D (CC BY 4.0)</span>
     <a href="../references.html">References and acknowledgements</a>
   </div>
 </footer>

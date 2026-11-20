@@ -11,6 +11,9 @@ Implementations (--a / --b):
                           and must write keypoints (N,2 pixel xy), scores (N) and, when the model has them,
                           descriptors (N,D), ranker (N) and covariances (N,2,2).
 
+--model xfeat: --top-k is the number of keypoints (default 4096); --scores-th and --n-limit do not apply
+(XFeat's detection threshold is fixed at 0.05, as in the original).
+
 --model raco: a detector without descriptors. --top-k is the number of keypoints (default 2048);
 --scores-th and --n-limit do not apply. With --descriptor aliked-n16 the RaCo keypoints of each side are
 described by that side's ALIKED (upstream: the original ALIKED; folded: tools/folded.py; cmd: pass
@@ -67,6 +70,14 @@ def make_runner(spec, args):
             aliked = Folded(os.path.join(upstream.ROOT, "weights", f"{args.descriptor}.jkpw"), rest or "cpu")
             run = with_descriptors(run, aliked.describe_at)
         return run
+    if args.model == "xfeat" and kind == "upstream":
+        import xfeat_upstream
+        model = xfeat_upstream.load_model(rest or "cpu", args.top_k)
+        return lambda rgb: xfeat_upstream.run(model, rgb)
+    if args.model == "xfeat" and kind == "folded":
+        from xfeat_folded import XFeatFolded
+        weights = args.weights or os.path.join(upstream.ROOT, "weights", "xfeat.jkpw")
+        return XFeatFolded(weights, rest or "cpu", args.top_k).run
     if kind == "upstream":
         model = upstream.load_model(args.model, rest or "cpu", args.top_k, args.scores_th, args.n_limit)
         return lambda rgb: upstream.run(model, rgb)

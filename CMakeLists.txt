@@ -12,7 +12,7 @@ set(JKP_METAL "AUTO" CACHE STRING "Metal backend (Apple platforms): AUTO (build 
 set_property(CACHE JKP_METAL PROPERTY STRINGS AUTO ON OFF)
 set(JKP_WEBGPU "AUTO" CACHE STRING "WebGPU backend: AUTO (build it when Dawn, or under Emscripten emdawnwebgpu, is found), ON or OFF")
 set_property(CACHE JKP_WEBGPU PROPERTY STRINGS AUTO ON OFF)
-set(JKP_EMBED_MODELS "aliked-n16;raco" CACHE STRING "Models to embed when JKP_EMBED_WEIGHTS is ON (names in weights/)")
+set(JKP_EMBED_MODELS "aliked-n16;raco;xfeat" CACHE STRING "Models to embed when JKP_EMBED_WEIGHTS is ON (names in weights/)")
 
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
   set(CMAKE_BUILD_TYPE Release)
@@ -110,6 +110,7 @@ add_library(jkp
   src/core/weights.cpp
   src/models/aliked/aliked.cpp
   src/models/raco/raco.cpp
+  src/models/xfeat/xfeat.cpp
   src/backend/cpu/cpu_ops.cpp
   "${embed_cpp}")
 target_include_directories(jkp PUBLIC include PRIVATE src)
@@ -198,7 +199,7 @@ if(EMSCRIPTEN AND JKP_BUILD_WASM)
     add_custom_command(TARGET jkp_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                        "${CMAKE_CURRENT_SOURCE_DIR}/web/${f}" "${CMAKE_CURRENT_BINARY_DIR}/web/${f}")
   endforeach()
-  foreach(f aliked-n16.jkpw raco.jkpw)
+  foreach(f aliked-n16.jkpw raco.jkpw xfeat.jkpw)
     add_custom_command(TARGET jkp_wasm POST_BUILD COMMAND ${CMAKE_COMMAND} -E copy_if_different
                        "${CMAKE_CURRENT_SOURCE_DIR}/weights/${f}" "${CMAKE_CURRENT_BINARY_DIR}/web/${f}")
   endforeach()
@@ -221,6 +222,7 @@ if(JKP_BUILD_TESTS)
   set(test_backends ${jkp_backends})
   # Backends with the RaCo operations (PLAN.md, RaCo track); the others throw from Ops::normalize.
   set(raco_backends cpu)
+  set(xfeat_backends cpu)  # GPU backends join as they get the XFeat operations (PLAN.md, XFeat track)
   if(JKP_HAVE_CUDA)
     list(APPEND raco_backends cuda)
   endif()
@@ -323,6 +325,24 @@ if(JKP_BUILD_TESTS)
     foreach(backend IN LISTS raco_backends)
       add_test(NAME golden_raco_${backend}_${name}
                COMMAND raco_golden_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/raco.jkpw" "${golden}" ${backend})
+    endforeach()
+  endforeach()
+
+  # XFeat: python tools/dump_golden.py --model xfeat <images>
+  add_executable(xfeat_golden_test tests/xfeat_golden_test.cpp)
+  target_include_directories(xfeat_golden_test PRIVATE src)
+  target_link_libraries(xfeat_golden_test PRIVATE jkp)
+  foreach(b CUDA METAL WEBGPU)
+    if(JKP_HAVE_${b})
+      target_compile_definitions(xfeat_golden_test PRIVATE JKP_TEST_${b})
+    endif()
+  endforeach()
+  file(GLOB xfeat_golden_files "${CMAKE_CURRENT_SOURCE_DIR}/build/golden/xfeat/*.jkpt")
+  foreach(golden IN LISTS xfeat_golden_files)
+    get_filename_component(name "${golden}" NAME_WLE)
+    foreach(backend IN LISTS xfeat_backends)
+      add_test(NAME golden_xfeat_${backend}_${name}
+               COMMAND xfeat_golden_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/xfeat.jkpw" "${golden}" ${backend})
     endforeach()
   endforeach()
 endif()

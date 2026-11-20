@@ -38,6 +38,8 @@ void activate(float* v, int n, Act act) {
     for (int i = 0; i < n; ++i) v[i] = 1.0f / (1.0f + std::exp(-v[i]));
   } else if (act == Act::LeakyRelu) {
     for (int i = 0; i < n; ++i) v[i] = v[i] > 0 ? v[i] : 0.01f * v[i];
+  } else if (act == Act::Relu) {
+    for (int i = 0; i < n; ++i) v[i] = std::max(v[i], 0.0f);
   }
 }
 
@@ -60,6 +62,21 @@ inline void bilinear_setup(float x, float y, int w, int h, int idx[4], float wt[
 }
 inline float bilinear_apply(const float* plane, const int idx[4], const float wt[4]) {
   return wt[0] * plane[idx[0]] + wt[1] * plane[idx[1]] + wt[2] * plane[idx[2]] + wt[3] * plane[idx[3]];
+}
+
+// PyTorch's cubic convolution weights (A = -0.75) for the taps at -1, 0, 1, 2 around floor(x), t = x - floor(x).
+inline void cubic_coeffs(float t, float c[4]) {
+  const float a = -0.75f;
+  auto near = [a](float x) { return ((a + 2) * x - (a + 3)) * x * x + 1; };
+  auto far = [a](float x) { return ((a * x - 5 * a) * x + 8 * a) * x - 4 * a; };
+  c[0] = far(t + 1.0f), c[1] = near(t), c[2] = near(1.0f - t), c[3] = far(2.0f - t);
+}
+
+// XFeat's sampling positions: pixel p of a W-wide image, normalized as 2 * (p / (W - 1)) - 1 (float32, the
+// original's order) and read with align_corners = false from a map `size` wide.
+inline float xfeat_source(int p, int full, int size) {
+  const float g = 2.0f * (static_cast<float>(p) / static_cast<float>(full - 1)) - 1.0f;
+  return ((g + 1.0f) * static_cast<float>(size) - 1.0f) / 2.0f;
 }
 
 // log(1 + exp(x)); linear above 20 as in PyTorch.
@@ -496,6 +513,196 @@ class CpuOps : public Ops {
             out->cholesky[3 * static_cast<size_t>(i) + c] = bilinear_apply(v, id, bw);
           }
         }
+      }
+    });
+  }
+
+  TensorPtr resize(const TensorPtr& xp, int oh, int ow) override {
+    const CpuTensor& x = cpu(xp);
+    if (oh < 1 || ow < 1) throw std::runtime_error("resize: empty output");
+    CpuPtr out = make(x.c, oh, ow);
+    // align_corners = false: source = max((dst + 0.5) * in / out - 0.5, 0) (PyTorch upsample_bilinear2d).
+    auto taps = [](int in, int outn, std::vector<int>& i0, std::vector<int>& i1, std::vector<float>& l1) {
+      const float scale = static_cast<float>(in) / static_cast<float>(outn);
+      i0.resize(outn), i1.resize(outn), l1.resize(outn);
+      for (int d = 0; d < outn; ++d) {
+        const float src = std::max(scale * (static_cast<float>(d) + 0.5f) - 0.5f, 0.0f);
+        i0[d] = std::min(static_cast<int>(src), in - 1);
+        i1[d] = i0[d] + (i0[d] < in - 1 ? 1 : 0);
+        l1[d] = std::min(std::max(src - static_cast<float>(i0[d]), 0.0f), 1.0f);
+      }
+    };
+    std::vector<int> x0, x1, y0, y1;
+    std::vector<float> lx, ly;
+    taps(x.w, ow, x0, x1, lx);
+    taps(x.h, oh, y0, y1, ly);
+    parallel_for(oh, [&](int y_begin, int y_end) {
+      for (int c = 0; c < x.c; ++c)
+        for (int y = y_begin; y < y_end; ++y) {
+          const float* r0 = x.plane(c) + y0[y] * x.w;
+          const float* r1 = x.plane(c) + y1[y] * x.w;
+          float* o = out->plane(c) + y * ow;
+          const float h1 = ly[y], h0 = 1.0f - h1;
+          for (int i = 0; i < ow; ++i) {
+            const float w1 = lx[i], w0 = 1.0f - w1;
+            o[i] = h0 * (w0 * r0[x0[i]] + w1 * r0[x1[i]]) + h1 * (w0 * r1[x0[i]] + w1 * r1[x1[i]]);
+          }
+        }
+    });
+    return out;
+  }
+
+  TensorPtr gray_instance_norm(const TensorPtr& xp) override {
+    const CpuTensor& x = cpu(xp);
+    const size_t n = static_cast<size_t>(x.h) * x.w;
+    CpuPtr out = make(1, x.h, x.w);
+    // Mean of the channels as PyTorch's mean (sum, then times 1/C).
+    const float inv_c = 1.0f / static_cast<float>(x.c);
+    for (size_t i = 0; i < n; ++i) {
+      float sum = 0;
+      for (int c = 0; c < x.c; ++c) sum += x.plane(c)[i];
+      out->d[i] = sum * inv_c;
+    }
+    // Statistics in double, two passes; then x * invstd - mean * invstd in float (PyTorch's batch norm).
+    double sum = 0;
+    for (size_t i = 0; i < n; ++i) sum += out->d[i];
+    const double mean = sum / static_cast<double>(n);
+    double var = 0;
+    for (size_t i = 0; i < n; ++i) var += (out->d[i] - mean) * (out->d[i] - mean);
+    const double invstd = 1.0 / std::sqrt(var / static_cast<double>(n) + 1e-5);
+    const float alpha = static_cast<float>(invstd), beta = static_cast<float>(-mean * invstd);
+    for (size_t i = 0; i < n; ++i) out->d[i] = out->d[i] * alpha + beta;
+    return out;
+  }
+
+  TensorPtr conv2d_stride2(const TensorPtr& xp, const Param& weight, const Param* bias, Act act) override {
+    const CpuTensor& x = cpu(xp);
+    const int cout = weight.shape[0], cin = weight.shape[1], k = weight.shape[2], pad = k / 2;
+    if (cin != x.c || weight.shape[3] != k || k % 2 == 0) throw std::runtime_error("conv2d_stride2: shape mismatch");
+    const int oh = (x.h + 1) / 2, ow = (x.w + 1) / 2;
+    CpuPtr out = make(cout, oh, ow);
+    parallel_for(oh, [&](int y_begin, int y_end) {
+      for (int oc = 0; oc < cout; ++oc)
+        for (int y = y_begin; y < y_end; ++y) {
+          float* o = out->plane(oc) + y * ow;
+          std::fill(o, o + ow, bias ? bias->data[oc] : 0.0f);
+          for (int ic = 0; ic < cin; ++ic) {
+            const float* wk = weight.data + (static_cast<size_t>(oc) * cin + ic) * k * k;
+            for (int ky = 0; ky < k; ++ky) {
+              const int sy = 2 * y + ky - pad;
+              if (sy < 0 || sy >= x.h) continue;
+              const float* in = x.plane(ic) + sy * x.w;
+              for (int kx = 0; kx < k; ++kx) {
+                const float wv = wk[ky * k + kx];
+                for (int i = 0; i < ow; ++i) {
+                  const int sx = 2 * i + kx - pad;
+                  if (sx >= 0 && sx < x.w) o[i] += wv * in[sx];
+                }
+              }
+            }
+          }
+          activate(o, ow, act);
+        }
+    });
+    return out;
+  }
+
+  TensorPtr space_to_depth(const TensorPtr& xp, int b) override {
+    const CpuTensor& x = cpu(xp);
+    if (x.h % b || x.w % b) throw std::runtime_error("space_to_depth: size not a multiple of the block");
+    const int oh = x.h / b, ow = x.w / b;
+    CpuPtr out = make(x.c * b * b, oh, ow);
+    for (int c = 0; c < x.c; ++c)
+      for (int ky = 0; ky < b; ++ky)
+        for (int kx = 0; kx < b; ++kx) {
+          float* o = out->plane((c * b + ky) * b + kx);
+          for (int y = 0; y < oh; ++y)
+            for (int i = 0; i < ow; ++i) o[y * ow + i] = x.plane(c)[(y * b + ky) * x.w + i * b + kx];
+        }
+    return out;
+  }
+
+  void detect_xfeat(const TensorPtr& logits_p, const TensorPtr& reliability_p, const TensorPtr& feats_p,
+                    const XfeatDetectParams& params, XfeatKeypoints* out) override {
+    const CpuTensor &lg = cpu(logits_p), &rel = cpu(reliability_p), &f = cpu(feats_p);
+    const int h8 = lg.h, w8 = lg.w, H = 8 * h8, W = 8 * w8, r = params.window / 2;
+    if (lg.c != 65 || rel.c != 1 || rel.h != h8 || rel.w != w8 || f.h != h8 || f.w != w8 || params.window % 2 == 0)
+      throw std::runtime_error("detect_xfeat: bad arguments");
+
+    // Softmax over the 65 channels of each cell; the first 64 go back to their pixels.
+    std::vector<float> heat(static_cast<size_t>(H) * W), pooled;
+    parallel_for(h8, [&](int y_begin, int y_end) {
+      float e[65];
+      for (int y = y_begin; y < y_end; ++y)
+        for (int x = 0; x < w8; ++x) {
+          const size_t at = static_cast<size_t>(y) * w8 + x, plane = static_cast<size_t>(h8) * w8;
+          float m = -INFINITY;
+          for (int c = 0; c < 65; ++c) m = std::max(m, lg.d[c * plane + at]);
+          float sum = 0;
+          for (int c = 0; c < 65; ++c) sum += e[c] = std::exp(lg.d[c * plane + at] - m);
+          for (int c = 0; c < 64; ++c) heat[static_cast<size_t>(8 * y + c / 8) * W + 8 * x + c % 8] = e[c] / sum;
+        }
+    });
+
+    // NMS: local maxima of the window above the threshold, in raster order.
+    max_filter(heat, pooled, W, H, r);
+    std::vector<int> cand;
+    for (int i = 0; i < H * W; ++i)
+      if (heat[i] == pooled[i] && heat[i] > params.threshold) cand.push_back(i);
+
+    // Score: nearest heatmap value (round half to even, 0 outside; the last row and column read outside)
+    // times the bilinear reliability (zeros outside). A keypoint at (0, 0) is dropped, as in the original.
+    std::vector<float> score(cand.size());
+    for (size_t j = 0; j < cand.size(); ++j) {
+      const int px = cand[j] % W, py = cand[j] / W;
+      const int nx = static_cast<int>(std::nearbyint(xfeat_source(px, W, W)));
+      const int ny = static_cast<int>(std::nearbyint(xfeat_source(py, H, H)));
+      const float hv = nx >= 0 && nx < W && ny >= 0 && ny < H ? heat[static_cast<size_t>(ny) * W + nx] : 0.0f;
+      int bi[4];
+      float bw[4];
+      bilinear_setup(xfeat_source(px, W, w8), xfeat_source(py, H, h8), w8, h8, bi, bw);
+      score[j] = px == 0 && py == 0 ? -1.0f : hv * bilinear_apply(rel.d.data(), bi, bw);
+    }
+    std::vector<int> order(cand.size());
+    std::iota(order.begin(), order.end(), 0);
+    std::stable_sort(order.begin(), order.end(), [&](int a, int b) { return score[a] > score[b]; });
+    int count = std::min(static_cast<int>(order.size()), std::max(params.top_k, 0));
+    while (count > 0 && !(score[order[count - 1]] > 0)) --count;
+    order.resize(count);
+
+    // Descriptors: bicubic samples (zeros outside) of the normalized features, normalized again.
+    const int dim = f.c;
+    out->dim = dim;
+    out->pix.resize(2 * static_cast<size_t>(count));
+    out->score.resize(count);
+    out->desc.assign(static_cast<size_t>(count) * dim, 0.0f);
+    parallel_for(count, [&](int begin, int end) {
+      for (int i = begin; i < end; ++i) {
+        const int px = cand[order[i]] % W, py = cand[order[i]] / W;
+        out->pix[2 * i] = px, out->pix[2 * i + 1] = py;
+        out->score[i] = score[order[i]];
+        const float sx = xfeat_source(px, W, w8), sy = xfeat_source(py, H, h8);
+        const float fx = std::floor(sx), fy = std::floor(sy);
+        const int x0 = static_cast<int>(fx) - 1, y0 = static_cast<int>(fy) - 1;
+        float cx[4], cy[4];
+        cubic_coeffs(sx - fx, cx);
+        cubic_coeffs(sy - fy, cy);
+        float* d = out->desc.data() + static_cast<size_t>(i) * dim;
+        for (int c = 0; c < dim; ++c) {
+          const float* plane = f.plane(c);
+          auto at = [&](int x, int y) { return x >= 0 && x < w8 && y >= 0 && y < h8 ? plane[y * w8 + x] : 0.0f; };
+          float v = 0;
+          for (int a = 0; a < 4; ++a) {
+            const float row = at(x0, y0 + a) * cx[0] + at(x0 + 1, y0 + a) * cx[1] + at(x0 + 2, y0 + a) * cx[2] +
+                              at(x0 + 3, y0 + a) * cx[3];
+            v += row * cy[a];
+          }
+          d[c] = v;
+        }
+        float norm = 0;
+        for (int c = 0; c < dim; ++c) norm += d[c] * d[c];
+        norm = std::max(std::sqrt(norm), 1e-12f);
+        for (int c = 0; c < dim; ++c) d[c] /= norm;
       }
     });
   }

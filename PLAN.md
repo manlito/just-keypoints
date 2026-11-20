@@ -11,7 +11,7 @@ and the RaCo detector (keypoints with ranker scores and covariances).
 | Scope | Keypoints + descriptors only. No matcher. |
 | Precision | FP32 "reference" mode on every backend, matching the original ALIKED repo; it is the default. FP16 is an opt-in fast mode (`config.precision`). |
 | Weights embedding | User's choice at build time (`JKP_EMBED_WEIGHTS=ON/OFF`, per model). Loading from a path, memory blob or URL always works. |
-| Second detector | RaCo (cvg/RaCo, Apache-2.0), developed alongside the backends instead of after them: it runs on the CPU backend now and reaches each GPU backend once that backend passes ALIKED. See "RaCo track" and "RaCo" below. No further detectors planned. |
+| Second detector | RaCo (cvg/RaCo, Apache-2.0), developed alongside the backends instead of after them: it runs on the CPU backend now and reaches each GPU backend once that backend passes ALIKED. See "RaCo track" and "RaCo" below. A third, XFeat (verlab/accelerated_features, Apache-2.0), for light and mobile use: see "XFeat track". |
 | Extensibility | Model id in config and weights file, per-model graph under `src/models/`, shared op kernels. Detector and descriptor are separate stages so they can be combined. |
 | Native backend | Hand-written CUDA kernels. No PyTorch, ONNX Runtime, cuDNN or TensorRT. |
 | Apple backend | Hand-written Metal compute shaders (MSL). No Core ML or MPSGraph. |
@@ -286,6 +286,31 @@ Runs in parallel with M3-M8. Each step needs only the backend it names, so it ne
   - Demo: detector switch (ALIKED, or RaCo described by ALIKED), best K by ranker score, covariance ellipses at
     3, 10 or 30 sigma. TUM pair, WebGPU: RaCo top 1000 gives 318 matches at ratio 0.9 (ALIKED: 229); 2000
     detected and the 500 best by ranker kept give 224 matches.
+
+### XFeat track
+
+XFeat (CVPR 2024, verlab/accelerated_features, Apache-2.0): a detector and 64-dim descriptor about a tenth of
+ALIKED's cost, for the mobile demo of like-recon and for quick tests. Sparse mode only (`detectAndCompute`);
+the semi-dense XFeat* matches per pair, so it has no per-image keypoints and does not fit a feature library.
+"Both versions" are the two precisions: FP32 (reference, default) and FP16 on the GPU backends, as for ALIKED;
+upstream ships one FP32 checkpoint (`weights/xfeat.pt`), FP16 converts at load time.
+
+- [ ] **X1 — Reference locked:** upstream pinned, `weights/xfeat.jkpw` (BatchNorm folded), `tools/xfeat_folded.py`
+  matching the original, `compare.py --model xfeat`, golden dump.
+- [ ] **X2 — CPU backend:** `jkp extract --model xfeat`; golden test.
+- [ ] **X3 — Metal**, FP32 and FP16. **X4 — WebGPU**, natively and in the browser. **X5 — CUDA** (NVIDIA machine).
+- [ ] **X6 — Bindings and docs:** Python (`model="xfeat"`), browser module, demo detector switch, docs pages.
+
+New operations (everything else is ALIKED's): ReLU, 3x3 convolution with stride 2, instance norm over the image,
+bilinear resize with `align_corners = false` to a given size, space-to-depth by 8, and `detect_xfeat`: softmax
+over 65 channels, depth-to-space, 5x5 NMS above 0.05, score = heatmap x bilinear reliability, best `top_k`
+(default 4096), descriptors by bicubic sampling of the L2-normalized 64-channel map, normalized again.
+
+Conventions to fix (the reference pass and the C++ code agree on them):
+- the image is in [0, 1] and is resized (not padded) to a multiple of 32, as upstream;
+- keypoints mean what ALIKED's mean, `(0, 0)` the centre of the top-left pixel: `(i + 0.5) * r - 0.5` for the
+  resized image's pixel `i`, where upstream returns `i * r` (at most 0.5 (r - 1) px apart);
+- equal scores are ordered in raster order.
 
 ## Phases
 

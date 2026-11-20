@@ -24,6 +24,10 @@
 // RaCo (normalize, pad_reflect, detect_raco) is ported from the CPU backend as on Metal (R5);
 // detect_raco reuses the device-side top-k selection of detect (Selection).
 //
+// XFeat (resize, gray_instance_norm, conv2d_stride2, space_to_depth, detect_xfeat) is ported from the CPU
+// backend as on Metal (X5). The instance-norm statistics are summed in double, as on the CPU, and in FP16
+// the 65 keypoint logits stay float like the score map, so that the heatmap does not tie.
+//
 // Profiling: with JKP_CUDA_PROFILE=1 in the environment every kernel launch is followed by a device
 // synchronization and its time is recorded under the operation that issued it; the table goes to stderr
 // when the backend is destroyed. Total times are meaningless in that mode, times per launch are not.
@@ -65,7 +69,7 @@ namespace {
 // Device helpers shared by the kernels
 // ---------------------------------------------------------------------------------------------
 
-enum : int { kActNone = 0, kActSelu = 1, kActSigmoid = 2, kActLeakyRelu = 3 };
+enum : int { kActNone = 0, kActSelu = 1, kActSigmoid = 2, kActLeakyRelu = 3, kActRelu = 4 };
 enum : int { kGreater = 0, kEqual = 1 };
 constexpr int kRadius = 2;        // NMS and soft-argmax window radius
 constexpr int kScanBlock = 256;   // elements handled by one thread in the compaction kernels
@@ -93,6 +97,7 @@ __device__ __forceinline__ float activate(float v, int act) {
   if (act == kActSelu) return selu(v);
   if (act == kActSigmoid) return 1.0f / (1.0f + expf(-v));
   if (act == kActLeakyRelu) return v > 0 ? v : 0.01f * v;
+  if (act == kActRelu) return v > 0 ? v : 0.0f;
   return v;
 }
 
@@ -892,6 +897,196 @@ __global__ void k_raco_refine(const R* logits, const float* prob, const R* ranke
 // ---------------------------------------------------------------------------------------------
 // Host side
 // ---------------------------------------------------------------------------------------------
+// XFeat (ported from the CPU backend; see tools/xfeat_folded.py)
+// ---------------------------------------------------------------------------------------------
+
+// Bilinear resize, align_corners = false: source = max((dst + 0.5) * scale - 0.5, 0), scale = in / out.
+template <typename R>
+__global__ void k_resize(const R* x, int c, int h, int w, int oh, int ow, float sx, float sy, R* out) {
+  int i = thread_index(), ohw = oh * ow;
+  if (i >= c * ohw) return;
+  int ch = i / ohw, y = (i % ohw) / ow, xo = i % ow;
+  float src_x = fmaxf(sx * (static_cast<float>(xo) + 0.5f) - 0.5f, 0.0f);
+  float src_y = fmaxf(sy * (static_cast<float>(y) + 0.5f) - 0.5f, 0.0f);
+  int x0 = min(static_cast<int>(src_x), w - 1), y0 = min(static_cast<int>(src_y), h - 1);
+  int x1 = x0 + (x0 < w - 1 ? 1 : 0), y1 = y0 + (y0 < h - 1 ? 1 : 0);
+  float w1 = clampf(src_x - static_cast<float>(x0), 0.0f, 1.0f), w0 = 1.0f - w1;
+  float h1 = clampf(src_y - static_cast<float>(y0), 0.0f, 1.0f), h0 = 1.0f - h1;
+  const R* r0 = x + (static_cast<size_t>(ch) * h + y0) * w;
+  const R* r1 = x + (static_cast<size_t>(ch) * h + y1) * w;
+  st(out + i, h0 * (w0 * ld(r0[x0]) + w1 * ld(r0[x1])) + h1 * (w0 * ld(r1[x0]) + w1 * ld(r1[x1])));
+}
+
+// Mean of the channels (sum, then times 1 / c), in float.
+template <typename R>
+__global__ void k_gray(const R* x, int c, int hw, float* g) {
+  int i = thread_index();
+  if (i >= hw) return;
+  float sum = 0;
+  for (int ch = 0; ch < c; ++ch) sum += ld(x[static_cast<size_t>(ch) * hw + i]);
+  g[i] = sum * (1.0f / static_cast<float>(c));
+}
+
+// Instance-norm statistics in double, as the CPU backend: one thread per block of kScanBlock values sums
+// v (mode 0) or (v - mean)^2 with mean = stats[0] / total (mode 1). Applied again to the block sums
+// (mode 0) until one is left, which goes to stats[slot].
+template <typename V>
+__global__ void k_moments_block(const V* v, int n, const double* stats, int total, int mode, double* partial) {
+  int b = thread_index(), begin = b * kScanBlock;
+  if (begin >= n) return;
+  int end = min(n, begin + kScanBlock);
+  const double mean = mode ? stats[0] / static_cast<double>(total) : 0.0;
+  double sum = 0;
+  for (int i = begin; i < end; ++i) {
+    const double d = static_cast<double>(v[i]) - mean;
+    sum += mode ? d * d : static_cast<double>(v[i]);
+  }
+  partial[b] = sum;
+}
+__global__ void k_moments_total(const double* partial, int blocks, int slot, double* stats) {
+  if (thread_index() != 0) return;
+  double sum = 0;
+  for (int b = 0; b < blocks; ++b) sum += partial[b];
+  stats[slot] = sum;
+}
+// g * alpha + beta with alpha = invstd, beta = -mean * invstd rounded to float (PyTorch's batch norm).
+template <typename R>
+__global__ void k_instance_norm(const float* g, int n, const double* stats, R* out) {
+  int i = thread_index();
+  if (i >= n) return;
+  const double mean = stats[0] / static_cast<double>(n);
+  const double invstd = 1.0 / sqrt(stats[1] / static_cast<double>(n) + 1e-5);
+  const float alpha = static_cast<float>(invstd), beta = static_cast<float>(-mean * invstd);
+  st(out + i, g[i] * alpha + beta);
+}
+
+// Stride-2 convolution, T output channels per thread for one output pixel, zero padding K / 2, weights
+// tap-major as k_conv2d_tile. Same order of accumulation as the CPU backend. Grid: ceil(cout / T) * oh * ow.
+template <typename R, int T, int K>
+__global__ void k_conv2d_s2_tile(const R* x, const R* weight, const R* bias, int cin, int cout, int h, int w, int oh,
+                                 int ow, int act, R* out) {
+  const int ohw = oh * ow, blocks = (cout + T - 1) / T;
+  const int i = thread_index();
+  if (i >= blocks * ohw) return;
+  const int ob = i / ohw, pix = i % ohw, y = pix / ow, xo = pix % ow, pad = K / 2, oc0 = ob * T;
+  float acc[T];
+  #pragma unroll
+  for (int t = 0; t < T; ++t) acc[t] = bias && oc0 + t < cout ? ld(bias[oc0 + t]) : 0.0f;
+  for (int ic = 0; ic < cin; ++ic) {
+    const R* in = x + static_cast<size_t>(ic) * h * w;
+    const int wic = ic * K * K;
+    for (int ky = 0; ky < K; ++ky) {
+      const int sy = 2 * y + ky - pad;
+      if (sy < 0 || sy >= h) continue;
+      for (int kx = 0; kx < K; ++kx) {
+        const int sx = 2 * xo + kx - pad;
+        if (sx < 0 || sx >= w) continue;
+        const float v = ld(in[sy * w + sx]);
+        const R* wp = weight + (static_cast<size_t>(wic + ky * K + kx) * blocks + ob) * T;
+        #pragma unroll
+        for (int t = 0; t < T; ++t) acc[t] = mac<R>(acc[t], ld(wp[t]), v);
+      }
+    }
+  }
+  #pragma unroll
+  for (int t = 0; t < T; ++t)
+    if (oc0 + t < cout) st(out + static_cast<size_t>(oc0 + t) * ohw + pix, activate(acc[t], act));
+}
+
+// 1xHxW -> (b*b)x(H/b)x(W/b); channel ky * b + kx holds pixel (b y + ky, b x + kx).
+template <typename R>
+__global__ void k_space_to_depth(const R* x, int h, int w, int b, R* out) {
+  int i = thread_index(), oh = h / b, ow = w / b, ohw = oh * ow;
+  if (i >= h * w) return;
+  int ch = i / ohw, y = (i % ohw) / ow, xo = i % ow, ky = ch / b, kx = ch % b;
+  out[i] = x[static_cast<size_t>(y * b + ky) * w + xo * b + kx];
+}
+
+// Softmax over the 65 logits of each cell; the first 64 go to their pixels of the full-resolution heatmap.
+__global__ void k_xfeat_heat(const float* logits, int h8, int w8, float* heat) {
+  int i = thread_index(), plane = h8 * w8;
+  if (i >= plane) return;
+  int y = i / w8, x = i % w8, W = 8 * w8;
+  float m = -INFINITY;
+  for (int c = 0; c < 65; ++c) m = fmaxf(m, logits[static_cast<size_t>(c) * plane + i]);
+  float e[65], sum = 0;
+  for (int c = 0; c < 65; ++c) sum += e[c] = expf(logits[static_cast<size_t>(c) * plane + i] - m);
+  for (int c = 0; c < 64; ++c) heat[static_cast<size_t>(8 * y + c / 8) * W + 8 * x + c % 8] = e[c] / sum;
+}
+
+// XFeat's sampling positions: pixel p of a `full`-wide image, normalized as 2 * (p / (full - 1)) - 1 and read
+// with align_corners = false from a map `size` wide.
+__device__ __forceinline__ float xfeat_source(int p, int full, int size) {
+  const float g = 2.0f * (static_cast<float>(p) / static_cast<float>(full - 1)) - 1.0f;
+  return ((g + 1.0f) * static_cast<float>(size) - 1.0f) / 2.0f;
+}
+
+// Score map: for each local maximum above the threshold, the nearest heatmap value (round half to even, 0
+// outside) times the bilinear reliability; 0 elsewhere and at pixel (0, 0).
+__global__ void k_xfeat_score(const float* heat, const float* pooled, const float* rel, int H, int W, float th,
+                              float* score) {
+  int i = thread_index();
+  if (i >= H * W) return;
+  int px = i % W, py = i / W, h8 = H / 8, w8 = W / 8;
+  float s = 0;
+  if (heat[i] == pooled[i] && heat[i] > th && (px != 0 || py != 0)) {
+    int nx = static_cast<int>(rintf(xfeat_source(px, W, W))), ny = static_cast<int>(rintf(xfeat_source(py, H, H)));
+    float hv = nx >= 0 && nx < W && ny >= 0 && ny < H ? heat[static_cast<size_t>(ny) * W + nx] : 0.0f;
+    int bi[4];
+    float bw[4];
+    bilinear_setup(xfeat_source(px, W, w8), xfeat_source(py, H, h8), w8, h8, bi, bw);
+    s = hv * bilinear_apply(rel, bi, bw);
+  }
+  score[i] = s;
+}
+
+__device__ __forceinline__ void cubic_coeffs(float t, float* c) {
+  const float a = -0.75f;
+  float x = t + 1.0f;
+  c[0] = ((a * x - 5 * a) * x + 8 * a) * x - 4 * a;
+  c[1] = ((a + 2) * t - (a + 3)) * t * t + 1;
+  x = 1.0f - t;
+  c[2] = ((a + 2) * x - (a + 3)) * x * x + 1;
+  x = 2.0f - t;
+  c[3] = ((a * x - 5 * a) * x + 8 * a) * x - 4 * a;
+}
+
+// Descriptors (before row normalization), scores and pixels of the selected keypoints. One thread per
+// (keypoint, channel); bicubic sample of the normalized features, zeros outside.
+template <typename R>
+__global__ void k_xfeat_describe(const R* f, int dim, int h8, int w8, const float* score, const int* idx, int n,
+                                 float* desc, float* score_out, int* pix) {
+  int t = thread_index();
+  if (t >= n * dim) return;
+  int i = t / dim, ch = t % dim, H = 8 * h8, W = 8 * w8;
+  int px = idx[i] % W, py = idx[i] / W;
+  if (ch == 0) {
+    score_out[i] = score[idx[i]];
+    pix[2 * i] = px, pix[2 * i + 1] = py;
+  }
+  const float sx = xfeat_source(px, W, w8), sy = xfeat_source(py, H, h8);
+  const float fx = floorf(sx), fy = floorf(sy);
+  const int x0 = static_cast<int>(fx) - 1, y0 = static_cast<int>(fy) - 1;
+  float cx[4], cy[4];
+  cubic_coeffs(sx - fx, cx);
+  cubic_coeffs(sy - fy, cy);
+  const R* plane = f + static_cast<size_t>(ch) * h8 * w8;
+  float v = 0;
+  for (int a = 0; a < 4; ++a) {
+    const int yy = y0 + a;
+    float tap[4];
+    for (int b = 0; b < 4; ++b) {
+      const int xx = x0 + b;
+      tap[b] = xx >= 0 && xx < w8 && yy >= 0 && yy < h8 ? ld(plane[yy * w8 + xx]) : 0.0f;
+    }
+    const float row = tap[0] * cx[0] + tap[1] * cx[1] + tap[2] * cx[2] + tap[3] * cx[3];
+    v += row * cy[a];
+  }
+  desc[static_cast<size_t>(i) * dim + ch] = v;
+}
+
+
+// ---------------------------------------------------------------------------------------------
 
 // Whether the NVIDIA driver is installed. On Windows without it, CUDA 13.4's static runtime crashes in its
 // first call instead of returning an error (the release workflow's runners have no GPU; CUDA 12.9 returns
@@ -1182,6 +1377,7 @@ int act_id(Act act) {
     case Act::Selu: return kActSelu;
     case Act::Sigmoid: return kActSigmoid;
     case Act::LeakyRelu: return kActLeakyRelu;
+    case Act::Relu: return kActRelu;
   }
   throw std::runtime_error("cuda: unknown activation");
 }
@@ -1260,12 +1456,14 @@ class CudaOps : public Ops {
     const R* b = bias ? param(*bias) : nullptr;
     const int hw = x.h * x.w, a = act_id(act);
     g_profile.tag("conv%dx%d %3d->%-3d %4dx%-4d%s", k, k, cin, cout, x.w, x.h, x.pyramid && k == 1 ? " pyramid" : "");
-    // FP16: the sigmoid layer produces the score map, which stays float (see the top of the file).
-    if (kHalf && act == Act::Sigmoid && cout <= 4 && (k == 1 || k == 3)) {
+    // FP16: the sigmoid layer produces the score map, which stays float (see the top of the file), and so do
+    // XFeat's 65 keypoint logits (a 1x1 convolution without activation), so that its heatmap does not tie.
+    if (kHalf && ((act == Act::Sigmoid && cout <= 4 && (k == 1 || k == 3)) || (act == Act::None && cout == 65 && k == 1))) {
       CudaPtr out = std::make_shared<CudaTensor>(pool_, cout, x.h, x.w, false);
       const R* w = param_tiled(weight, 4);
-      if (k == 1) launch(k_conv2d_tile<R, float, 4, 1>, hw, x.as<R>(), w, b, cin, cout, x.h, x.w, a, out->template out<float>());
-      else launch(k_conv2d_tile<R, float, 4, 3>, hw, x.as<R>(), w, b, cin, cout, x.h, x.w, a, out->template out<float>());
+      const long long threads = static_cast<long long>((cout + 3) / 4) * hw;
+      if (k == 1) launch(k_conv2d_tile<R, float, 4, 1>, threads, x.as<R>(), w, b, cin, cout, x.h, x.w, a, out->template out<float>());
+      else launch(k_conv2d_tile<R, float, 4, 3>, threads, x.as<R>(), w, b, cin, cout, x.h, x.w, a, out->template out<float>());
       return out;
     }
     CudaPtr out = make(cout, x.h, x.w);
@@ -1556,6 +1754,114 @@ class CudaOps : public Ops {
       out->cholesky.resize(3 * nk);
       cov.download(out->cholesky.data(), 3 * nk);
     }
+  }
+
+  TensorPtr resize(const TensorPtr& xp, int oh, int ow) override {
+    use();
+    const CudaTensor& x = dev(xp);
+    if (oh < 1 || ow < 1) throw std::runtime_error("resize: empty output");
+    CudaPtr out = make(x.c, oh, ow);
+    g_profile.tag("resize c%d %dx%d -> %dx%d", x.c, x.w, x.h, ow, oh);
+    launch(k_resize<R>, out->size(), x.as<R>(), x.c, x.h, x.w, oh, ow, static_cast<float>(x.w) / static_cast<float>(ow),
+           static_cast<float>(x.h) / static_cast<float>(oh), out->template out<R>());
+    return out;
+  }
+
+  TensorPtr gray_instance_norm(const TensorPtr& xp) override {
+    use();
+    const CudaTensor& x = dev(xp);
+    const int n = x.h * x.w;
+    CudaPtr out = make(1, x.h, x.w);
+    g_profile.tag("gray_instance_norm %dx%d", x.w, x.h);
+    Buffer<float> g(pool_, n);
+    Buffer<double> stats(pool_, 2);
+    launch(k_gray<R>, n, x.as<R>(), x.c, n, g.get());
+    for (int mode = 0; mode < 2; ++mode) {
+      int blocks = (n + kScanBlock - 1) / kScanBlock;
+      Buffer<double> partial(pool_, std::max(blocks, 1)), partial2(pool_, std::max(blocks, 1));
+      launch(k_moments_block<float>, blocks, g.get(), n, stats.get(), n, mode, partial.get());
+      double *cur = partial.get(), *next = partial2.get();
+      while (blocks > kScanBlock) {
+        const int up = (blocks + kScanBlock - 1) / kScanBlock;
+        launch(k_moments_block<double>, up, cur, blocks, stats.get(), n, 0, next);
+        std::swap(cur, next);
+        blocks = up;
+      }
+      launch(k_moments_total, 1, cur, blocks, mode, stats.get());
+    }
+    launch(k_instance_norm<R>, n, g.get(), n, stats.get(), out->template out<R>());
+    return out;
+  }
+
+  TensorPtr conv2d_stride2(const TensorPtr& xp, const Param& weight, const Param* bias, Act act) override {
+    use();
+    const CudaTensor& x = dev(xp);
+    const int cout = weight.shape[0], cin = weight.shape[1], k = weight.shape[2];
+    if (cin != x.c || weight.shape[3] != k || k != 3) throw std::runtime_error("conv2d_stride2: shape mismatch");
+    const int oh = (x.h + 1) / 2, ow = (x.w + 1) / 2, t = tile(cout), a = act_id(act);
+    CudaPtr out = make(cout, oh, ow);
+    g_profile.tag("conv3x3/2 %3d->%-3d %4dx%-4d", cin, cout, x.w, x.h);
+    const R* b = bias ? param(*bias) : nullptr;
+    const R* w = param_tiled(weight, t);
+    const long long threads = static_cast<long long>((cout + t - 1) / t) * oh * ow;
+    R* o = out->template out<R>();
+    if (t == 4) launch(k_conv2d_s2_tile<R, 4, 3>, threads, x.as<R>(), w, b, cin, cout, x.h, x.w, oh, ow, a, o);
+    else if (t == 8) launch(k_conv2d_s2_tile<R, 8, 3>, threads, x.as<R>(), w, b, cin, cout, x.h, x.w, oh, ow, a, o);
+    else launch(k_conv2d_s2_tile<R, 16, 3>, threads, x.as<R>(), w, b, cin, cout, x.h, x.w, oh, ow, a, o);
+    return out;
+  }
+
+  TensorPtr space_to_depth(const TensorPtr& xp, int block) override {
+    use();
+    const CudaTensor& x = dev(xp);
+    if (x.c != 1 || block < 1 || x.h % block || x.w % block) throw std::runtime_error("space_to_depth: bad arguments");
+    CudaPtr out = make(block * block, x.h / block, x.w / block);
+    g_profile.tag("space_to_depth %dx%d", x.w, x.h);
+    launch(k_space_to_depth<R>, out->size(), x.as<R>(), x.h, x.w, block, out->template out<R>());
+    return out;
+  }
+
+  void detect_xfeat(const TensorPtr& logits_p, const TensorPtr& reliability_p, const TensorPtr& feats_p,
+                    const XfeatDetectParams& params, XfeatKeypoints* out) override {
+    use();
+    const CudaTensor &lg = dev(logits_p), &rel = dev(reliability_p), &f = dev(feats_p);
+    const int h8 = lg.h, w8 = lg.w, H = 8 * h8, W = 8 * w8, n = H * W, dim = f.c;
+    if (lg.c != 65 || rel.c != 1 || rel.h != h8 || rel.w != w8 || f.h != h8 || f.w != w8 || params.window % 2 == 0)
+      throw std::runtime_error("detect_xfeat: bad arguments");
+    out->pix.clear(), out->score.clear(), out->desc.clear();
+    out->dim = dim;
+    if (n == 0) return;
+    const float* logits = lg.as<float>();  // float in both modes (conv2d)
+    const float* reliability = rel.as<float>();
+
+    g_profile.tag("detect_xfeat heat %dx%d", W, H);
+    Buffer<float> heat(pool_, n), score(pool_, n);
+    launch(k_xfeat_heat, h8 * w8, logits, h8, w8, heat.get());
+    g_profile.tag("detect_xfeat nms %dx%d", W, H);
+    {
+      Buffer<float> tmp(pool_, n), pooled(pool_, n);
+      launch(k_max_filter, n, heat.get(), W, H, params.window / 2, 0, tmp.get());
+      launch(k_max_filter, n, tmp.get(), W, H, params.window / 2, 1, pooled.get());
+      launch(k_xfeat_score, n, heat.get(), pooled.get(), reliability, H, W, params.threshold, score.get());
+    }
+    g_profile.tag("detect_xfeat select");
+    Selection select(pool_, score.get(), n);
+    const int kept = std::min(std::max(params.top_k, 0), select.count(kGreater, 0.0f));
+    if (kept == 0) return;
+    const size_t nk = static_cast<size_t>(kept);
+    Buffer<int> idx(pool_, nk), pix(pool_, 2 * nk);
+    select.top(kept, idx.get());
+    g_profile.tag("detect_xfeat describe");
+    Buffer<float> desc(pool_, nk * dim), s(pool_, nk);
+    launch(k_xfeat_describe<R>, static_cast<long long>(kept) * dim, f.as<R>(), dim, h8, w8, score.get(), idx.get(), kept,
+           desc.get(), s.get(), pix.get());
+    launch(k_normalize_rows, kept, desc.get(), kept, dim);
+    out->pix.resize(2 * nk);
+    out->score.resize(nk);
+    out->desc.resize(nk * dim);
+    pix.download(out->pix.data(), out->pix.size());
+    s.download(out->score.data(), nk);
+    desc.download(out->desc.data(), out->desc.size());
   }
 
   void describe(const TensorPtr& feature_map, const Keypoints& kpts, const SddhParams& p,

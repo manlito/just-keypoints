@@ -308,8 +308,10 @@ upstream ships one FP32 checkpoint (`weights/xfeat.pt`), FP16 converts at load t
 - [x] **X4 — WebGPU**, natively and in the browser. Natively: identical sets and positions, score <= 5.3e-6,
   cosine >= 1 - 1.1e-10; FP16 as Metal. In Chrome (the demo, TUM pair, top 1000): 244 matches at ratio 0.9
   (ALIKED: 229), 12-17 ms per image; the module's CPU backend 0.36-0.42 s.
-- [ ] **X5 — CUDA** (NVIDIA machine): the six operations, as on Metal. Until then XFeat on CUDA throws "XFeat is
-  not implemented on this backend yet"; callers fall back to the CPU (22 ms at 640x480 on the M5 Pro).
+- [x] **X5 — CUDA**, FP32 and FP16 (RTX 2070 Max-Q, CUDA 13.4): the six operations, as on Metal; the instance-norm
+  statistics are summed in double as on the CPU. FP32 against the original on the 59 images: identical sets and
+  positions, score <= 5.5e-6, cosine >= 1 - 5.3e-11. FP16: overlap >= 98.97 % (mean 99.4 %), cosine >= 1 - 2.9e-4.
+  10.3 ms at 640x480 in FP32, 5.7 ms in FP16 (PyTorch CUDA 10.1); 23.7 / 22.2 ms at 1920x1080 (PyTorch 17.5).
 - [x] **X6 — Bindings and docs:** Python (`model="xfeat"`, tests), browser module (`xfeat.jkpw` is copied
   beside it), demo detector switch, README, references, accuracy and speed.
 

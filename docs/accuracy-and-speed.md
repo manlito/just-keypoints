@@ -60,12 +60,13 @@ Against the original `XFeat.detectAndCompute` on 59 images (320 px to 2522x818),
 | Backend | Keypoint sets | Position error | Score error | Descriptor cosine |
 |---|---|---|---|---|
 | CPU | identical | 0 | <= 2.7e-5 | >= 1 - 5.4e-11 |
+| CUDA | identical | 0 | <= 5.5e-6 | >= 1 - 5.3e-11 |
 | Metal | identical | 0 | <= 2.7e-5 | >= 1 - 1.9e-10 |
 | WebGPU (native) | identical | 0 | <= 5.3e-6 | >= 1 - 1.1e-10 |
 
 Keypoints are pixels of the network's image, so a keypoint found by both is at exactly the same place. In FP16 on
-Metal and WebGPU, 99.0 % or more of the keypoints are the same (mean 99.4 %). Milliseconds per image, top-k
-1000, M5 Pro:
+Metal and WebGPU, 99.0 % or more of the keypoints are the same (mean 99.4 %); on CUDA 98.97 % or more (mean
+99.4 %), descriptor cosine >= 1 - 2.9e-4. Milliseconds per image, top-k 1000, M5 Pro:
 
 | Size | CPU | Metal FP32 | Metal FP16 | WebGPU FP32 | WebGPU FP16 | PyTorch MPS |
 |---|---|---|---|---|---|---|
@@ -74,4 +75,14 @@ Metal and WebGPU, 99.0 % or more of the keypoints are the same (mean 99.4 %). Mi
 | 1024x768 | 46.0 | 5.5 | 4.4 | 5.8 | 5.4 | 5.5 |
 | 1920x1080 | 98.4 | 10.6 | 8.2 | 12.1 | 11.2 | 9.9 |
 
-The CUDA backend does not run XFeat yet.
+On the RTX 2070 Max-Q laptop (CUDA 13.4, PyTorch 2.15):
+
+| Size | CUDA FP32 | CUDA FP16 | PyTorch CUDA |
+|---|---|---|---|
+| 640x480 | 10.3 | 5.7 | 10.1 |
+| 1241x376 | 11.2 | 6.6 | 9.0 |
+| 1024x768 | 12.8 | 9.8 | 9.3 |
+| 1920x1080 | 23.7 | 22.2 | 17.5 |
+
+The convolutions are ALIKED's kernels, not tuned for XFeat: at 1920x1080 the 64-channel 3x3 layers at 1/8
+resolution take about a third of the GPU time, and the top-k selection's round trips to the host a tenth.

@@ -203,8 +203,8 @@ In the browser: `jkp.create({ weightsUrl: 'raco.jkpw', descriptorWeightsUrl: 'al
 
 [XFeat](https://github.com/verlab/accelerated_features) (CVPR 2024) is a third model: a light detector with
 64-dim descriptors, for mobile use and quick tests. Sparse mode only (upstream's `detectAndCompute`; the
-semi-dense XFeat* matches per pair). It runs on the CPU, Metal and WebGPU backends, in FP32 and in FP16 on the
-GPUs, and matches the original on each; CUDA is not ported yet (PLAN.md, XFeat track).
+semi-dense XFeat* matches per pair). It runs on the CPU, CUDA, Metal and WebGPU backends, in FP32 and in FP16 on
+the GPUs, and matches the original on each (PLAN.md, XFeat track).
 
 ```sh
 build/release/jkp extract image.png --model xfeat --out features.jkpt

@@ -23,7 +23,7 @@ typedef struct {
   jkp_backend backend;
   /* Model to run; selects the embedded weights when no weights are given. Default "aliked-n16".
      "raco" is a detector without descriptors: it returns ranker scores and covariances instead.
-     "xfeat" is a light detector with 64-dim descriptors (about a tenth of aliked-n16's work). */
+     "xfeat" is a light detector with 64-dim descriptors (about a third of aliked-n16's time on the CPU). */
   const char* model;
   /* Weights source, first that is set wins: memory blob, file path, weights embedded at build time. */
   const void* weights_data;

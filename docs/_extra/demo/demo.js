@@ -1,5 +1,5 @@
 // The live demo: two images, their keypoints, the matches between them, and the time each step takes.
-import { jkp, environment, weights, RACO_WEIGHTS_URL, pixels, loadImage, sourceSize, ms, unsupportedMessage } from '../common.js';
+import { jkp, environment, weights, RACO_WEIGHTS_URL, XFEAT_WEIGHTS_URL, pixels, loadImage, sourceSize, ms, unsupportedMessage } from '../common.js';
 
 const $ = (id) => document.getElementById(id);
 const SAMPLES = {
@@ -48,6 +48,7 @@ function settings() {
 
 function extractorKey(s) {
   if (s.detector === 'raco') return `raco|${s.backend}|k${s.topK}`;
+  if (s.detector === 'xfeat') return `xfeat|${s.backend}|${s.precision}|k${s.topK}`;
   return s.mode === 'topk' ? `${s.backend}|${s.precision}|k${s.topK}` : `${s.backend}|${s.precision}|t${s.th}|${s.cap}`;
 }
 
@@ -123,6 +124,9 @@ async function ensureExtractor(s) {
     // RaCo keypoints, described by ALIKED for matching; RaCo runs in FP32 only.
     options = { weights: await weights(RACO_WEIGHTS_URL), descriptorWeights: await weights(), backend: s.backend,
                 precision: 'fp32', topK: s.topK };
+  } else if (s.detector === 'xfeat') {
+    // XFeat keeps the best K above its own detection threshold (0.05).
+    options = { weights: await weights(XFEAT_WEIGHTS_URL), backend: s.backend, precision: s.precision, topK: s.topK };
   } else {
     options = { weights: await weights(), backend: s.backend, precision: s.precision };
     if (s.mode === 'topk') options.topK = s.topK;
@@ -286,7 +290,7 @@ function draw() {
 function renderStats() {
   const s = settings();
   const [a, b] = state.shown;
-  const raco = s.detector === 'raco';
+  const raco = s.detector === 'raco', xfeat = s.detector === 'xfeat';
   const rows = [];
   const cell = (r, f) => (r ? f(r) : '–');
   rows.push(['Size', cell(a, (r) => `${r.w}x${r.h}`), cell(b, (r) => `${r.w}x${r.h}`)]);
@@ -310,9 +314,10 @@ function renderStats() {
   const env = state.env;
   const selection = raco
     ? `the best ${s.topK} by detection score` + (s.rankKeep > 0 ? `, then the best ${s.rankKeep} by ranker score` : '')
+    : xfeat ? `the best ${s.topK} above 0.05`
     : s.mode === 'topk' ? `the best ${s.topK}` : `score above ${s.th.toFixed(2)}, at most ${s.cap}`;
   const kv = [
-    ['Detector', raco ? 'RaCo, ALIKED descriptors' : 'ALIKED'],
+    ['Detector', raco ? 'RaCo, ALIKED descriptors' : xfeat ? 'XFeat' : 'ALIKED'],
     ['Backend', s.backend === 'webgpu' ? 'WebGPU' : 'CPU (WebAssembly, one thread)'],
     ['GPU', env?.webgpu ? env.adapter : 'no WebGPU adapter'],
     ['Precision', raco ? 'FP32' : s.precision.toUpperCase()],
@@ -493,19 +498,23 @@ function wire() {
 
 // Controls that depend on the detector, backend and selection mode.
 function syncControls() {
-  const s = settings(), raco = s.detector === 'raco';
-  $('f-mode').hidden = raco;
-  $('f-topk').hidden = !raco && s.mode !== 'topk';
-  $('f-th').hidden = raco || s.mode === 'topk';
+  const s = settings(), raco = s.detector === 'raco', xfeat = s.detector === 'xfeat';
+  $('f-mode').hidden = raco || xfeat;
+  $('f-topk').hidden = !raco && !xfeat && s.mode !== 'topk';
+  $('f-th').hidden = raco || xfeat || s.mode === 'topk';
   $('f-rank').hidden = !raco;
   $('topk-l').textContent = raco ? 'Detected per image' : 'Keypoints per image';
   $('cov').disabled = !raco;
   $('det-hint').textContent = raco
     ? 'RaCo detects keypoints and adds a ranker score and a covariance to each; ALIKED describes them for ' +
       'matching. Two networks per image, FP32 only.'
+    : xfeat
+    ? 'XFeat detects and describes keypoints (64 floats) in one light network: about a third of ALIKED\'s time on a CPU, half on a GPU.'
     : 'ALIKED detects and describes keypoints in one network.';
   $('backend-hint').textContent = raco
     ? 'The CPU backend runs in WebAssembly on one thread: RaCo with descriptors takes about 12 s per 640x480 image.'
+    : xfeat
+    ? 'The CPU backend runs in WebAssembly on one thread: XFeat takes about 0.4 s per 640x480 image.'
     : 'The CPU backend runs in WebAssembly on one thread: about a second per 640x480 image.';
   const fp16 = document.querySelector('input[name="prec"][value="fp16"]');
   fp16.disabled = raco || s.backend === 'cpu' || !state.env?.f16 || !state.env?.webgpu;

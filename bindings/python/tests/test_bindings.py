@@ -97,6 +97,13 @@ def test_raco(image):
     np.testing.assert_array_equal(d.xy, f.xy)
 
 
+def test_xfeat(image):
+    f = jkp.Extractor(model="xfeat", top_k=300).extract(image)
+    assert f.n == 300 and f.dim == 64 and f.desc.shape == (300, 64) and f.rank is None and f.cov is None
+    np.testing.assert_allclose(np.linalg.norm(f.desc, axis=1), 1, rtol=1e-5)
+    assert (f.score > 0).all() and (np.diff(f.score) <= 0).all()
+
+
 def test_errors():
     with pytest.raises(ValueError):
         jkp.Extractor(backend="tpu")
@@ -146,3 +153,8 @@ def test_gpu_matches_cpu(backend, image):
     r = gpu(backend, model="raco", top_k=300).extract(image)
     np.testing.assert_allclose(r.xy, r_cpu.xy, atol=1e-2)
     np.testing.assert_allclose(r.cov, r_cpu.cov, rtol=1e-3, atol=1e-3)
+    x_cpu = jkp.Extractor(model="xfeat", top_k=300).extract(image)
+    x = gpu(backend, model="xfeat", top_k=300).extract(image)
+    np.testing.assert_array_equal(x.xy, x_cpu.xy)
+    np.testing.assert_allclose(x.desc, x_cpu.desc, atol=1e-4)
+    assert gpu(backend, model="xfeat", top_k=300, precision="fp16").extract(image).n == 300

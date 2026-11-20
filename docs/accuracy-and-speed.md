@@ -52,3 +52,26 @@ page</a> measures the same sizes in your browser, for ALIKED or RaCo.
 
 For comparison, the ALIKED paper reports 12.9 ms for `aliked-n16` at 640x480 with 1000 keypoints (PyTorch,
 RTX 2060).
+
+## XFeat
+
+Against the original `XFeat.detectAndCompute` on 59 images (320 px to 2522x818), top 4096 keypoints:
+
+| Backend | Keypoint sets | Position error | Score error | Descriptor cosine |
+|---|---|---|---|---|
+| CPU | identical | 0 | <= 2.7e-5 | >= 1 - 5.4e-11 |
+| Metal | identical | 0 | <= 2.7e-5 | >= 1 - 1.9e-10 |
+| WebGPU (native) | identical | 0 | <= 5.3e-6 | >= 1 - 1.1e-10 |
+
+Keypoints are pixels of the network's image, so a keypoint found by both is at exactly the same place. In FP16 on
+Metal and WebGPU, 99.0 % or more of the keypoints are the same (mean 99.4 %). Milliseconds per image, top-k
+1000, M5 Pro:
+
+| Size | CPU | Metal FP32 | Metal FP16 | WebGPU FP32 | WebGPU FP16 | PyTorch MPS |
+|---|---|---|---|---|---|---|
+| 640x480 | 21.9 | 3.9 | 3.3 | 4.0 | 3.9 | 4.3 |
+| 1241x376 | 28.2 | 4.3 | 3.6 | 4.4 | 4.2 | 4.3 |
+| 1024x768 | 46.0 | 5.5 | 4.4 | 5.8 | 5.4 | 5.5 |
+| 1920x1080 | 98.4 | 10.6 | 8.2 | 12.1 | 11.2 | 9.9 |
+
+The CUDA backend does not run XFeat yet.

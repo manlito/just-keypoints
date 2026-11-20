@@ -202,11 +202,11 @@ NB_MODULE(_core, m) {
 
   nb::class_<Features>(m, "Features", "Keypoints of one image. Arrays are float32 copies.")
       .def_ro("n", &Features::n, "Number of keypoints.")
-      .def_ro("dim", &Features::dim, "Descriptor size: 128 for aliked-n16, 0 for raco without a descriptor model.")
+      .def_ro("dim", &Features::dim, "Descriptor size: 128 for aliked-n16, 64 for xfeat, 0 for raco without a descriptor model.")
       .def_prop_ro("xy", [](const Features& f) { return f.xy; }, nb::rv_policy::move,
               "(n, 2) pixel coordinates, x right, y down, (0, 0) the centre of the top-left pixel.")
       .def_prop_ro("score", [](const Features& f) { return f.score; }, nb::rv_policy::move,
-              "(n,) aliked: in [0, 1]. raco: a probability, summing to 1 over the image.")
+              "(n,) aliked: in [0, 1]. raco: a probability, summing to 1 over the image. xfeat: in (0, 1).")
       .def_prop_ro("desc", [](const Features& f) { return f.desc; }, nb::rv_policy::move, "(n, dim) L2-normalized descriptors, or None when dim is 0.")
       .def_prop_ro("rank", [](const Features& f) { return f.rank; }, nb::rv_policy::move, "(n,) ranker score, higher is better (raco), or None.")
       .def_prop_ro("cov", [](const Features& f) { return f.cov; }, nb::rv_policy::move, "(n, 2, 2) keypoint covariance in pixels squared (raco), or None.")
@@ -225,15 +225,16 @@ NB_MODULE(_core, m) {
            "device"_a = 0, "descriptor"_a = nb::none(), "descriptor_weights"_a = nb::none(),
            "skip_ranker"_a = false, "skip_covariance"_a = false, "precision"_a = "fp32",
            "backend: 'cpu', 'cuda', 'metal' or 'webgpu'.\n"
-           "model: 'aliked-n16' (keypoints and descriptors) or 'raco' (keypoints with ranker scores and "
-           "covariances, no descriptors).\n"
+           "model: 'aliked-n16' (keypoints and descriptors), 'raco' (keypoints with ranker scores and "
+           "covariances, no descriptors) or 'xfeat' (a light detector with 64-dim descriptors).\n"
            "weights: a .jkpw path or its bytes; None uses the weights built into the package.\n"
            "top_k > 0 keeps the top_k best keypoints; otherwise every keypoint with score > score_threshold, "
-           "at most max_keypoints. raco: always the top_k best (2048 when top_k <= 0).\n"
+           "at most max_keypoints. raco: always the top_k best (2048 when top_k <= 0); xfeat: the top_k best "
+           "above its own threshold (4096 when top_k <= 0).\n"
            "num_threads: CPU worker threads, 0 = all. device: GPU index.\n"
            "descriptor: 'aliked-n16' describes raco's keypoints (descriptor_weights as weights).\n"
            "skip_ranker, skip_covariance: raco leaves out that head (its output is None).\n"
-           "precision: 'fp32' (the reference) or 'fp16' (GPU backends, aliked only).\n"
+           "precision: 'fp32' (the reference) or 'fp16' (GPU backends, aliked and xfeat).\n"
            "Raises RuntimeError when the backend, device, model or weights cannot be used.")
       .def("_extract", &Extractor::extract, "image"_a.noconvert())
       .def_prop_ro("backend", &Extractor::backend)

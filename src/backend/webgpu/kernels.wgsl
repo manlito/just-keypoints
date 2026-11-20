@@ -33,6 +33,7 @@ const kActNone = 0;
 const kActSelu = 1;
 const kActSigmoid = 2;
 const kActLeakyRelu = 3;  // slope 0.01
+const kActRelu = 4;
 const kGreater = 0;
 const kRadius = 2;        // NMS and soft-argmax window radius
 const kScanBlock = 256;   // elements handled by one thread in the compaction kernels
@@ -49,6 +50,7 @@ fn activate(v: f32, act: i32) -> f32 {
   if (act == kActSelu) { return selu(v); }
   if (act == kActSigmoid) { return 1.0 / (1.0 + exp(-v)); }
   if (act == kActLeakyRelu) { return select(0.01 * v, v, v > 0.0); }
+  if (act == kActRelu) { return max(v, 0.0); }
   return v;
 }
 
@@ -1361,4 +1363,298 @@ fn run(i: i32) {
       res[at + 3 * i + c] = b.wt[0] * v[0] + b.wt[1] * v[1] + b.wt[2] * v[2] + b.wt[3] * v[3];
     }
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// XFeat (ported from kernels.metal; see tools/xfeat_folded.py)
+// ---------------------------------------------------------------------------------------------
+
+//@helpers xfeat
+// XFeat's sampling positions: pixel p of a `full`-wide image, normalized as 2 * (p / (full - 1)) - 1 and read
+// with align_corners = false from a map `size` wide. The division is rounded correctly: at p = full - 1 it
+// must give exactly 1, which puts the nearest heatmap pixel outside the map, as on the other backends.
+fn xfeat_source(p: i32, full: i32, size: i32) -> f32 {
+  let g = 2.0 * div_rn(f32(p), f32(full - 1)) - 1.0;
+  return ((g + 1.0) * f32(size) - 1.0) * 0.5;
+}
+
+//@kernel k_resize
+// Bilinear, align_corners = false: source = max((dst + 0.5) * scale - 0.5, 0); sx, sy = in / out.
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read_write> out: array<real>;
+fn run(i: i32) {
+  let c = pi(0u);
+  let h = pi(1u);
+  let w = pi(2u);
+  let oh = pi(3u);
+  let ow = pi(4u);
+  let sx = pf(5u);
+  let sy = pf(6u);
+  let ohw = oh * ow;
+  if (i >= c * ohw) { return; }
+  let ch = i / ohw;
+  let y = (i % ohw) / ow;
+  let xo = i % ow;
+  let src_x = max(sx * (f32(xo) + 0.5) - 0.5, 0.0);
+  let src_y = max(sy * (f32(y) + 0.5) - 0.5, 0.0);
+  let x0 = min(i32(src_x), w - 1);
+  let y0 = min(i32(src_y), h - 1);
+  let x1 = x0 + select(0, 1, x0 < w - 1);
+  let y1 = y0 + select(0, 1, y0 < h - 1);
+  let w1 = clampf(src_x - f32(x0), 0.0, 1.0);
+  let w0 = 1.0 - w1;
+  let h1 = clampf(src_y - f32(y0), 0.0, 1.0);
+  let h0 = 1.0 - h1;
+  let r0 = (ch * h + y0) * w;
+  let r1 = (ch * h + y1) * w;
+  out[i] = real(h0 * (w0 * f32(x[r0 + x0]) + w1 * f32(x[r0 + x1])) + h1 * (w0 * f32(x[r1 + x0]) + w1 * f32(x[r1 + x1])));
+}
+
+//@kernel k_gray
+// Mean of the channels (sum, then times 1 / c).
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read_write> g: array<f32>;
+fn run(i: i32) {
+  let c = pi(0u);
+  let hw = pi(1u);
+  if (i >= hw) { return; }
+  var sum = 0.0;
+  for (var ch = 0; ch < c; ch++) { sum += f32(x[ch * hw + i]); }
+  g[i] = sum * (1.0 / f32(c));
+}
+
+//@kernel k_moments_block
+// Kahan sums in blocks of kScanBlock: mode 0 sums v, mode 1 sums (v - mean)^2 with mean = stats[0] / n.
+@group(0) @binding(1) var<storage, read> v: array<f32>;
+@group(0) @binding(2) var<storage, read> stats: array<f32>;
+@group(0) @binding(3) var<storage, read_write> partial: array<f32>;
+fn run(b: i32) {
+  let n = pi(0u);
+  let mode = pi(1u);
+  let begin = b * kScanBlock;
+  if (begin >= n) { return; }
+  let end = min(n, begin + kScanBlock);
+  var mean = 0.0;
+  if (mode != 0) { mean = div_rn(stats[0], f32(n)); }
+  var sum = 0.0;
+  var comp = 0.0;
+  for (var i = begin; i < end; i++) {
+    let d = v[i] - mean;
+    let y = select(v[i], d * d, mode != 0) - comp;
+    let t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  partial[b] = sum;
+}
+
+//@kernel k_moments_total
+@group(0) @binding(1) var<storage, read> partial: array<f32>;
+@group(0) @binding(2) var<storage, read_write> stats: array<f32>;
+fn run(i: i32) {
+  let blocks = pi(0u);
+  let slot = pi(1u);
+  if (i != 0) { return; }
+  var sum = 0.0;
+  var comp = 0.0;
+  for (var b = 0; b < blocks; b++) {
+    let y = partial[b] - comp;
+    let t = sum + y;
+    comp = (t - sum) - y;
+    sum = t;
+  }
+  stats[slot] = sum;
+}
+
+//@kernel k_instance_norm
+// g * invstd - mean * invstd, invstd = 1 / sqrt(var + 1e-5) (biased variance), as PyTorch's batch norm.
+@group(0) @binding(1) var<storage, read> g: array<f32>;
+@group(0) @binding(2) var<storage, read> stats: array<f32>;
+@group(0) @binding(3) var<storage, read_write> out: array<real>;
+fn run(i: i32) {
+  let n = pi(0u);
+  if (i >= n) { return; }
+  let mean = div_rn(stats[0], f32(n));
+  let invstd = div_rn(1.0, sqrt(div_rn(stats[1], f32(n)) + 1e-5));
+  out[i] = real(g[i] * invstd + (-mean * invstd));
+}
+
+//@kernel k_conv2d_s2_tile
+// Stride-2 convolution, T output channels per thread for one output pixel, zero padding K / 2; weights as
+// k_conv2d_tile. Grid: ceil(cout / T) * oh * ow.
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read> weight: array<vec4<real>>;
+@group(0) @binding(3) var<storage, read> bias: array<real>;
+@group(0) @binding(4) var<storage, read_write> out: array<real>;
+fn run(i: i32) {
+  let has_bias = pi(0u);
+  let cin = pi(1u);
+  let cout = pi(2u);
+  let h = pi(3u);
+  let w = pi(4u);
+  let oh = pi(5u);
+  let ow = pi(6u);
+  let act = pi(7u);
+  let ohw = oh * ow;
+  let blocks = (cout + $T - 1) / $T;
+  if (i >= blocks * ohw) { return; }
+  let ob = i / ohw;
+  let pix = i % ohw;
+  let y = pix / ow;
+  let xo = pix % ow;
+  let pad = $K / 2;
+  let oc0 = ob * $T;
+  var acc: array<vec4<f32>, $T4>;
+  for (var t = 0; t < $T; t++) {
+    var b = 0.0;
+    if (has_bias != 0 && oc0 + t < cout) { b = f32(bias[oc0 + t]); }
+    acc[t / 4][t % 4] = b;
+  }
+  for (var ic = 0; ic < cin; ic++) {
+    let base = ic * h * w;
+    let wic = ic * $K * $K;
+    for (var ky = 0; ky < $K; ky++) {
+      let sy = 2 * y + ky - pad;
+      if (sy < 0 || sy >= h) { continue; }
+      for (var kx = 0; kx < $K; kx++) {
+        let sx = 2 * xo + kx - pad;
+        if (sx < 0 || sx >= w) { continue; }
+        let v = vec4<f32>(f32(x[base + sy * w + sx]));
+        let wp = ((wic + ky * $K + kx) * blocks + ob) * $T4;
+        for (var q = 0; q < $T4; q++) { acc[q] = mac(acc[q], vec4<f32>(weight[wp + q]), v); }
+      }
+    }
+  }
+  for (var t = 0; t < $T; t++) {
+    if (oc0 + t < cout) { out[(oc0 + t) * ohw + pix] = real(activate(acc[t / 4][t % 4], act)); }
+  }
+}
+
+//@kernel k_space_to_depth
+// 1xHxW -> (b*b)x(H/b)x(W/b); channel ky * b + kx holds pixel (b y + ky, b x + kx).
+@group(0) @binding(1) var<storage, read> x: array<real>;
+@group(0) @binding(2) var<storage, read_write> out: array<real>;
+fn run(i: i32) {
+  let h = pi(0u);
+  let w = pi(1u);
+  let b = pi(2u);
+  let oh = h / b;
+  let ow = w / b;
+  let ohw = oh * ow;
+  if (i >= h * w) { return; }
+  let ch = i / ohw;
+  let y = (i % ohw) / ow;
+  let xo = i % ow;
+  out[i] = x[(y * b + ch / b) * w + xo * b + ch % b];
+}
+
+//@kernel k_xfeat_heat
+// Softmax over the 65 logits of each cell; the first 64 go to their pixels of the full-resolution heatmap.
+@group(0) @binding(1) var<storage, read> logits: array<f32>;
+@group(0) @binding(2) var<storage, read_write> heat: array<f32>;
+fn run(i: i32) {
+  let h8 = pi(0u);
+  let w8 = pi(1u);
+  let plane = h8 * w8;
+  if (i >= plane) { return; }
+  let y = i / w8;
+  let x = i % w8;
+  let W = 8 * w8;
+  var m = kLowest;
+  for (var c = 0; c < 65; c++) { m = max(m, logits[c * plane + i]); }
+  var e: array<f32, 65>;
+  var sum = 0.0;
+  for (var c = 0; c < 65; c++) {
+    e[c] = exp(logits[c * plane + i] - m);
+    sum += e[c];
+  }
+  for (var c = 0; c < 64; c++) { heat[(8 * y + c / 8) * W + 8 * x + c % 8] = e[c] / sum; }
+}
+
+//@kernel k_xfeat_score
+// For each local maximum above the threshold, the nearest heatmap value (round half to even, 0 outside)
+// times the bilinear reliability; 0 elsewhere and at pixel (0, 0).
+//@use xfeat
+@group(0) @binding(1) var<storage, read> heat: array<f32>;
+@group(0) @binding(2) var<storage, read> pooled: array<f32>;
+@group(0) @binding(3) var<storage, read> rel: array<f32>;
+@group(0) @binding(4) var<storage, read_write> score: array<f32>;
+fn run(i: i32) {
+  let H = pi(0u);
+  let W = pi(1u);
+  let th = pf(2u);
+  if (i >= H * W) { return; }
+  let px = i % W;
+  let py = i / W;
+  let h8 = H / 8;
+  let w8 = W / 8;
+  var s = 0.0;
+  if (heat[i] == pooled[i] && heat[i] > th && (px != 0 || py != 0)) {
+    let nx = i32(round(xfeat_source(px, W, W)));
+    let ny = i32(round(xfeat_source(py, H, H)));
+    var hv = 0.0;
+    if (nx >= 0 && nx < W && ny >= 0 && ny < H) { hv = heat[ny * W + nx]; }
+    let b = bilinear_setup(xfeat_source(px, W, w8), xfeat_source(py, H, h8), w8, h8);
+    s = hv * (b.wt[0] * rel[b.idx[0]] + b.wt[1] * rel[b.idx[1]] + b.wt[2] * rel[b.idx[2]] + b.wt[3] * rel[b.idx[3]]);
+  }
+  score[i] = s;
+}
+
+//@kernel k_xfeat_describe
+// Descriptors (before row normalization), scores and pixels of the selected keypoints. One thread per
+// (keypoint, channel): bicubic sample (A = -0.75) of the normalized features, zeros outside.
+//@use xfeat
+@group(0) @binding(1) var<storage, read> f: array<real>;
+@group(0) @binding(2) var<storage, read> score: array<f32>;
+@group(0) @binding(3) var<storage, read> idx: array<i32>;
+@group(0) @binding(4) var<storage, read_write> desc: array<f32>;
+@group(0) @binding(5) var<storage, read_write> score_out: array<f32>;
+@group(0) @binding(6) var<storage, read_write> pix: array<i32>;
+fn cubic_coeffs(t: f32) -> array<f32, 4> {
+  let a = -0.75;
+  let x0 = t + 1.0;
+  let x2 = 1.0 - t;
+  let x3 = 2.0 - t;
+  return array<f32, 4>(((a * x0 - 5.0 * a) * x0 + 8.0 * a) * x0 - 4.0 * a, ((a + 2.0) * t - (a + 3.0)) * t * t + 1.0,
+                       ((a + 2.0) * x2 - (a + 3.0)) * x2 * x2 + 1.0, ((a * x3 - 5.0 * a) * x3 + 8.0 * a) * x3 - 4.0 * a);
+}
+fn run(t: i32) {
+  let dim = pi(0u);
+  let h8 = pi(1u);
+  let w8 = pi(2u);
+  let n = pi(3u);
+  if (t >= n * dim) { return; }
+  let i = t / dim;
+  let ch = t % dim;
+  let H = 8 * h8;
+  let W = 8 * w8;
+  let px = idx[i] % W;
+  let py = idx[i] / W;
+  if (ch == 0) {
+    score_out[i] = score[idx[i]];
+    pix[2 * i] = px;
+    pix[2 * i + 1] = py;
+  }
+  let sx = xfeat_source(px, W, w8);
+  let sy = xfeat_source(py, H, h8);
+  let fx = floor(sx);
+  let fy = floor(sy);
+  let x0 = i32(fx) - 1;
+  let y0 = i32(fy) - 1;
+  let cx = cubic_coeffs(sx - fx);
+  let cy = cubic_coeffs(sy - fy);
+  let base = ch * h8 * w8;
+  var v = 0.0;
+  for (var a = 0; a < 4; a++) {
+    let yy = y0 + a;
+    var tap: array<f32, 4>;
+    for (var b = 0; b < 4; b++) {
+      let xx = x0 + b;
+      tap[b] = 0.0;
+      if (xx >= 0 && xx < w8 && yy >= 0 && yy < h8) { tap[b] = f32(f[base + yy * w8 + xx]); }
+    }
+    let row = tap[0] * cx[0] + tap[1] * cx[1] + tap[2] * cx[2] + tap[3] * cx[3];
+    v += row * cy[a];
+  }
+  desc[i * dim + ch] = v;
 }

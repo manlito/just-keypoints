@@ -1,7 +1,8 @@
-"""Time jkp backends and the original ALIKED (PyTorch) on one image at several sizes.
+"""Time jkp backends and the original model (PyTorch) on one image at several sizes.
 
     python tools/bench.py --jkp "--backend metal" --jkp "--backend metal --precision fp16" --torch mps
     python tools/bench.py --jkp "--backend cuda" --jkp "--backend cuda --precision fp16" --torch cuda
+    python tools/bench.py --model xfeat --jkp "--backend metal" --torch mps     # XFeat (detectAndCompute)
 
 Each column is timed in turn, several rounds over, so that machine load affects them alike; the table
 shows the median over rounds of the median warm run. A run is everything from an 8-bit image in host
@@ -37,7 +38,8 @@ def resized(bgr, w, h):
 
 def jkp_column(binary, extra, args):
     def run(path, _bgr):
-        cmd = [binary, "bench", path, "--runs", str(args.runs), "--top-k", str(args.top_k)] + extra.split()
+        cmd = [binary, "bench", path, "--runs", str(args.runs), "--top-k", str(args.top_k), "--model", args.model]
+        cmd += extra.split()
         out = subprocess.run(cmd, check=True, capture_output=True, text=True).stdout
         return float(re.search(r"median ([0-9.]+) ms", out).group(1))
     return run
@@ -48,7 +50,9 @@ def torch_column(device, args):
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import upstream
 
-    model = upstream.load_model(device=device, top_k=args.top_k)
+    if args.model == "xfeat":
+        import xfeat_upstream
+        model = xfeat_upstream.load_model(device, args.top_k)
 
     def sync():
         if device.startswith("cuda"):
@@ -56,8 +60,20 @@ def torch_column(device, args):
         elif device == "mps":
             torch.mps.synchronize()
 
+    if args.model != "xfeat":
+        model = upstream.load_model(device=device, top_k=args.top_k)
+
+    @torch.no_grad()
+    def once_xfeat(rgb):
+        out = model.detectAndCompute(upstream.to_tensor(rgb, device), top_k=args.top_k)[0]
+        out = {k: v.cpu().numpy() for k, v in out.items()}
+        sync()
+        return out
+
     @torch.no_grad()
     def once(rgb):
+        if args.model == "xfeat":
+            return once_xfeat(rgb)
         image = upstream.to_tensor(rgb, model.device)
         feature_map, score_map = model.extract_dense_map(image)
         keypoints, scores, _ = model.dkd(score_map)
@@ -86,11 +102,12 @@ def main():
     ap.add_argument("--image", default=DEFAULT_IMAGE)
     ap.add_argument("--sizes", default="640x480,1024x768,1920x1080")
     ap.add_argument("--top-k", type=int, default=1000)
+    ap.add_argument("--model", default="aliked-n16", help="aliked-n16 or xfeat (also passed to jkp)")
     ap.add_argument("--runs", type=int, default=30, help="warm runs per measurement")
     ap.add_argument("--rounds", type=int, default=3)
     ap.add_argument("--binary", default=os.path.join(ROOT, "build", "release", "jkp"))
     ap.add_argument("--jkp", action="append", default=[], metavar="ARGS", help='jkp options, e.g. "--backend cuda"')
-    ap.add_argument("--torch", action="append", default=[], metavar="DEVICE", help="original ALIKED on cpu, cuda or mps")
+    ap.add_argument("--torch", action="append", default=[], metavar="DEVICE", help="original model on cpu, cuda or mps")
     args = ap.parse_args()
 
     columns = [("jkp " + re.sub(r"--(backend|precision) ", "", a), jkp_column(args.binary, a, args)) for a in args.jkp]

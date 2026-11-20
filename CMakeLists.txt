@@ -223,6 +223,12 @@ if(JKP_BUILD_TESTS)
   # Backends with the RaCo operations (PLAN.md, RaCo track); the others throw from Ops::normalize.
   set(raco_backends cpu)
   set(xfeat_backends cpu)  # GPU backends join as they get the XFeat operations (PLAN.md, XFeat track)
+  if(JKP_HAVE_METAL)
+    list(APPEND xfeat_backends metal metal:fp16)
+  endif()
+  if(JKP_HAVE_WEBGPU)
+    list(APPEND xfeat_backends webgpu webgpu:fp16)
+  endif()
   if(JKP_HAVE_CUDA)
     list(APPEND raco_backends cuda)
   endif()
@@ -292,6 +298,12 @@ if(JKP_BUILD_TESTS)
                COMMAND backend_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/aliked-n16.jkpw" ${backend})
       add_test(NAME ${backend}_fp16_vs_fp32
                COMMAND precision_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/aliked-n16.jkpw" ${backend} ${golden_files})
+      if(backend IN_LIST xfeat_backends)
+        add_test(NAME ${backend}_xfeat_vs_cpu
+                 COMMAND backend_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/xfeat.jkpw" ${backend})
+        add_test(NAME ${backend}_fp16_xfeat_vs_cpu
+                 COMMAND backend_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/xfeat.jkpw" ${backend}:fp16)
+      endif()
       if(backend IN_LIST raco_backends)
         add_test(NAME ${backend}_raco_vs_cpu
                  COMMAND backend_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/raco.jkpw" ${backend})
@@ -341,7 +353,8 @@ if(JKP_BUILD_TESTS)
   foreach(golden IN LISTS xfeat_golden_files)
     get_filename_component(name "${golden}" NAME_WLE)
     foreach(backend IN LISTS xfeat_backends)
-      add_test(NAME golden_xfeat_${backend}_${name}
+      string(REPLACE ":" "_" tag "${backend}")
+      add_test(NAME golden_xfeat_${tag}_${name}
                COMMAND xfeat_golden_test "${CMAKE_CURRENT_SOURCE_DIR}/weights/xfeat.jkpw" "${golden}" ${backend})
     endforeach()
   endforeach()

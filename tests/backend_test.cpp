@@ -2,7 +2,7 @@
 // final keypoints, scores and descriptors, across the selection modes and pixel formats.
 //   backend_test WEIGHTS.jkpw cuda|metal|webgpu
 // Needs no golden files. The CPU backend is itself checked against the original by golden_test and
-// raco_golden_test. With raco.jkpw it runs the RaCo graph instead of ALIKED.
+// raco_golden_test. With raco.jkpw it runs the RaCo graph instead of ALIKED, with xfeat.jkpw XFeat.
 #include <algorithm>
 #include <cmath>
 #include <cstdint>
@@ -16,6 +16,7 @@
 #include "core/weights.h"
 #include "models/aliked/aliked.h"
 #include "models/raco/raco.h"
+#include "models/xfeat/xfeat.h"
 #include "test_backends.h"
 #include "test_picture.h"
 
@@ -186,12 +187,106 @@ int run_raco(const jkp::Weights& weights, const std::string& backend) {
   return 0;
 }
 
+int run_xfeat(const jkp::Weights& weights, const std::string& backend) {
+  struct XCase {
+    const char* name;
+    int w, h, channels, extra_stride, top_k;
+    bool flat;
+  };
+  const XCase cases[] = {
+      {"rgb, resized", 203, 157, 3, 0, 0, false},
+      {"multiple of 32", 256, 192, 3, 0, 0, false},
+      {"top-k", 203, 157, 3, 0, 150, false},
+      {"gray with row padding", 131, 77, 1, 5, 0, false},
+      {"rgba with row padding", 131, 77, 4, 7, 0, false},
+      {"uniform gray image", 150, 100, 3, 0, 500, true},
+      {"smallest image", 32, 32, 3, 0, 0, false},
+      {"large, cut at top-k", 1024, 768, 3, 0, 4096, false},
+      {"large, resized, every keypoint", 1100, 700, 3, 0, 100000, false},
+  };
+  jkp::Xfeat model(weights);
+  auto cpu = jkp::make_cpu_ops(0);
+  auto gpu = make_backend(backend);
+  const bool fp16 = backend.find("fp16") != std::string::npos;
+  for (const XCase& c : cases) {
+    const int stride = c.w * c.channels + c.extra_stride;
+    std::vector<uint8_t> image = picture(c.w, c.h, c.channels, stride, 12345u + static_cast<uint32_t>(c.w));
+    if (c.flat) std::fill(image.begin(), image.end(), static_cast<uint8_t>(128));
+    Run r[2];
+    jkp::Ops* ops[2] = {cpu.get(), gpu.get()};
+    for (int b = 0; b < 2; ++b)
+      model.extract(*ops[b], image.data(), c.w, c.h, stride, c.channels, c.top_k, &r[b].out,
+                    [&](const char* name, const jkp::TensorPtr& t) {
+                      std::vector<float>& v = r[b].stages[name];
+                      v.resize(static_cast<size_t>(t->c) * t->h * t->w);
+                      t->read(v.data());
+                    });
+    const int before = g_failed;
+    std::printf("%s (%dx%d): %d keypoints (cpu), %d (gpu)\n", c.name, c.w, c.h, r[0].out.n, r[1].out.n);
+    double worst = 0;
+    // WGSL cannot turn off contraction into fused multiply-add, so WebGPU differs about three times as much
+    // as Metal in FP32 (PLAN.md, notes from R6). A flat image normalizes to zeros: stages that are all
+    // (nearly) zero compare absolute.
+    const bool webgpu = backend.rfind("webgpu", 0) == 0;
+    const double tol = fp16 ? 3e-2 : webgpu ? 1e-4 : 1e-5;
+    for (const auto& stage : r[0].stages) {
+      double top = 0;
+      for (float v : stage.second) top = std::fmax(top, std::fabs(v));
+      const auto& got = r[1].stages[stage.first];
+      worst = std::fmax(worst, top < 1e-3 ? compare(stage.first.c_str(), stage.second, got, tol, false)
+                                          : compare_rel(stage.first.c_str(), stage.second, got, tol, false));
+    }
+    // Keypoints are pixels of the resized image, so a keypoint has the same position on both backends. Ties
+    // and float32 rounding may change the order and, at the top-k cut, which of the last ones are kept.
+    const jkp::Features &a = r[0].out, &g = r[1].out;
+    std::map<std::pair<float, float>, int> at;
+    for (int j = 0; j < g.n; ++j) at[{g.xy[2 * j], g.xy[2 * j + 1]}] = j;
+    const int top_k = c.top_k > 0 ? c.top_k : weights.meta_int("top_k");
+    const bool cut = a.n >= top_k;
+    const int tail = std::max(2, a.n / (fp16 ? 20 : 500));
+    std::vector<float> sa, sg, da, dg;
+    int unpaired = 0, misplaced = 0;
+    for (int i = 0; i < a.n; ++i) {
+      auto it = at.find({a.xy[2 * i], a.xy[2 * i + 1]});
+      if (it == at.end()) {
+        ++unpaired;
+        misplaced += !cut || i < a.n - tail;
+        continue;
+      }
+      sa.push_back(a.score[i]), sg.push_back(g.score[it->second]);
+      da.insert(da.end(), &a.desc[64 * i], &a.desc[64 * i] + 64);
+      dg.insert(dg.end(), &g.desc[64 * it->second], &g.desc[64 * it->second] + 64);
+    }
+    // The same rounding can tie or untie a maximum with its neighbour; at most 0.05 % of the keypoints on
+    // WebGPU in FP32, none on Metal; FP16 changes about 1.5 % of them.
+    std::map<std::pair<float, float>, int> in_cpu;
+    for (int i = 0; i < a.n; ++i) in_cpu[{a.xy[2 * i], a.xy[2 * i + 1]}] = i;
+    int extra = 0;
+    for (int j = 0; j < g.n; ++j) {
+      auto it = in_cpu.find({g.xy[2 * j], g.xy[2 * j + 1]});
+      extra += it == in_cpu.end() && (!cut || j < g.n - tail);
+    }
+    const int allowed = fp16 ? a.n / 25 : webgpu ? a.n / 2000 : 0;  // FP16: 2 % each way
+    if (misplaced + extra > allowed) {
+      std::printf("    %-12s FAIL (%d unpaired of %d, %d and %d extra not at the cut)\n", "selection", unpaired, a.n,
+                  misplaced, extra);
+      ++g_failed;
+    }
+    const double dscore = compare("scores", sa, sg, tol, false);
+    const double ddesc = compare("descriptors", da, dg, tol, false);
+    std::printf("    %s  %d unpaired; stages %.1e (relative), score %.1e, descriptor %.1e\n",
+                g_failed == before ? "ok  " : "FAIL", unpaired, worst, dscore, ddesc);
+  }
+  return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
   const std::string backend = argc == 3 ? argv[2] : "";
-  if (backend != "cuda" && backend != "metal" && backend != "webgpu") {
-    std::fprintf(stderr, "usage: backend_test WEIGHTS.jkpw cuda|metal|webgpu\n");
+  const std::string base = backend.substr(0, backend.find(':'));
+  if (base != "cuda" && base != "metal" && base != "webgpu") {
+    std::fprintf(stderr, "usage: backend_test WEIGHTS.jkpw cuda|metal|webgpu[:fp16]\n");
     return 2;
   }
   const Case cases[] = {
@@ -214,6 +309,11 @@ int main(int argc, char** argv) {
   };
   try {
     jkp::Weights weights = jkp::Weights::from_file(argv[1]);
+    if (weights.meta("model") == "xfeat") {
+      run_xfeat(weights, backend);
+      std::printf(g_failed ? "FAILED (%d)\n" : "all cases match\n", g_failed);
+      return g_failed ? 1 : 0;
+    }
     if (weights.meta("model") == "raco") {
       run_raco(weights, backend);
       std::printf(g_failed ? "FAILED (%d)\n" : "all cases match\n", g_failed);

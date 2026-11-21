@@ -1,8 +1,18 @@
 # just-keypoints
 
-Keypoints and descriptors from the ALIKED network, with minimal dependencies, for feature matching and
-bundle adjustment. No PyTorch, no ONNX Runtime, no cuDNN: one C++ library with hand-written kernels for
-each backend.
+Keypoints and descriptors from the ALIKED, RaCo and XFeat networks, with minimal dependencies, for feature
+matching and bundle adjustment. No PyTorch, no ONNX Runtime, no cuDNN: one C++ library with hand-written kernels
+for each backend.
+
+:::{important}
+**Use [ALIKED](https://github.com/Shiaoming/ALIKED), [RaCo](https://github.com/cvg/RaCo) and
+[XFeat](https://github.com/verlab/accelerated_features).** This project is a test bed for dependency-free
+inference and GPU kernels, not a replacement for them. It adds nothing to them except speed and fewer
+dependencies: no new networks, training or features, and only a subset of what they offer (inference only, one
+ALIKED variant, `aliked-n16`, and XFeat's sparse mode). The methods, the weights, and the credit for them are
+their authors'. For real work, ALIKED, RaCo and XFeat are the projects to depend on. See
+[References and acknowledgements](references.md).
+:::
 
 - **Backends**: the CPU (plain C++, the reference), CUDA on NVIDIA GPUs, Metal on Apple Silicon, and
   WebGPU, natively and in the browser through WebAssembly.
@@ -11,8 +21,8 @@ each backend.
   FP16 is an opt-in fast mode on the GPU backends.
 - **Fast**: 8 ms per 640x480 image on an M5 Pro (Metal), 15 ms on an RTX 2070 laptop (CUDA), about 12 ms
   in Chrome (WebGPU), each with 1000 keypoints and descriptors.
-- **One small C API**: give it pixels, get back keypoint positions, scores and 128-dimensional,
-  L2-normalized descriptors.
+- **One small C API**: give it pixels, get back keypoint positions, scores and L2-normalized
+  descriptors (128-dimensional from ALIKED, also for RaCo's keypoints, 64 from XFeat).
 - **Not in scope**: matching. The library stops at keypoints and descriptors; the demo's matcher lives in
   the demo.
 
